@@ -1,9 +1,10 @@
 use crate::{
     expression::{self, Expression, FunctionPolicy, FunctionReport},
+    parameters::Parameters,
     range::{Histogram, LEVELS, RangeAnalysis},
     raw::MonoImage,
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use clap::ValueEnum;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -26,16 +27,15 @@ impl Default for Transfers {
     fn default() -> Self {
         Self {
             png: Transfer::Linear,
-            jpeg: Transfer::Srgb,
+            jpeg: Transfer::Linear,
         }
     }
 }
 
-const TONE_BINS: usize = 1024;
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ToneCurve {
     pub optimized: bool,
+    pub optimize_strength: f64,
     pub exposure_factor: f64,
     pub input_median: f64,
     pub contrast_strength: f64,
@@ -45,22 +45,52 @@ pub struct ToneCurve {
 
 impl ToneCurve {
     pub fn fit(hist: &Histogram, range: &RangeAnalysis, optimized: bool, black: f64) -> Self {
-        let median = range.normalize(f64::from(hist.quantile(0.5)));
-        let shadow = range.normalize(f64::from(hist.quantile(0.1)));
-        let highlight = range.normalize(f64::from(hist.quantile(0.9)));
-        let active = optimized && hist.min != hist.max;
-        let exposure_factor = if active {
-            (0..=64)
-                .map(|i| 2.0f64.powf(-2.0 + f64::from(i) / 8.0))
+        Self::fit_with_parameters(hist, range, optimized, black, &Parameters::default())
+            .expect("default tone settings must produce a normalized monotonic curve")
+    }
+
+    pub fn fit_with_parameters(
+        hist: &Histogram,
+        range: &RangeAnalysis,
+        optimized: bool,
+        black: f64,
+        parameters: &Parameters,
+    ) -> Result<Self> {
+        parameters.validate()?;
+        let median = range.normalize(f64::from(hist.quantile(parameters.tone_midtone_quantile)));
+        let shadow = range.normalize(f64::from(hist.quantile(parameters.tone_shadow_quantile)));
+        let highlight =
+            range.normalize(f64::from(hist.quantile(parameters.tone_highlight_quantile)));
+        let active = optimized && parameters.optimize_strength > 0.0 && hist.min != hist.max;
+        let mut exposure_factor = if active {
+            let steps = ((parameters.tone_max_exposure_ev - parameters.tone_min_exposure_ev)
+                * parameters.tone_exposure_steps as f64)
+                .ceil() as usize;
+            (0..=steps)
+                .map(|i| {
+                    2.0f64.powf(
+                        (parameters.tone_min_exposure_ev
+                            + i as f64 / parameters.tone_exposure_steps as f64)
+                            .min(parameters.tone_max_exposure_ev),
+                    )
+                })
                 .min_by(|&a, &b| {
                     let score = |exposure| {
                         let middle = srgb_encode(expose(median, exposure));
                         let contrast = srgb_encode(expose(highlight, exposure))
                             - srgb_encode(expose(shadow, exposure));
                         let noise = display_noise(range, black, median, exposure).unwrap_or(0.0);
-                        ((middle - 0.43) / 0.15).powi(2)
-                            + 0.15 * ((0.6 - contrast).max(0.0) / 0.4).powi(2)
-                            + 0.35 * ((noise - 0.10).max(0.0) / 0.10).powi(2)
+                        ((middle - parameters.tone_target_midtone)
+                            / parameters.tone_midtone_tolerance)
+                            .powi(2)
+                            + parameters.tone_contrast_weight
+                                * ((parameters.tone_target_contrast - contrast).max(0.0)
+                                    / parameters.tone_contrast_tolerance)
+                                    .powi(2)
+                            + parameters.tone_noise_weight
+                                * ((noise - parameters.tone_noise_threshold).max(0.0)
+                                    / parameters.tone_noise_tolerance)
+                                    .powi(2)
                     };
                     score(a).total_cmp(&score(b))
                 })
@@ -68,19 +98,37 @@ impl ToneCurve {
         } else {
             1.0
         };
+        if active && parameters.tone_exposure_bias != 0.0 {
+            exposure_factor *= parameters.tone_exposure_bias.exp2();
+        }
         let mut curve = Self {
             optimized,
+            optimize_strength: if active {
+                parameters.optimize_strength
+            } else {
+                0.0
+            },
             exposure_factor,
             input_median: median,
-            contrast_strength: if active { 0.75 } else { 0.0 },
+            contrast_strength: if active {
+                parameters.tone_contrast_strength
+            } else {
+                0.0
+            },
             predicted_midtone_noise_display: display_noise(range, black, median, exposure_factor),
             perceptual_curve: Vec::new(),
         };
         if active {
-            curve.perceptual_curve =
-                perceptual_curve(hist, range, black, exposure_factor, curve.contrast_strength);
+            curve.perceptual_curve = perceptual_curve(
+                hist,
+                range,
+                black,
+                exposure_factor,
+                curve.contrast_strength,
+                parameters,
+            )?;
         }
-        curve
+        Ok(curve)
     }
 
     pub fn map(&self, x: f64) -> f64 {
@@ -91,13 +139,24 @@ impl ToneCurve {
             return 1.0;
         }
         let linear = expose(x, self.exposure_factor);
-        if self.perceptual_curve.is_empty() {
-            return linear;
+        let mapped = if self.perceptual_curve.is_empty() {
+            linear
+        } else {
+            let bins = self.perceptual_curve.len() - 1;
+            let position = srgb_encode(linear) * bins as f64;
+            let index = (position.floor() as usize).min(bins - 1);
+            let t = position - index as f64;
+            srgb_decode(
+                self.perceptual_curve[index] * (1.0 - t) + self.perceptual_curve[index + 1] * t,
+            )
+        };
+        if self.optimize_strength == 1.0 || !self.optimized {
+            mapped
+        } else if self.optimize_strength == 0.0 {
+            x
+        } else {
+            (1.0 - self.optimize_strength) * x + self.optimize_strength * mapped
         }
-        let position = srgb_encode(linear) * TONE_BINS as f64;
-        let index = (position.floor() as usize).min(TONE_BINS - 1);
-        let t = position - index as f64;
-        srgb_decode(self.perceptual_curve[index] * (1.0 - t) + self.perceptual_curve[index + 1] * t)
     }
 }
 
@@ -123,70 +182,98 @@ fn perceptual_curve(
     black: f64,
     exposure: f64,
     strength: f64,
-) -> Vec<f64> {
-    let mut density = vec![0.0; TONE_BINS];
+    parameters: &Parameters,
+) -> Result<Vec<f64>> {
+    if strength == 0.0 {
+        return Ok(Vec::new());
+    }
+    let bins = parameters.tone_bins;
+    let mut density = vec![0.0; bins];
     for (code, &count) in hist.bins.iter().enumerate() {
         if count > 0 && code as f64 > range.lower && (code as f64) < range.upper {
             let z = srgb_encode(expose(range.normalize(code as f64), exposure));
-            let bin = ((z * TONE_BINS as f64) as usize).min(TONE_BINS - 1);
+            let bin = ((z * bins as f64) as usize).min(bins - 1);
             density[bin] += count as f64;
         }
     }
-    for _ in 0..3 {
-        density = (0..TONE_BINS)
+    let radius = parameters.tone_smoothing_radius;
+    let mut kernel = vec![1.0; 2 * radius + 1];
+    for i in 1..kernel.len() {
+        kernel[i] = kernel[i - 1] * (kernel.len() - i) as f64 / i as f64;
+    }
+    let normalization = 2.0f64.powi((2 * radius) as i32);
+    for _ in 0..parameters.tone_smoothing_passes {
+        density = (0..bins)
             .map(|i| {
-                [1.0, 4.0, 6.0, 4.0, 1.0]
-                    .into_iter()
+                kernel
+                    .iter()
                     .enumerate()
-                    .map(|(k, weight)| {
-                        density[(i + k).saturating_sub(2).min(TONE_BINS - 1)] * weight / 16.0
+                    .map(|(k, &weight)| {
+                        density[(i + k).saturating_sub(radius).min(bins - 1)] * weight
+                            / normalization
                     })
                     .sum()
             })
             .collect();
     }
-    let average = density.iter().sum::<f64>() / TONE_BINS as f64;
+    let average = density.iter().sum::<f64>() / bins as f64;
     if average == 0.0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let weights: Vec<_> = density
         .iter()
-        .map(|v| 0.15 + (v / average).sqrt())
+        .map(|v| {
+            parameters.tone_density_prior
+                + if parameters.tone_density_power == 0.5 {
+                    (v / average).sqrt()
+                } else {
+                    (v / average).powf(parameters.tone_density_power)
+                }
+        })
         .collect();
-    let caps: Vec<_> = (0..TONE_BINS)
+    let caps: Vec<_> = (0..bins)
         .map(|i| {
-            let z = (i as f64 + 0.5) / TONE_BINS as f64;
+            let z = (i as f64 + 0.5) / bins as f64;
             let y = srgb_decode(z);
             let x = y / (exposure - (exposure - 1.0) * y);
             let noise = display_noise(range, black, x, exposure).unwrap_or(0.0);
-            (0.04 / noise.max(1e-9)).clamp(1.15, 3.0)
+            (parameters.tone_noise_target / noise.max(1e-9))
+                .clamp(parameters.tone_cap_min, parameters.tone_cap_max)
         })
         .collect();
     // A positive prior and slope bounds prevent equalization of a narrow/noisy peak into posterized tones.
-    let (mut low, mut high) = (0.0, 32.0);
-    for _ in 0..48 {
+    let (mut low, mut high) = (0.0, parameters.tone_solver_upper);
+    for _ in 0..parameters.tone_solver_iterations {
         let scale = (low + high) * 0.5;
         let total: f64 = weights
             .iter()
             .zip(&caps)
-            .map(|(w, cap)| (scale * w).clamp(0.35, *cap))
+            .map(|(w, cap)| (scale * w).clamp(parameters.tone_slope_min, *cap))
             .sum();
-        if total > TONE_BINS as f64 {
+        if total > bins as f64 {
             high = scale;
         } else {
             low = scale;
         }
     }
     let scale = (low + high) * 0.5;
-    let mut result = Vec::with_capacity(TONE_BINS + 1);
+    let mut result = Vec::with_capacity(bins + 1);
     let mut cumulative = 0.0;
     result.push(0.0);
     for (i, (&weight, &cap)) in weights.iter().zip(&caps).enumerate() {
-        cumulative += (scale * weight).clamp(0.35, cap) / TONE_BINS as f64;
-        result.push((1.0 - strength) * (i + 1) as f64 / TONE_BINS as f64 + strength * cumulative);
+        cumulative += (scale * weight).clamp(parameters.tone_slope_min, cap) / bins as f64;
+        result.push((1.0 - strength) * (i + 1) as f64 / bins as f64 + strength * cumulative);
     }
-    result[TONE_BINS] = 1.0;
-    result
+    result[bins] = 1.0;
+    ensure!(
+        (cumulative - 1.0).abs() <= 1e-8
+            && result
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            && result.windows(2).all(|pair| pair[0] <= pair[1]),
+        "tone normalization did not converge to a monotonic unit curve; increase --param-tone-solver-iterations or reduce --param-tone-solver-upper"
+    );
+    Ok(result)
 }
 
 pub fn srgb_encode(x: f64) -> f64 {
@@ -231,7 +318,36 @@ pub fn render(
     policy: FunctionPolicy,
     transfers: Transfers,
 ) -> Result<Rendered> {
-    let tone = ToneCurve::fit(hist, range, optimized, image.metadata.black_level);
+    render_with_parameters(
+        image,
+        hist,
+        range,
+        optimized,
+        expression,
+        policy,
+        transfers,
+        &Parameters::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_parameters(
+    image: &MonoImage,
+    hist: &Histogram,
+    range: &RangeAnalysis,
+    optimized: bool,
+    expression: Option<&Expression>,
+    policy: FunctionPolicy,
+    transfers: Transfers,
+    parameters: &Parameters,
+) -> Result<Rendered> {
+    let tone = ToneCurve::fit_with_parameters(
+        hist,
+        range,
+        optimized,
+        image.metadata.black_level,
+        parameters,
+    )?;
     let mut values: Vec<f64> = (0..LEVELS)
         .map(|code| tone.map(range.normalize(code as f64)))
         .collect();

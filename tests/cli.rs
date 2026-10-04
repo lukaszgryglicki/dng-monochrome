@@ -95,6 +95,10 @@ fn help_version_and_missing_arguments() {
         defaults.transfers(),
         dng_monochrome::tone::Transfers::default()
     );
+    assert_eq!(
+        defaults.transfers().jpeg,
+        dng_monochrome::tone::Transfer::Linear
+    );
     assert!(defaults.optimization_enabled());
     for flag in ["--help", "-help", "-h"] {
         let output = success(Command::new(BIN).arg(flag).output().unwrap());
@@ -159,13 +163,7 @@ fn default_output_is_sixteen_bit_grayscale_at_maximum_compression() {
     assert_eq!(*png.pixels.iter().min().unwrap(), 0);
     assert_eq!(*png.pixels.iter().max().unwrap(), 65535);
     for (&p, &j) in png.pixels.iter().zip(&jpeg) {
-        let x = f64::from(p) / 65535.0;
-        let display = if x <= 0.0031308 {
-            12.92 * x
-        } else {
-            1.055 * x.powf(1.0 / 2.4) - 0.055
-        };
-        let expected = (display * 255.0).round() as i32;
+        let expected = ((u32::from(p) + 128) / 257) as i32;
         assert!((expected - i32::from(j)).abs() <= 4);
     }
     assert!(!output.join("photo.json").exists());
@@ -412,7 +410,7 @@ fn independent_transfers_and_shared_overrides_have_exact_precedence() {
             vec![],
             Transfers {
                 png: Linear,
-                jpeg: Srgb,
+                jpeg: Linear,
             },
         ),
         (
@@ -433,7 +431,7 @@ fn independent_transfers_and_shared_overrides_have_exact_precedence() {
             vec!["--png-transfer", "srgb"],
             Transfers {
                 png: Srgb,
-                jpeg: Srgb,
+                jpeg: Linear,
             },
         ),
         (

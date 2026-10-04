@@ -1,10 +1,8 @@
-use crate::{range::Histogram, raw::MonoImage};
+use crate::{parameters::Parameters, range::Histogram, raw::MonoImage};
+use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
 
-const SIDE: usize = 16;
-const AREA: usize = SIDE * SIDE;
-const MAX_PATCHES: usize = 12_000;
 const NORMAL_MAD: f64 = 0.674_489_750_196_081_7;
 const QUANTIZATION_VARIANCE: f64 = 1.0 / 12.0;
 
@@ -93,13 +91,17 @@ impl NoiseEstimate {
     }
 
     pub fn signal_for_snr(&self, snr: f64) -> Option<f64> {
+        self.signal_for_snr_with_minimum(snr, Parameters::default().noise_min_sigma)
+    }
+
+    pub(crate) fn signal_for_snr_with_minimum(&self, snr: f64, minimum_sigma: f64) -> Option<f64> {
         if self.read_noise_resolved
             && let Some(model) = self.model
         {
             return Some(model.signal_for_snr(snr).max(1.0));
         }
         self.dark_sigma_codes
-            .filter(|v| *v >= 0.5)
+            .filter(|v| *v >= minimum_sigma)
             .map(|sigma| (snr * sigma).max(1.0))
     }
 }
@@ -125,9 +127,31 @@ impl DynamicRange {
         upper: f64,
         has_range: bool,
     ) -> Self {
+        Self::estimate_with_parameters(
+            noise,
+            black,
+            lower,
+            upper,
+            has_range,
+            &Parameters::default(),
+        )
+    }
+
+    pub(crate) fn estimate_with_parameters(
+        noise: &NoiseEstimate,
+        black: f64,
+        lower: f64,
+        upper: f64,
+        has_range: bool,
+        parameters: &Parameters,
+    ) -> Self {
         let ceiling = (upper - black).max(0.0);
-        let floor1 = has_range.then(|| noise.signal_for_snr(1.0)).flatten();
-        let floor3 = has_range.then(|| noise.signal_for_snr(3.0)).flatten();
+        let floor1 = has_range
+            .then(|| noise.signal_for_snr_with_minimum(1.0, parameters.noise_min_sigma))
+            .flatten();
+        let floor3 = has_range
+            .then(|| noise.signal_for_snr_with_minimum(3.0, parameters.noise_min_sigma))
+            .flatten();
         let stops = |floor: f64| (ceiling / floor).max(1.0).log2();
         let sensitivity = noise
             .read_sigma_fit_sensitivity_codes
@@ -189,49 +213,62 @@ fn percentile(values: &mut [f64], fraction: f64) -> f64 {
     }
 }
 
-fn patch(image: &MonoImage, x: usize, y: usize) -> Option<Patch> {
+fn patch(
+    image: &MonoImage,
+    x: usize,
+    y: usize,
+    parameters: &Parameters,
+    values: &mut [f64],
+    residuals: &mut [f64],
+) -> Option<Patch> {
     let width = image.metadata.width;
     let white = image.metadata.white_level;
-    let center = (SIDE - 1) as f64 / 2.0;
-    let mut values = [0.0; AREA];
+    let side = parameters.noise_patch_side;
+    let area = side * side;
+    let center = (side - 1) as f64 / 2.0;
     let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
-    for row in 0..SIDE {
-        for col in 0..SIDE {
+    for row in 0..side {
+        for col in 0..side {
             let value = image.pixels[(y + row) * width + x + col];
             if value == 0 || value >= white {
                 return None;
             }
             let value = f64::from(value);
-            values[row * SIDE + col] = value;
+            values[row * side + col] = value;
             sum += value;
             sx += (col as f64 - center) * value;
             sy += (row as f64 - center) * value;
         }
     }
-    let mean = sum / AREA as f64;
-    let coordinate_energy = (AREA * (SIDE * SIDE - 1)) as f64 / 12.0;
+    let mean = sum / area as f64;
+    let coordinate_energy = (area * (side * side - 1)) as f64 / 12.0;
     let (bx, by) = (sx / coordinate_energy, sy / coordinate_energy);
-    let mut residuals = [0.0; AREA];
-    for row in 0..SIDE {
-        for col in 0..SIDE {
-            residuals[row * SIDE + col] = (values[row * SIDE + col]
+    for row in 0..side {
+        for col in 0..side {
+            residuals[row * side + col] = (values[row * side + col]
                 - mean
                 - bx * (col as f64 - center)
                 - by * (row as f64 - center))
                 .abs();
         }
     }
-    let sigma =
-        percentile(&mut residuals, 0.5) / NORMAL_MAD * (AREA as f64 / (AREA - 3) as f64).sqrt();
+    let sigma = percentile(residuals, 0.5) / NORMAL_MAD * (area as f64 / (area - 3) as f64).sqrt();
     let mut haar = [0.0; 3];
-    for (index, lag) in [1, 2, 4].into_iter().enumerate() {
+    for (index, lag) in [
+        parameters.noise_haar_lag_small,
+        parameters.noise_haar_lag_medium,
+        parameters.noise_haar_lag_large,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut count = 0;
-        for row in 0..SIDE - lag {
-            for col in 0..SIDE - lag {
-                let offset = row * SIDE + col;
+        for row in 0..side - lag {
+            for col in 0..side - lag {
+                let offset = row * side + col;
                 residuals[count] =
-                    (values[offset] - values[offset + lag] - values[offset + lag * SIDE]
-                        + values[offset + lag * SIDE + lag])
+                    (values[offset] - values[offset + lag] - values[offset + lag * side]
+                        + values[offset + lag * side + lag])
                         .abs()
                         * 0.5;
                 count += 1;
@@ -249,7 +286,7 @@ fn patch(image: &MonoImage, x: usize, y: usize) -> Option<Patch> {
     })
 }
 
-fn summarize(patches: &[Patch], model: Option<NoiseModel>) -> NoiseBin {
+fn summarize(patches: &[Patch], model: Option<NoiseModel>, parameters: &Parameters) -> NoiseBin {
     let mut means: Vec<_> = patches.iter().map(|p| p.signal).collect();
     let signal = percentile(&mut means, 0.5);
     let mut variances: Vec<_> = patches
@@ -258,9 +295,14 @@ fn summarize(patches: &[Patch], model: Option<NoiseModel>) -> NoiseBin {
             p.variance / model.map_or(1.0, |m| m.variance(p.signal).max(QUANTIZATION_VARIANCE))
         })
         .collect();
-    // Correct the lower quartile's sampling bias for a Gaussian MAD with 253 residual degrees of freedom.
-    let correction = (1.0 - NORMAL_MAD * (1.3605 / (AREA - 3) as f64).sqrt()).powi(2);
-    let variance = percentile(&mut variances, 0.25) / correction
+    let degrees = parameters.noise_patch_side.pow(2) - 3;
+    let uncertainty = (1.3605 / degrees as f64).sqrt();
+    let correction = if parameters.noise_variance_quantile == 0.25 {
+        (1.0 - NORMAL_MAD * uncertainty).powi(2)
+    } else {
+        (1.0 + normal_quantile(parameters.noise_variance_quantile) * uncertainty).powi(2)
+    };
+    let variance = percentile(&mut variances, parameters.noise_variance_quantile) / correction
         * model.map_or(1.0, |m| m.variance(signal).max(QUANTIZATION_VARIANCE));
     NoiseBin {
         signal_codes: signal,
@@ -269,19 +311,60 @@ fn summarize(patches: &[Patch], model: Option<NoiseModel>) -> NoiseBin {
     }
 }
 
-fn fit_model(bins: &[NoiseBin]) -> Option<(NoiseModel, f64)> {
-    if bins.len() < 6 || bins.iter().any(|p| p.sigma_codes < 0.5) {
+fn normal_quantile(fraction: f64) -> f64 {
+    // Acklam's central inverse-normal approximation; configured quantiles are in [0.05, 0.95].
+    let q = fraction - 0.5;
+    let r = q * q;
+    let numerator = (((((-39.69683028665376 * r + 220.9460984245205) * r - 275.9285104469687)
+        * r
+        + 138.357751867269)
+        * r
+        - 30.66479806614716)
+        * r
+        + 2.506628277459239)
+        * q;
+    let denominator = ((((-54.47609879822406 * r + 161.5858368580409) * r - 155.6989798598866)
+        * r
+        + 66.80131188771972)
+        * r
+        - 13.28068155288572)
+        * r
+        + 1.0;
+    numerator / denominator
+}
+
+#[test]
+fn normal_quantile_matches_gaussian_reference_values() {
+    for (fraction, expected) in [
+        (0.05, -1.644853626951473),
+        (0.1, -1.2815515655446004),
+        (0.25, -NORMAL_MAD),
+        (0.5, 0.0),
+        (0.75, NORMAL_MAD),
+        (0.9, 1.2815515655446004),
+        (0.95, 1.644853626951473),
+    ] {
+        assert!((normal_quantile(fraction) - expected).abs() < 3e-9);
+    }
+}
+
+fn fit_model(bins: &[NoiseBin], parameters: &Parameters) -> Option<(NoiseModel, f64)> {
+    if bins.len() < parameters.noise_fit_min_bins
+        || bins
+            .iter()
+            .any(|p| p.sigma_codes < parameters.noise_min_sigma)
+    {
         return None;
     }
     let span = bins.last()?.signal_codes - bins.first()?.signal_codes;
-    if span < 16.0 {
+    if span < parameters.noise_fit_min_span {
         return None;
     }
     let mut slopes = Vec::new();
     for (i, left) in bins.iter().enumerate() {
         for right in &bins[i + 1..] {
             let delta = right.signal_codes - left.signal_codes;
-            if delta > 0.15 * span {
+            if delta > parameters.noise_fit_pair_separation * span {
                 slopes.push((right.sigma_codes.powi(2) - left.sigma_codes.powi(2)) / delta);
             }
         }
@@ -300,13 +383,15 @@ fn fit_model(bins: &[NoiseBin]) -> Option<(NoiseModel, f64)> {
         .map(|p| p.sigma_codes.powi(2))
         .fold(f64::INFINITY, f64::min)
         .max(QUANTIZATION_VARIANCE);
-    for _ in 0..4 {
+    for _ in 0..parameters.noise_fit_iterations {
         let (mut sw, mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
         for bin in bins {
             let x = bin.signal_codes / span;
             let y = bin.sigma_codes.powi(2).max(QUANTIZATION_VARIANCE);
             let residual = ((y - (a * bin.signal_codes + b)) / y).abs();
-            let weight = (minimum_variance / y).powi(2) * (0.15 / residual.max(0.15));
+            let weight = (minimum_variance / y).powi(2)
+                * (parameters.noise_fit_residual_scale
+                    / residual.max(parameters.noise_fit_residual_scale));
             sw += weight;
             sx += weight * x;
             sy += weight * y;
@@ -323,7 +408,7 @@ fn fit_model(bins: &[NoiseBin]) -> Option<(NoiseModel, f64)> {
     if a < 0.0 {
         let mut variances: Vec<_> = bins.iter().map(|p| p.sigma_codes.powi(2)).collect();
         let center = percentile(&mut variances, 0.5);
-        if -a * span > 0.15 * center {
+        if -a * span > parameters.noise_fit_negative_slope * center {
             return None;
         }
         a = 0.0;
@@ -345,13 +430,32 @@ fn fit_model(bins: &[NoiseBin]) -> Option<(NoiseModel, f64)> {
         })
         .collect();
     let error = percentile(&mut errors, 0.5);
-    (error <= 0.25).then_some((model, error))
+    (error <= parameters.noise_fit_max_error).then_some((model, error))
 }
 
 pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
+    estimate_noise_impl(image, hist, &Parameters::default())
+}
+
+pub fn estimate_noise_with_parameters(
+    image: &MonoImage,
+    hist: &Histogram,
+    parameters: &Parameters,
+) -> Result<NoiseEstimate> {
+    parameters.validate()?;
+    Ok(estimate_noise_impl(image, hist, parameters))
+}
+
+fn estimate_noise_impl(
+    image: &MonoImage,
+    hist: &Histogram,
+    parameters: &Parameters,
+) -> NoiseEstimate {
     let (width, height) = (image.metadata.width, image.metadata.height);
+    let side = parameters.noise_patch_side;
+    let area = side * side;
     let mut estimate = NoiseEstimate {
-        patch_side: SIDE,
+        patch_side: side,
         ..NoiseEstimate::default()
     };
     if let Some([shot, read]) = image.metadata.noise_profile {
@@ -364,21 +468,33 @@ pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
         estimate.read_noise_resolved = true;
         estimate.confidence = Confidence::Moderate;
     }
-    if width < SIDE || height < SIDE {
+    if width < side || height < side {
         estimate
             .notes
             .push("Image too small for spatial noise estimation.".into());
         return estimate;
     }
-    let step = ((image.pixels.len() as f64 / MAX_PATCHES as f64)
+    let step = ((image.pixels.len() as f64 / parameters.noise_max_patches as f64)
         .sqrt()
         .ceil() as usize)
-        .max(SIDE);
-    let cols = (width - SIDE) / step + 1;
-    let rows = (height - SIDE) / step + 1;
+        .max(side);
+    let cols = (width - side) / step + 1;
+    let rows = (height - side) / step + 1;
     let samples: Vec<_> = (0..cols * rows)
         .into_par_iter()
-        .map(|i| patch(image, (i % cols) * step, (i / cols) * step))
+        .map_init(
+            || (vec![0.0; area], vec![0.0; area]),
+            |(values, residuals), i| {
+                patch(
+                    image,
+                    (i % cols) * step,
+                    (i / cols) * step,
+                    parameters,
+                    values,
+                    residuals,
+                )
+            },
+        )
         .collect();
     estimate.patches_examined = samples.len();
     let mut valid: Vec<_> = samples.into_iter().flatten().collect();
@@ -386,39 +502,47 @@ pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
     valid.sort_unstable_by(|a, b| a.signal.total_cmp(&b.signal));
     let weak: Vec<_> = valid
         .iter()
-        .filter(|p| p.texture <= 1.5 && p.lag_growth <= 1.35)
+        .filter(|p| {
+            p.texture <= parameters.noise_texture_max
+                && p.lag_growth <= parameters.noise_lag_growth_max
+        })
         .copied()
         .collect();
     estimate.weak_texture_patches = weak.len();
-    let candidates = if weak.len() >= 32 { &weak } else { &valid };
-    if candidates.len() < 32 {
+    let candidates = if weak.len() >= parameters.noise_min_patches {
+        &weak
+    } else {
+        &valid
+    };
+    if candidates.len() < parameters.noise_min_patches {
         estimate
             .notes
             .push("Too few uncensored patches; spatial noise is unavailable.".into());
         return estimate;
     }
-    let count = (candidates.len() / 48).clamp(1, 16);
+    let count =
+        (candidates.len() / parameters.noise_patches_per_bin).clamp(1, parameters.noise_max_bins);
     let chunk = candidates.len().div_ceil(count);
     let calibrated = estimate.model.is_some();
     estimate.bins = candidates
         .chunks(chunk)
-        .map(|p| summarize(p, None))
+        .map(|p| summarize(p, None, parameters))
         .collect();
-    if !calibrated && weak.len() >= 32 {
-        for _ in 0..3 {
-            if let Some((model, error)) = fit_model(&estimate.bins) {
+    if !calibrated && weak.len() >= parameters.noise_min_patches {
+        for _ in 0..parameters.noise_refinement_passes {
+            if let Some((model, error)) = fit_model(&estimate.bins, parameters) {
                 estimate.model = Some(model);
                 estimate.relative_fit_error = Some(error);
                 estimate.bins = candidates
                     .chunks(chunk)
-                    .map(|p| summarize(p, Some(model)))
+                    .map(|p| summarize(p, Some(model), parameters))
                     .collect();
             } else {
                 estimate.model = None;
                 estimate.relative_fit_error = None;
             }
         }
-        if let Some((model, error)) = fit_model(&estimate.bins) {
+        if let Some((model, error)) = fit_model(&estimate.bins, parameters) {
             estimate.model = Some(model);
             estimate.relative_fit_error = Some(error);
             let mut sigmas = Vec::new();
@@ -430,36 +554,51 @@ pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
                     .filter(|(i, _)| *i != excluded)
                     .map(|(_, p)| p.clone())
                     .collect();
-                if let Some((model, _)) = fit_model(&subset) {
+                if let Some((model, _)) = fit_model(&subset, parameters) {
                     sigmas.push(model.read_variance.sqrt());
                 }
             }
-            if sigmas.len() * 5 >= estimate.bins.len() * 4 {
-                let bounds = [percentile(&mut sigmas, 0.1), percentile(&mut sigmas, 0.9)];
+            if sigmas.len() as f64
+                >= estimate.bins.len() as f64 * parameters.noise_fit_success_fraction
+            {
+                let bounds = [
+                    percentile(&mut sigmas, parameters.noise_sensitivity_tail),
+                    percentile(&mut sigmas, 1.0 - parameters.noise_sensitivity_tail),
+                ];
                 estimate.read_sigma_fit_sensitivity_codes = Some(bounds);
                 let first = estimate.bins.first().expect("nonempty bins").signal_codes;
                 let last = estimate.bins.last().expect("nonempty bins").signal_codes;
-                estimate.read_noise_resolved = bounds[1] <= 3.0 * bounds[0]
-                    && (first <= 0.35 * (last - first)
-                        || first <= 6.0 * model.read_variance.sqrt());
+                estimate.read_noise_resolved = bounds[1]
+                    <= parameters.noise_read_ratio_max * bounds[0]
+                    && (first <= parameters.noise_extrapolation_fraction * (last - first)
+                        || first
+                            <= parameters.noise_shadow_read_sigmas * model.read_variance.sqrt());
             }
         } else {
             estimate.model = None;
             estimate.relative_fit_error = None;
         }
     }
-    let tail_count = (candidates.len() / 5).max(32).min(candidates.len());
-    let dark = summarize(&candidates[..tail_count], estimate.model);
-    let light = summarize(&candidates[candidates.len() - tail_count..], estimate.model);
-    estimate.dark_sigma_codes = (dark.sigma_codes >= 0.5).then_some(dark.sigma_codes);
-    estimate.light_sigma_codes = (light.sigma_codes >= 0.5).then_some(light.sigma_codes);
+    let tail_count = (candidates.len() / parameters.noise_tail_divisor)
+        .max(parameters.noise_min_patches)
+        .min(candidates.len());
+    let dark = summarize(&candidates[..tail_count], estimate.model, parameters);
+    let light = summarize(
+        &candidates[candidates.len() - tail_count..],
+        estimate.model,
+        parameters,
+    );
+    estimate.dark_sigma_codes =
+        (dark.sigma_codes >= parameters.noise_min_sigma).then_some(dark.sigma_codes);
+    estimate.light_sigma_codes =
+        (light.sigma_codes >= parameters.noise_min_sigma).then_some(light.sigma_codes);
     estimate.dark_samples = tail_count;
     estimate.light_samples = tail_count;
     estimate.shadow_signal_codes = Some(dark.signal_codes);
     estimate.highlight_signal_codes = Some(light.signal_codes);
     let mut correlations: Vec<_> = candidates
         .iter()
-        .filter(|p| p.variance >= 0.25)
+        .filter(|p| p.variance >= parameters.noise_correlation_min_variance)
         .map(|p| p.correlation)
         .collect();
     if !correlations.is_empty() {
@@ -475,12 +614,15 @@ pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
     if !estimate.read_noise_resolved {
         estimate.notes.push("Read-noise extrapolation is unsupported; DR uses measured shadow noise, which includes shot noise and possibly texture.".into());
     }
-    if weak.len() < 32 {
+    if weak.len() < parameters.noise_min_patches {
         estimate.notes.push(
             "Too few weak-texture patches; the conservative proxy includes image structure.".into(),
         );
     }
-    if estimate.correlation_ratio.is_some_and(|v| v > 1.3) {
+    if estimate
+        .correlation_ratio
+        .is_some_and(|v| v > parameters.noise_correlation_warning)
+    {
         estimate.notes.push("Spatial correlation detected: detrended patch noise is used instead of assuming independent adjacent pixels.".into());
     }
     if let Some(model) = estimate.model.filter(|_| calibrated) {
@@ -496,10 +638,12 @@ pub fn estimate_noise(image: &MonoImage, hist: &Histogram) -> NoiseEstimate {
             })
             .collect();
         let ratio = percentile(&mut ratios, 0.5);
-        if !(0.5..=2.0).contains(&ratio) {
+        if !(1.0 / parameters.noise_profile_tolerance..=parameters.noise_profile_tolerance)
+            .contains(&ratio)
+        {
             estimate.confidence = Confidence::Low;
             estimate.read_noise_resolved = false;
-            estimate.notes.push("DNG NoiseProfile disagrees with spatial observations by more than 2x; DR uses the measured shadow proxy.".into());
+            estimate.notes.push(format!("DNG NoiseProfile disagrees with spatial observations by more than {}x; DR uses the measured shadow proxy.", parameters.noise_profile_tolerance));
         }
     }
     if hist.min == hist.max {

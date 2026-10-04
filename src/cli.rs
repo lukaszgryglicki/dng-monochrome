@@ -1,12 +1,13 @@
 use crate::{
     expression::{Expression, FunctionPolicy},
     output::{self, OutputPaths},
+    parameters::Parameters,
     range::{self, Histogram, RangeOptions},
     raw,
     tone::{self, Transfer, Transfers},
 };
 use anyhow::{Context, Result, ensure};
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, CommandFactory, Parser};
 use serde::Serialize;
 use std::{
     collections::HashSet,
@@ -20,13 +21,13 @@ use walkdir::WalkDir;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Develop monochrome DNGs into full-precision 16-bit grayscale PNGs and display-matched JPEGs.",
+    about = "Develop monochrome DNGs into full-precision 16-bit grayscale PNGs and grayscale JPEGs.",
     long_about = "Develop integer monochrome DNGs without demosaicing. Directories are searched recursively. \
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
         true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
-        maximum lossless compression and default linear transfer; JPEGs are display-encoded 8-bit grayscale. \
+        maximum lossless compression; JPEGs are 8-bit grayscale. \
         Both carry photographic EXIF. Optimization is on by default, clipping strength is 3, \
-        PNG transfer is linear and JPEG transfer is sRGB.",
+        PNG and JPEG transfers are both linear. Tunable constants are exposed as --param-* options.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
         Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function -> policy -> transfers.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
@@ -136,7 +137,7 @@ pub struct Cli {
         long,
         visible_alias = "jpg-transfer",
         value_enum,
-        help = "JPEG transfer; default srgb, overrides --transfer; linear has coarser shadows"
+        help = "JPEG transfer; default linear, overrides --transfer; srgb has finer shadows"
     )]
     pub jpeg_transfer: Option<Transfer>,
 
@@ -185,11 +186,18 @@ pub struct Cli {
         help = "Suppress progress, warnings and completion; errors and --analyze JSON remain"
     )]
     pub silent: bool,
+
+    #[command(flatten)]
+    pub parameters: Parameters,
 }
 
 impl Cli {
     pub fn try_parse_compat(args: impl IntoIterator<Item = OsString>) -> Result<Self, clap::Error> {
-        Self::try_parse_from(normalize_arguments(args))
+        let cli = Self::try_parse_from(normalize_arguments(args))?;
+        cli.parameters.validate().map_err(|error| {
+            Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
+        Ok(cli)
     }
 
     pub fn policy(&self) -> FunctionPolicy {
@@ -286,7 +294,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                 return arg;
             }
             let name = text.trim_start_matches('-').split('=').next().unwrap_or("");
-            let known_value = VALUES.contains(&name);
+            let known_value = VALUES.contains(&name) || name.starts_with("param-");
             if !text.contains('=') && (known_value && text.starts_with('-') || text == "-o") {
                 value_next = true;
             }
@@ -361,13 +369,18 @@ fn is_dng(path: &Path) -> bool {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    cli.parameters.validate()?;
     let range_options = RangeOptions {
         dark: cli.dark,
         light: cli.light,
         clip_strength: cli.clip_strength,
     };
     range_options.validate()?;
-    let expression = cli.function.as_deref().map(Expression::parse).transpose()?;
+    let expression = cli
+        .function
+        .as_deref()
+        .map(|source| Expression::parse_with_parameters(source, &cli.parameters))
+        .transpose()?;
     let inputs = discover(&cli.inputs)?;
     let transfers = cli.transfers();
     let modes = if cli.both {
@@ -410,8 +423,8 @@ pub fn run(cli: Cli) -> Result<()> {
             let start = Instant::now();
             let decoded = (|| -> Result<_> {
                 let image = raw::decode(&input.path, cli.no_crop)?;
-                let hist = Histogram::new(&image.pixels)?;
-                let range = range::analyze(&image, &hist, range_options)?;
+                let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
+                let range = range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
                 Ok((image, hist, range))
             })();
             let (image, hist, range) = match decoded {
@@ -432,6 +445,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     "source": input.path.to_string_lossy(),
                     "metadata": image.metadata,
                     "range": range,
+                    "parameters": cli.parameters,
                 });
                 eprintln!("{}", serde_json::to_string_pretty(&diagnostic)?);
             }
@@ -441,6 +455,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     "source": input.path.to_string_lossy(),
                     "metadata": image.metadata,
                     "range": range,
+                    "parameters": cli.parameters,
                 });
                 serde_json::to_writer(io::stdout().lock(), &report)?;
                 writeln!(io::stdout().lock())?;
@@ -450,8 +465,9 @@ pub fn run(cli: Cli) -> Result<()> {
             for &optimized in &modes {
                 let mode = if optimized { "best" } else { "auto" };
                 let result = (|| -> Result<()> {
-                    let rendered = tone::render(
+                    let rendered = tone::render_with_parameters(
                         &image, &hist, &range, optimized, expression.as_ref(), cli.policy(), transfers,
+                        &cli.parameters,
                     )?;
                     let paths = output_paths(&cli, input, optimized);
                     let report = ConversionReport {
@@ -469,27 +485,35 @@ pub fn run(cli: Cli) -> Result<()> {
                         jpeg_quality: cli.jpeg_quality,
                         png_compression: "maximum (DEFLATE level 9, adaptive filtering)",
                         threads,
+                        parameters: &cli.parameters,
                     };
-                    output::save(
+                    output::save_with_parameters(
                         &paths, &image, &rendered, &report, transfers,
                         cli.jpeg_quality, cli.overwrite,
+                        &cli.parameters,
                     )?;
                     if !cli.silent {
                         let dr = range.dynamic_range.snr1_stops.map_or_else(
                             || "unavailable (insufficient noise evidence)".to_owned(),
-                            |value| format!("{value:.1} bits/stops (noise-limited, {:?} confidence)",
-                                range.dynamic_range.confidence),
+                            |value| format!("{value:.digits$} bits/stops (noise-limited, {:?} confidence)",
+                                range.dynamic_range.confidence, digits = cli.parameters.progress_dr_decimals),
                         );
                         eprintln!(
-                        "[{}/{}] {} [{mode}, strength {}] {}; {:.1}..{:.1}, clip {:.3}%/{:.3}%, approx DR {dr}, raw-code span {:.1} bits, {} codes -> {} (elapsed {:.1}s)",
-                        index + 1, inputs.len(), input.relative.display(), cli.clip_strength, exposure_summary(&image), range.lower, range.upper,
+                        "[{}/{}] {} [{mode}, strength {}] {}; {:.range_digits$}..{:.range_digits$}, clip {:.clip_digits$}%/{:.clip_digits$}%, approx DR {dr}, raw-code span {:.dr_digits$} bits, {} codes -> {} (elapsed {:.elapsed_digits$}s)",
+                        index + 1, inputs.len(), input.relative.display(), cli.clip_strength, exposure_summary(&image, &cli.parameters), range.lower, range.upper,
                         range.clipped_dark_percent, range.clipped_light_percent,
                         range.retained_span_bits, rendered.stats.png_occupied_codes, paths.png.display(), start.elapsed().as_secs_f64(),
+                        range_digits = cli.parameters.progress_range_decimals,
+                        clip_digits = cli.parameters.progress_clip_decimals,
+                        dr_digits = cli.parameters.progress_dr_decimals,
+                        elapsed_digits = cli.parameters.progress_elapsed_decimals,
                         );
                         if optimized {
-                            let mapping = (1..20).map(|i| {
-                                let x = f64::from(i) / 20.0;
-                                format!("{x:.2}->{:.5}", rendered.tone.map(x))
+                            let mapping = (1..cli.parameters.mapping_steps).map(|i| {
+                                let x = i as f64 / cli.parameters.mapping_steps as f64;
+                                format!("{x:.input_digits$}->{:.output_digits$}", rendered.tone.map(x),
+                                    input_digits = cli.parameters.mapping_input_decimals,
+                                    output_digits = cli.parameters.mapping_output_decimals)
                             }).collect::<Vec<_>>().join(", ");
                             eprintln!("  best mapping (normalized linear, before --func and output transfer): {mapping}");
                         }
@@ -520,7 +544,7 @@ pub fn run(cli: Cli) -> Result<()> {
     })
 }
 
-fn exposure_summary(image: &raw::MonoImage) -> String {
+fn exposure_summary(image: &raw::MonoImage, parameters: &Parameters) -> String {
     let metadata = &image.metadata;
     let iso = metadata
         .iso
@@ -529,10 +553,21 @@ fn exposure_summary(image: &raw::MonoImage) -> String {
         || {
             metadata.aperture_value_apex.map_or_else(
                 || "f/unknown".into(),
-                |v| format!("f/{:.2} (APEX)", (v * 0.5).exp2()),
+                |v| {
+                    format!(
+                        "f/{:.digits$} (APEX)",
+                        (v * 0.5).exp2(),
+                        digits = parameters.progress_aperture_decimals
+                    )
+                },
             )
         },
-        |v| format!("f/{v:.2}"),
+        |v| {
+            format!(
+                "f/{v:.digits$}",
+                digits = parameters.progress_aperture_decimals
+            )
+        },
     );
     let time = image.source_metadata.exif.exposure_time.map_or_else(
         || "unknown".into(),
@@ -572,4 +607,5 @@ struct ConversionReport<'a> {
     jpeg_quality: u8,
     png_compression: &'static str,
     threads: usize,
+    parameters: &'a Parameters,
 }

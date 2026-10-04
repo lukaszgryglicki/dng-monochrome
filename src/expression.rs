@@ -1,4 +1,7 @@
-use crate::range::{Histogram, LEVELS};
+use crate::{
+    parameters::Parameters,
+    range::{Histogram, LEVELS},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 
@@ -20,13 +23,26 @@ pub struct Expression {
 
 impl Expression {
     pub fn parse(source: &str) -> Result<Self> {
-        ensure!(source.len() <= 16_384, "expression exceeds 16384 bytes");
+        Self::parse_with_parameters(source, &Parameters::default())
+    }
+
+    pub fn parse_with_parameters(source: &str, parameters: &Parameters) -> Result<Self> {
+        parameters.validate()?;
+        ensure!(
+            source.len() <= parameters.expression_max_bytes,
+            "expression exceeds {} bytes",
+            parameters.expression_max_bytes
+        );
         let mut depth = 0usize;
         for ch in source.chars() {
             match ch {
                 '(' => {
                     depth += 1;
-                    ensure!(depth <= 128, "expression exceeds 128 nested parentheses");
+                    ensure!(
+                        depth <= parameters.expression_max_parentheses,
+                        "expression exceeds {} nested parentheses",
+                        parameters.expression_max_parentheses
+                    );
                 }
                 ')' => depth = depth.saturating_sub(1),
                 _ => {}
@@ -37,6 +53,7 @@ impl Expression {
             position: 0,
             token: Token::End,
             program: Vec::new(),
+            max_depth: parameters.expression_max_depth,
         };
         parser.advance()?;
         parser.expression(0, 0)?;
@@ -180,6 +197,7 @@ struct Parser<'a> {
     position: usize,
     token: Token,
     program: Vec<Instruction>,
+    max_depth: usize,
 }
 
 impl Parser<'_> {
@@ -266,7 +284,11 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self, minimum: u8, depth: usize) -> Result<()> {
-        ensure!(depth <= 256, "expression exceeds 256 nested operations");
+        ensure!(
+            depth <= self.max_depth,
+            "expression exceeds {} nested operations",
+            self.max_depth
+        );
         match self.advance()? {
             Token::Number(value) => self.program.push(Instruction::Value(value)),
             Token::Name(name) if matches!(self.token, Token::Symbol(b'(')) => {

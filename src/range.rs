@@ -1,12 +1,14 @@
-use crate::noise::DynamicRange;
 pub use crate::noise::{NoiseEstimate, estimate_noise};
 use crate::raw::MonoImage;
+use crate::{
+    noise::{DynamicRange, estimate_noise_with_parameters},
+    parameters::Parameters,
+};
 use anyhow::{Result, ensure};
 use rayon::prelude::*;
 use serde::Serialize;
 
 pub const LEVELS: usize = 65536;
-const AUTO_CAP: f64 = 0.02;
 
 #[derive(Debug)]
 pub struct Histogram {
@@ -18,11 +20,16 @@ pub struct Histogram {
 
 impl Histogram {
     pub fn new(pixels: &[u16]) -> Result<Self> {
+        Self::with_parameters(pixels, &Parameters::default())
+    }
+
+    pub fn with_parameters(pixels: &[u16], parameters: &Parameters) -> Result<Self> {
+        parameters.validate()?;
         ensure!(!pixels.is_empty(), "cannot analyze an empty image");
         let chunk = pixels
             .len()
-            .div_ceil(rayon::current_num_threads() * 4)
-            .max(262144);
+            .div_ceil(rayon::current_num_threads() * parameters.histogram_chunks_per_thread)
+            .max(parameters.histogram_min_chunk);
         let bins = pixels
             .par_chunks(chunk)
             .map(|part| {
@@ -172,6 +179,16 @@ pub fn analyze(
     hist: &Histogram,
     options: RangeOptions,
 ) -> Result<RangeAnalysis> {
+    analyze_with_parameters(image, hist, options, &Parameters::default())
+}
+
+pub fn analyze_with_parameters(
+    image: &MonoImage,
+    hist: &Histogram,
+    options: RangeOptions,
+    parameters: &Parameters,
+) -> Result<RangeAnalysis> {
+    parameters.validate()?;
     options.validate()?;
     ensure!(
         image.metadata.width.checked_mul(image.metadata.height) == Some(image.pixels.len())
@@ -180,22 +197,25 @@ pub fn analyze(
     );
     let black = image.metadata.black_level;
     let white = f64::from(image.metadata.white_level);
-    let noise = estimate_noise(image, hist);
-    let (dark_knee, dark_percent) = tail_knee(hist, false, noise.dark_sigma_codes);
-    let (light_knee, light_percent) = tail_knee(hist, true, noise.light_sigma_codes);
+    let noise = estimate_noise_with_parameters(image, hist, parameters)?;
+    let (dark_knee, dark_percent) = tail_knee(hist, false, noise.dark_sigma_codes, parameters);
+    let (light_knee, light_percent) = tail_knee(hist, true, noise.light_sigma_codes, parameters);
     let (dark_knee, dark_coherent_samples) = if options.dark.is_none() && dark_percent > 0.0 {
-        protect_coherent_tail(image, hist, &noise, dark_knee, false)
+        protect_coherent_tail(image, hist, &noise, dark_knee, false, parameters)
     } else {
         (dark_knee, 0)
     };
     let (light_knee, light_coherent_samples) = if options.light.is_none() && light_percent > 0.0 {
-        protect_coherent_tail(image, hist, &noise, light_knee, true)
+        protect_coherent_tail(image, hist, &noise, light_knee, true, parameters)
     } else {
         (light_knee, 0)
     };
-    let dark_cap = f64::from(hist.tail_value(AUTO_CAP, false));
-    let light_cap = f64::from(hist.tail_value(AUTO_CAP, true));
-    let noise_floor = black + noise.signal_for_snr(2.0).unwrap_or(0.0);
+    let dark_cap = f64::from(hist.tail_value(parameters.auto_cap, false));
+    let light_cap = f64::from(hist.tail_value(parameters.auto_cap, true));
+    let noise_floor = black
+        + noise
+            .signal_for_snr_with_minimum(parameters.dark_snr, parameters.noise_min_sigma)
+            .unwrap_or(0.0);
     let mut lower = options.dark.map_or_else(
         || black.max(dark_knee.max(noise_floor).min(dark_cap)),
         |p| f64::from(hist.tail_value(p / 100.0, false)),
@@ -238,7 +258,13 @@ pub fn analyze(
         let blend = f64::from(options.clip_strength - 1) / 8.0;
         let stronger = |bound: f64, knee: f64, high: bool| {
             let current = hist.percent_where(|v| if high { v > bound } else { v < bound });
-            let strongest = (1.0 + 0.5 * knee).clamp(1.0, 2.0).max(current);
+            let strongest = (parameters.strength_target_base
+                + parameters.strength_knee_weight * knee)
+                .clamp(
+                    parameters.strength_target_min,
+                    parameters.strength_target_max,
+                )
+                .max(current);
             let target = current + blend * (strongest - current);
             if target <= current {
                 return bound;
@@ -261,7 +287,7 @@ pub fn analyze(
             upper
         };
         if selected_lower >= selected_upper {
-            let minimum_span = (upper - lower).min(1.0);
+            let minimum_span = (upper - lower).min(parameters.tied_span);
             if options.dark.is_none() && options.light.is_none() {
                 let center = ((selected_lower + selected_upper) * 0.5)
                     .clamp(lower + minimum_span * 0.5, upper - minimum_span * 0.5);
@@ -293,11 +319,17 @@ pub fn analyze(
         .dark_sigma_codes
         .filter(|sigma| *sigma > 0.0)
         .map(|sigma| ((upper - lower) / sigma).max(1.0).log2());
-    let dynamic_range =
-        DynamicRange::estimate(&noise, black, lower, upper.min(white), hist.min != hist.max);
+    let dynamic_range = DynamicRange::estimate_with_parameters(
+        &noise,
+        black,
+        lower,
+        upper.min(white),
+        hist.min != hist.max,
+        parameters,
+    );
     if noise
         .dark_sigma_codes
-        .is_some_and(|sigma| upper - lower < 8.0 * sigma)
+        .is_some_and(|sigma| upper - lower < parameters.noise_warning_sigmas * sigma)
     {
         warnings.push("Selected signal span is small relative to estimated noise; stretching will amplify noise.".into());
     }
@@ -343,46 +375,64 @@ fn protect_coherent_tail(
     noise: &NoiseEstimate,
     bound: f64,
     high: bool,
+    parameters: &Parameters,
 ) -> (f64, usize) {
     let (width, height) = (image.metadata.width, image.metadata.height);
-    if width < 3 || height < 3 {
+    let radius = parameters.coherent_radius;
+    let side = 2 * radius + 1;
+    if width < side || height < side {
         return (bound, 0);
     }
-    let step = ((image.pixels.len() as f64 / 500_000.0).sqrt().ceil() as usize).max(1);
-    let cols = (width - 3) / step + 1;
-    let rows = (height - 3) / step + 1;
+    let step = ((image.pixels.len() as f64 / parameters.coherent_samples as f64)
+        .sqrt()
+        .ceil() as usize)
+        .max(1);
+    let cols = (width - side) / step + 1;
+    let rows = (height - side) / step + 1;
+    let neighbor_count = side * side - 1;
     let in_tail = |v: f64| if high { v > bound } else { v < bound };
     let mut supported: Vec<f64> = (0..cols * rows)
         .into_par_iter()
-        .filter_map(|i| {
-            let (x, y) = (1 + (i % cols) * step, 1 + (i / cols) * step);
-            if !in_tail(f64::from(image.pixels[y * width + x])) {
-                return None;
-            }
-            let mut neighbors = [0u16; 8];
-            let mut n = 0;
-            for row in y - 1..=y + 1 {
-                for col in x - 1..=x + 1 {
-                    if row != y || col != x {
-                        neighbors[n] = image.pixels[row * width + col];
-                        n += 1;
+        .map_init(
+            || vec![0u16; neighbor_count],
+            |neighbors, i| {
+                let (x, y) = (radius + (i % cols) * step, radius + (i / cols) * step);
+                if !in_tail(f64::from(image.pixels[y * width + x])) {
+                    return None;
+                }
+                let mut n = 0;
+                for row in y - radius..=y + radius {
+                    for col in x - radius..=x + radius {
+                        if row != y || col != x {
+                            neighbors[n] = image.pixels[row * width + col];
+                            n += 1;
+                        }
                     }
                 }
-            }
-            if neighbors.iter().filter(|v| in_tail(f64::from(**v))).count() < 5 {
-                return None;
-            }
-            neighbors.sort_unstable();
-            Some((f64::from(neighbors[3]) + f64::from(neighbors[4])) * 0.5)
-        })
+                if neighbors.iter().filter(|v| in_tail(f64::from(**v))).count()
+                    < parameters.coherent_neighbors
+                {
+                    return None;
+                }
+                neighbors.sort_unstable();
+                let middle = neighbor_count / 2;
+                Some((f64::from(neighbors[middle - 1]) + f64::from(neighbors[middle])) * 0.5)
+            },
+        )
+        .flatten()
         .collect();
-    if supported.len() < 4 {
+    if supported.len() < parameters.coherent_min_support {
         return (bound, supported.len());
     }
     supported.sort_unstable_by(f64::total_cmp);
-    let rank = ((supported.len() - 1) as f64 * if high { 0.995 } else { 0.005 }) as usize;
+    let fraction = if high {
+        1.0 - parameters.coherent_tail_fraction
+    } else {
+        parameters.coherent_tail_fraction
+    };
+    let rank = ((supported.len() - 1) as f64 * fraction) as usize;
     let value = supported[rank];
-    let margin = 2.0
+    let margin = parameters.coherent_noise_margin
         * noise
             .sigma_at((value - image.metadata.black_level).max(0.0))
             .unwrap_or(0.0);
@@ -394,23 +444,28 @@ fn protect_coherent_tail(
     (protected, supported.len())
 }
 
-fn tail_knee(hist: &Histogram, high: bool, sigma: Option<f64>) -> (f64, f64) {
+fn tail_knee(
+    hist: &Histogram,
+    high: bool,
+    sigma: Option<f64>,
+    parameters: &Parameters,
+) -> (f64, f64) {
     let outer = f64::from(if high { hist.max } else { hist.min });
-    let inner = f64::from(hist.tail_value(AUTO_CAP, high));
+    let inner = f64::from(hist.tail_value(parameters.auto_cap, high));
     let span = (inner - outer).abs();
-    if span < (2.0 * sigma.unwrap_or(0.0)).max(4.0) {
+    if span < (parameters.tail_noise_sigma * sigma.unwrap_or(0.0)).max(parameters.tail_min_span) {
         return (outer, 0.0);
     }
     let mut best = (0.0, outer, 0.0);
-    for i in 1..200 {
-        let fraction = AUTO_CAP * f64::from(i) / 200.0;
+    for i in 1..parameters.tail_steps {
+        let fraction = parameters.auto_cap * i as f64 / parameters.tail_steps as f64;
         let value = f64::from(hist.tail_value(fraction, high));
-        let score = (value - outer).abs() / span - f64::from(i) / 200.0;
+        let score = (value - outer).abs() / span - i as f64 / parameters.tail_steps as f64;
         if score > best.0 {
             best = (score, value, fraction * 100.0);
         }
     }
-    if best.0 >= 0.2 {
+    if best.0 >= parameters.tail_knee_score {
         (best.1, best.2)
     } else {
         (outer, 0.0)

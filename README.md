@@ -7,11 +7,11 @@ an embedded preview.
 PNG is always lossless, grayscale, 16 bits per pixel, and encoded at the
 encoder's **maximum compression setting: DEFLATE level 9 with adaptive row
 filtering**. It is never reduced to 8-bit, RGB, or an indexed palette.
-JPEG uses the same developed image with perceptually appropriate quantization,
-not the most significant byte of a linear raw value.
+JPEG uses the same developed image, quantized according to its selected
+transfer: linear by default, or sRGB when requested.
 
 **Defaults:** photographic optimization **on**, clipping strength **3**,
-linear PNG (`gAMA=1`), and sRGB grayscale JPEG quality **90**.
+linear PNG (`gAMA=1`), and linear grayscale JPEG quality **90**.
 Standard photographic EXIF is copied to both
 formats, including ISO, exposure time and the recorded aperture/lens metadata.
 
@@ -96,10 +96,10 @@ dng-monochrome --no-optimize --dark 0 --light 0 -o linear shot.DNG
 # Display-encoded PNG for viewers that ignore linear PNG gamma.
 dng-monochrome --transfer srgb -o display shot.DNG
 
-# Linear-quantized JPEG as well as linear PNG, for viewers preferring that look.
+# Explicitly select the defaults: linear-quantized JPEG and linear PNG.
 dng-monochrome --transfer linear -o both-linear shot.DNG
 
-# Independent transfer choices; explicit per-format values override --transfer.
+# Use sRGB JPEG for sharing; explicit per-format values override --transfer.
 dng-monochrome --png-transfer linear --jpeg-transfer srgb shot.DNG
 dng-monochrome --jpg-transfer linear -o linear-jpeg shot.DNG
 
@@ -144,7 +144,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--both` | Generate unoptimized `auto/` and optimized `best/` versions; conflicts with explicit optimization toggles |
 | `--transfer srgb\|linear` | Set **both** formats; unspecified means the separate defaults below |
 | `--png-transfer srgb\|linear` | PNG encoding, default **`linear`**; overrides `--transfer` |
-| `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`srgb`**; alias `--jpg-transfer`; overrides `--transfer` |
+| `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`linear`**; alias `--jpg-transfer`; overrides `--transfer` |
 | `--jpeg-quality 1..100` | JPEG quality; default `90` for sharing; PNG is the lossless master |
 | `--threads 0..256` | Processing workers; `0` detects available hardware parallelism |
 | `--no-crop` | Retain the full raw raster instead of the recommended DNG crop |
@@ -155,6 +155,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `-q, --silent` | Suppress progress, warnings, best mappings and completion; errors and explicit `--analyze` JSON remain |
 | `-h, --help` | Usage; `--help` or `-help` includes full descriptions and examples |
 | `-V, --version` | Version |
+| `--param-NAME VALUE` | Override a tuning parameter listed below; `--param-NAME=VALUE` and `-param-NAME VALUE` also work |
 
 Percentages can have an optional `%` suffix. Each must be finite and in
 `[0,100)`, and their sum must be less than 100. Either end can be overridden
@@ -164,6 +165,206 @@ override their own end, irrespective of clipping strength.
 
 No lower PNG compression or bit-depth option exists. Maximum compression can
 cost noticeably more CPU time on large, noisy images.
+
+### Advanced `--param-*` tuning
+
+All tunable constants in this application's processing, estimation, expression
+limits, progress formatting and JPEG Huffman encoding are exposed below.
+**With no overrides, the algorithms and PNG pixels are unchanged; the only
+changed rendering default is JPEG transfer from sRGB to linear.**
+Existing controls such as `--clip-strength`, `--jpeg-quality`, `--threads`,
+manual percentages and transfers retain their existing names.
+
+Each option accepts `--param-name=value`, `--param-name value`,
+`-param-name=value`, or `-param-name value`. Values are numbers except the
+explicit `true`/`false` Huffman switch. All numeric bounds below are inclusive;
+integer counts must be integers. NaN, infinity, out-of-range values and invalid
+parameter combinations are errors before input files are opened.
+Fractions use `0..1`, not percent, unless a parameter explicitly says percent.
+
+Mathematical/format definitions are deliberately fixed: normalized endpoints,
+16-/8-bit ranges, the exact 65,536-bin raw histogram, standard sRGB/APEX
+equations, Gaussian/MAD and quantization conversion factors, median/regression
+definitions, SNR1/SNR3 report meanings, parser precedence, TIFF/EXIF tags and
+size limits, and the mandatory maximum-compression grayscale16 PNG format.
+Dependency internals and hard resource/numerical safety guards are not tuning
+options. Changing a binomial smoothing radius or noise patch size derives its
+kernel, buffer sizes and degrees of freedom consistently.
+
+The effective values are included in `--analyze`, `--verbose` and `--report`
+JSON under `parameters`, using snake_case field names. Noise/clipping overrides
+can change the DR estimate; artistic tone overrides do not change raw analysis.
+Aggressive noise-model settings do not make the estimate calibrated or more
+accurate merely because they produce a larger number.
+
+#### Histogram scheduling
+
+| Option | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `--param-histogram-chunks-per-thread` | `4` | 1..64 | Target histogram chunks per worker |
+| `--param-histogram-min-chunk` | `262144` | 1024..16777216 | Minimum pixels per chunk |
+
+#### Clipping and coherent detail
+
+| Option | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `--param-auto-cap` | `0.02` | 0..0.49 | Conservative tail-search cap, as a fraction |
+| `--param-tail-steps` | `200` | 2..65536 | Tail-search subdivisions |
+| `--param-tail-noise-sigma` | `2` | 0..100 | Minimum tail span in noise sigmas |
+| `--param-tail-min-span` | `4` | 1e-6..65535 | Minimum tail span in raw codes |
+| `--param-tail-knee-score` | `0.2` | 0..1 | Minimum normalized knee score |
+| `--param-dark-snr` | `2` | 0..100 | SNR for the automatic dark floor; the one-code minimum remains |
+| `--param-strength-target-base` | `1` | 0..49 | Strength-9 target base, percent |
+| `--param-strength-knee-weight` | `0.5` | 0..10 | Weight multiplying knee percent |
+| `--param-strength-target-min` | `1` | 0..49 | Minimum strength-9 target, percent |
+| `--param-strength-target-max` | `2` | 0..49 | Maximum strength-9 target, percent |
+| `--param-tied-span` | `1` | 1e-6..65535 | Raw-code interval retained at ties, limited to the prior span |
+| `--param-noise-warning-sigmas` | `8` | 0..1000 | Warn below this selected-span/shadow-sigma ratio |
+| `--param-coherent-samples` | `500000` | 1..10000000 | Approximate coherent-tail sample-position budget |
+| `--param-coherent-radius` | `1` | 1..8 | Neighborhood radius; side is `2*radius+1` |
+| `--param-coherent-neighbors` | `5` | 1..288 | Required same-tail neighbors, excluding center |
+| `--param-coherent-min-support` | `4` | 1..1000000 | Supported positions needed before expanding a bound |
+| `--param-coherent-tail-fraction` | `0.005` | 0..0.5 | Lower supported-extreme quantile; upper is `1-value` |
+| `--param-coherent-noise-margin` | `2` | 0..100 | Noise-sigma margin around supported extremes |
+
+The strength target is
+`max(existing_percent, clamp(base + knee_weight*knee_percent, min, max))`.
+The existing strength 1..9 interpolation and manual-end precedence are unchanged.
+The minimum target must not exceed the maximum. Required neighbors must fit
+the selected neighborhood: at radius 1 there are only 8, at radius 2 there are 24.
+Change the neighbor requirement explicitly when changing the radius.
+
+#### Noise estimation and confidence
+
+| Option | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `--param-noise-patch-side` | `16` | 5..128 | Square patch side, pixels |
+| `--param-noise-max-patches` | `12000` | 1..1000000 | Approximate spatial sampling budget |
+| `--param-noise-haar-lag-small` | `1` | 1..127 | Small Haar separation, pixels |
+| `--param-noise-haar-lag-medium` | `2` | 1..127 | Medium Haar separation |
+| `--param-noise-haar-lag-large` | `4` | 1..127 | Large Haar separation |
+| `--param-noise-texture-max` | `1.5` | 0.01..100 | Maximum plane-residual/large-lag noise ratio |
+| `--param-noise-lag-growth-max` | `1.35` | 0.01..100 | Maximum large/medium Haar ratio |
+| `--param-noise-min-patches` | `32` | 1..1000000 | Minimum candidates and minimum tail-group size |
+| `--param-noise-patches-per-bin` | `48` | 1..1000000 | Target patches per brightness group |
+| `--param-noise-max-bins` | `16` | 3..128 | Maximum brightness groups |
+| `--param-noise-variance-quantile` | `0.25` | 0.05..0.95 | Variance-envelope quantile; bias correction follows it |
+| `--param-noise-min-sigma` | `0.5` | 1e-6..65535 | Minimum resolved spatial sigma, raw codes |
+| `--param-noise-fit-min-bins` | `6` | 3..128 | Minimum groups required for a fitted model |
+| `--param-noise-fit-min-span` | `16` | 1e-6..65535 | Minimum brightness span, raw codes |
+| `--param-noise-fit-pair-separation` | `0.15` | 0..0.99 | Minimum pair separation as a fraction of brightness span |
+| `--param-noise-fit-iterations` | `4` | 0..64 | Robust weighted regression iterations |
+| `--param-noise-fit-residual-scale` | `0.15` | 1e-6..10 | Relative-residual downweighting scale |
+| `--param-noise-fit-negative-slope` | `0.15` | 0..10 | Tolerated negative slope times span / median variance |
+| `--param-noise-fit-max-error` | `0.25` | 0..10 | Maximum median relative model error |
+| `--param-noise-refinement-passes` | `3` | 0..32 | Variance-normalized brightness-bin refinements |
+| `--param-noise-fit-success-fraction` | `0.8` | 0.01..1 | Required successful leave-one-bin-out fraction |
+| `--param-noise-sensitivity-tail` | `0.1` | 0..0.5 | Lower sensitivity quantile; upper is `1-value` |
+| `--param-noise-read-ratio-max` | `3` | 1..100 | Maximum upper/lower read-noise sensitivity ratio |
+| `--param-noise-extrapolation-fraction` | `0.35` | 0..100 | Darkest-bin signal limit / fitted brightness span |
+| `--param-noise-shadow-read-sigmas` | `6` | 0..1000 | Alternative darkest-bin limit in read sigmas |
+| `--param-noise-tail-divisor` | `5` | 1..1024 | Candidate count divided by this gives tail-group size |
+| `--param-noise-correlation-min-variance` | `0.25` | 0..4294836225 | Minimum variance for correlation diagnostics |
+| `--param-noise-correlation-warning` | `1.3` | 0..1000 | Correlation ratio above which to emit a note |
+| `--param-noise-profile-tolerance` | `2` | 1..1000 | Maximum observed/profile sigma ratio or its reciprocal |
+
+Haar separations must satisfy `small < medium < large < patch_side`.
+The fit's minimum bin count must not exceed the maximum bin count.
+Fewer available patches or failed evidence gates still produce the documented
+explicit proxy/unavailable result, not an invented fitted read-noise value.
+The variance-quantile correction assumes Gaussian sampling; changing it is an
+experiment, not a replacement for calibration.
+
+#### Photographic optimization
+
+| Option | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `--param-optimize-strength` | `1` | 0..1 | Blend the complete optimized curve with range-only light |
+| `--param-tone-exposure-bias` | `0` | -16..16 | Exposure compensation in stops after automatic selection |
+| `--param-tone-min-exposure-ev` | `-2` | -16..16 | Minimum searched exposure, stops |
+| `--param-tone-max-exposure-ev` | `6` | -16..16 | Maximum searched exposure, stops |
+| `--param-tone-exposure-steps` | `8` | 1..64 | Search candidates per stop |
+| `--param-tone-midtone-quantile` | `0.5` | 0..1 | Input quantile treated as the midtone |
+| `--param-tone-shadow-quantile` | `0.1` | 0..1 | Input shadow quantile for contrast scoring |
+| `--param-tone-highlight-quantile` | `0.9` | 0..1 | Input highlight quantile for contrast scoring |
+| `--param-tone-target-midtone` | `0.43` | 0..1 | Target perceptual midtone |
+| `--param-tone-midtone-tolerance` | `0.15` | 1e-6..1 | Midtone objective normalization |
+| `--param-tone-target-contrast` | `0.6` | 0..1 | Desired perceptual shadow/highlight separation |
+| `--param-tone-contrast-tolerance` | `0.4` | 1e-6..1 | Contrast objective normalization |
+| `--param-tone-contrast-weight` | `0.15` | 0..1000 | Exposure-search contrast penalty weight |
+| `--param-tone-noise-threshold` | `0.1` | 0..1 | Noise threshold before penalizing exposure |
+| `--param-tone-noise-tolerance` | `0.1` | 1e-6..1 | Noise objective normalization |
+| `--param-tone-noise-weight` | `0.35` | 0..1000 | Exposure-search noise penalty weight |
+| `--param-tone-contrast-strength` | `0.75` | 0..1 | Histogram-contrast blend, independent of exposure |
+| `--param-tone-bins` | `1024` | 16..65536 | Perceptual histogram bins, not raw histogram bins |
+| `--param-tone-smoothing-passes` | `3` | 0..64 | Binomial histogram smoothing passes |
+| `--param-tone-smoothing-radius` | `2` | 0..16 | Binomial smoothing radius in bins |
+| `--param-tone-density-prior` | `0.15` | 1e-6..100 | Positive uniform density prior |
+| `--param-tone-density-power` | `0.5` | 0..4 | Normalized density exponent; default is square root |
+| `--param-tone-noise-target` | `0.04` | 1e-6..1 | Noise budget controlling contrast-gain caps |
+| `--param-tone-cap-min` | `1.15` | 1..64 | Minimum noise-dependent upper slope cap |
+| `--param-tone-cap-max` | `3` | 1..64 | Maximum upper slope cap |
+| `--param-tone-slope-min` | `0.35` | 0..1 | Lower density slope before blending |
+| `--param-tone-solver-upper` | `32` | 1e-6..1e9 | Upper normalization-scale search bound |
+| `--param-tone-solver-iterations` | `48` | 1..128 | Normalization bisection iterations |
+
+Exposure bounds must be ordered; equal bounds select a fixed exposure before
+applying the bias. Shadow, midtone and highlight quantiles must be ordered.
+The minimum cap must not exceed the maximum. `solver_upper * density_prior`
+must be at least 1 so the normalization root is bracketed.
+Insufficient solver convergence is an explicit error; increase iterations or
+reduce the upper bound rather than accepting an invalid/non-monotonic curve.
+
+Useful controls for ordinary editing:
+
+```sh
+# Weaken the WHOLE optimized rendering, including exposure.
+dng-monochrome --param-optimize-strength=0.6 shot.DNG
+
+# Add half a stop after automatic exposure selection.
+dng-monochrome -param-tone-exposure-bias 0.5 shot.DNG
+
+# Brighter target midtone, but gentler histogram contrast.
+dng-monochrome --param-tone-target-midtone=0.5 --param-tone-contrast-strength=0.4 shot.DNG
+
+# Fixed +1-stop exposure shoulder, without histogram contrast.
+dng-monochrome --param-tone-min-exposure-ev=1 --param-tone-max-exposure-ev=1 \
+  --param-tone-contrast-strength=0 shot.DNG
+
+# Penalize visible noise more and lower the allowed contrast noise budget.
+dng-monochrome --param-tone-noise-weight=0.7 --param-tone-noise-target=0.025 shot.DNG
+```
+
+For full optimized curve `F(x)` and amount `s`, the result before `--func` is
+`(1-s)*x + s*F(x)`. Amount 0 bypasses the complete optimization, matching
+`--no-optimize` pixels; it still retains the selected `best` mode/report label.
+Contrast strength 0 disables only histogram contrast, retaining the exposure
+shoulder. Exposure bias and all other optimizer controls have no pixel effect
+with `--no-optimize`, amount 0, or a constant image. None of these controls adds
+local processing, sharpening or denoising.
+
+#### Expression limits, progress and encoding
+
+| Option | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `--param-expression-max-bytes` | `16384` | 1..1048576 | Maximum expression source bytes |
+| `--param-expression-max-parentheses` | `128` | 1..512 | Maximum nested parentheses |
+| `--param-expression-max-depth` | `256` | 1..512 | Maximum recursive parsing depth |
+| `--param-mapping-steps` | `20` | 2..1000 | Unit interval divisions; print the `steps-1` interior samples |
+| `--param-mapping-input-decimals` | `2` | 0..12 | Printed mapping input precision |
+| `--param-mapping-output-decimals` | `5` | 0..17 | Printed mapping output precision |
+| `--param-progress-dr-decimals` | `1` | 0..12 | DR and code-span precision |
+| `--param-progress-range-decimals` | `1` | 0..12 | Raw endpoint precision |
+| `--param-progress-clip-decimals` | `3` | 0..12 | Actual clipping percentage precision |
+| `--param-progress-elapsed-decimals` | `1` | 0..6 | Elapsed-time precision |
+| `--param-progress-aperture-decimals` | `2` | 0..12 | Displayed f-number precision |
+| `--param-jpeg-optimize-huffman` | `true` | true/false | Optimize entropy tables; decoded JPEG pixels are unchanged |
+
+Parser limits are independent; whichever is reached first applies. Raising
+limits does not change the grammar or allow nonfinite results. When requesting
+more mapping samples, increase input decimals if necessary to distinguish
+their printed positions. Progress precision never changes image pixels,
+EXIF rationals or JSON numeric precision.
 
 ## What happens to the pixels
 
@@ -203,7 +404,7 @@ read noise, or a small bright object from an outlier. **This is a conservative
 useful-range heuristic, not a measurement of physical sensor dynamic range or
 effective ADC bits.** Full-spectrum conversion does not change that limitation.
 
-The conservative **strength-1** algorithm:
+The conservative **strength-1** algorithm, with default parameters:
 
 - Sample approximately 12,000 or fewer 16x16 patches, remove each local plane,
   and estimate residual noise using Gaussian-scaled median absolute
@@ -277,6 +478,8 @@ This is a reproducible global photographic rendering, not a claim that one
 curve is aesthetically best for every scene. Maximizing variance alone tends
 to crush intermediate tones and amplify noise, so that is not the objective.
 It is enabled by default; use `--no-optimize` for range-only development.
+The numbers below describe the unchanged default algorithm; the
+`--param-tone-*` controls above expose its tuning choices.
 
 First search exposure factors `a` from 0.25 to 64 in eighth-stop increments.
 Balance a display midtone near 0.43, the 10th-to-90th-percentile contrast and
@@ -356,7 +559,7 @@ modulo one, e.g. `-0.2 -> 0.8`, `1.2 -> 0.2`, and `2 -> 0`.
 It is an artistic, generally non-monotonic option, not a recovery technique.
 
 The math-only parser has no scripting, files, network, variables other than
-`x`, or complex arithmetic. Limits are 16,384 input bytes, 128 nested
+`x`, or complex arithmetic. Default limits are 16,384 input bytes, 128 nested
 parentheses and 256 nested parsing operations; evaluation uses a flat reusable
 stack, so long chains do not recursively evaluate an AST.
 
@@ -368,10 +571,10 @@ selected numerical data without an extra display-transfer quantization.
 chunk. The shared `--transfer` option changes both formats; `--png-transfer`
 and `--jpeg-transfer` override it regardless of argument order.
 A color-managed viewer can display either correctly; a viewer that ignores
-linear PNG gamma may show the default version too dark. JPEG is useful for
-ordinary viewing/sharing regardless of a viewer's PNG gamma support.
+linear PNG gamma may show the default version too dark. Select
+`--jpeg-transfer srgb` for conventional display-encoded JPEG sharing.
 
-JPEG is native single-channel grayscale and defaults to sRGB. When both
+JPEG is native single-channel grayscale and defaults to linear. When both
 transfers match, its samples are `round(PNG16 / 257)`. For linear PNG / sRGB
 JPEG, the final PNG intensities are first sRGB-encoded; for sRGB PNG / linear
 JPEG, they are first sRGB-decoded. They are then rounded to eight bits.
@@ -380,11 +583,12 @@ intermediate image. The default
 JPEG quality is 90 with optimized Huffman tables. Quality 100 is still a
 lossy JPEG, not a lossless substitute for PNG.
 
-`--jpeg-transfer linear` (or `--jpg-transfer linear`) deliberately stores
+The default `--jpeg-transfer linear` (or `--jpg-transfer linear`) stores
 linear-quantized bytes. This may resemble a linear PNG in an unmanaged viewer
 such as a particular Geeqie configuration, but appearance depends on color
-management. Linear JPEG has coarser shadow gradation than sRGB JPEG; the latter
-remains the recommended sharing default. Linear JPEG is marked with EXIF
+management. Linear JPEG has coarser shadow gradation than sRGB JPEG; choose
+`--jpeg-transfer srgb` when finer shadow quantization is wanted for sharing.
+Linear JPEG is marked with EXIF
 Gamma=1 and uncalibrated colorspace; many viewers still assume sRGB.
 Reports expose `png_transfer` and `jpeg_transfer`; the legacy `transfer` key
 also records the PNG transfer.
@@ -498,9 +702,14 @@ over 5,000-character formulas, 100 nested parentheses, precedence, all boundary
 policies, overflow/domain failures and 4,000 arbitrary-input parser cases.
 CLI tests cover every flag, shell-expanded multi-file input, recursion, both
 variants, collisions, overwrite protection, reports, and invalid combinations.
-The 19-point best mapping, default optimization/opt-out, all transfer pairs,
+The default 19-point best mapping, optimization/opt-out, all transfer pairs,
 per-format override precedence, ISO/f/t display and silent/debug behavior are
-also checked. To fully decode and check a generated collection:
+also checked. Parameter tests cover every option's implicit/explicit defaults,
+both CLI spellings, nondefault values, invalid values/combinations, report and
+processing paths, unchanged default pixel fingerprints, variable noise geometry
+and bias correction, optimizer amount/exposure/contrast, parser limits and
+Huffman-only encoding changes. README defaults are checked against the actual
+CLI declarations. To fully decode and check a generated collection:
 
 ```sh
 DNG_MONO_OUTPUTS=/path/to/dng-mono \

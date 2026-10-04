@@ -1,4 +1,5 @@
 use crate::{
+    parameters::Parameters,
     raw::{MonoImage, SensorMetadata},
     tone::{Rendered, Transfer, Transfers},
 };
@@ -90,6 +91,30 @@ pub fn save(
     quality: u8,
     overwrite: bool,
 ) -> Result<()> {
+    save_with_parameters(
+        paths,
+        image,
+        rendered,
+        report,
+        transfers,
+        quality,
+        overwrite,
+        &Parameters::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_with_parameters(
+    paths: &OutputPaths,
+    image: &MonoImage,
+    rendered: &Rendered,
+    report: &impl Serialize,
+    transfers: Transfers,
+    quality: u8,
+    overwrite: bool,
+    parameters: &Parameters,
+) -> Result<()> {
+    parameters.validate()?;
     let parent = paths
         .png
         .parent()
@@ -112,7 +137,16 @@ pub fn save(
                 &png_exif,
             )
         },
-        || encode_jpeg(parent, &image.metadata, &rendered.jpeg, quality, &jpeg_exif),
+        || {
+            encode_jpeg(
+                parent,
+                &image.metadata,
+                &rendered.jpeg,
+                quality,
+                &jpeg_exif,
+                parameters.jpeg_optimize_huffman,
+            )
+        },
     );
     let png = png.context("encoding 16-bit PNG")?;
     let jpeg = jpeg.context("encoding grayscale JPEG")?;
@@ -182,13 +216,14 @@ fn encode_jpeg(
     pixels: &[u8],
     quality: u8,
     exif: &[u8],
+    optimize_huffman: bool,
 ) -> Result<NamedTempFile> {
     let mut file = temporary(parent)?;
     {
         let mut buffer = BufWriter::new(file.as_file_mut());
         let mut encoder = jpeg_encoder::Encoder::new(&mut buffer, quality);
         encoder.add_exif_metadata(exif)?;
-        encoder.set_optimized_huffman_tables(true);
+        encoder.set_optimized_huffman_tables(optimize_huffman);
         encoder.encode(
             pixels,
             metadata.width as u16,

@@ -1,9 +1,347 @@
 use dng_monochrome::{
     expression::{Expression, FunctionPolicy},
+    parameters::Parameters,
     range::{self, Histogram, RangeOptions},
     raw::{MonoImage, SensorMetadata},
     tone::{self, ToneCurve, Transfer},
 };
+
+#[test]
+fn configurable_noise_geometry_and_envelope_preserve_known_flat_noise() {
+    let pixels = normal_noise(512 * 512)
+        .into_iter()
+        .map(|noise| (6023.0 + 20.0 * noise).round() as u16)
+        .collect();
+    let image = image(pixels, 512, 1023.0, 16383);
+    let hist = Histogram::new(&image.pixels).unwrap();
+    for (side, quantile) in [(8, 0.05), (16, 0.25), (24, 0.5), (32, 0.75), (64, 0.95)] {
+        let parameters = Parameters {
+            noise_patch_side: side,
+            noise_variance_quantile: quantile,
+            ..Parameters::default()
+        };
+        let estimate =
+            dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &parameters)
+                .unwrap();
+        assert_eq!(estimate.patch_side, side);
+        let step = ((image.pixels.len() as f64 / parameters.noise_max_patches as f64)
+            .sqrt()
+            .ceil() as usize)
+            .max(side);
+        let across = (512 - side) / step + 1;
+        assert_eq!(estimate.patches_examined, across * across);
+        let measured = estimate.dark_sigma_codes.unwrap();
+        assert!(
+            (measured / 20.0 - 1.0).abs() < 0.2,
+            "side={side}, quantile={quantile}, sigma={measured}"
+        );
+    }
+    for parameters in [
+        Parameters {
+            noise_max_patches: 1,
+            ..Parameters::default()
+        },
+        Parameters {
+            noise_min_patches: 1000000,
+            ..Parameters::default()
+        },
+        Parameters {
+            noise_min_sigma: 100.0,
+            ..Parameters::default()
+        },
+    ] {
+        let estimate =
+            dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &parameters)
+                .unwrap();
+        assert!(estimate.dark_sigma_codes.is_none());
+    }
+    let strict = Parameters {
+        noise_texture_max: 0.01,
+        ..Parameters::default()
+    };
+    let estimate =
+        dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &strict).unwrap();
+    assert_eq!(estimate.weak_texture_patches, 0);
+    assert!(
+        estimate
+            .notes
+            .iter()
+            .any(|note| note.contains("Too few weak-texture"))
+    );
+}
+
+#[test]
+fn configurable_noise_fit_and_profile_evidence_change_decisions() {
+    let mut image = noisy_scene(0.2, 25.0, false, false);
+    let hist = Histogram::new(&image.pixels).unwrap();
+    let baseline = range::estimate_noise(&image, &hist);
+    assert!(baseline.read_noise_resolved);
+    for parameters in [
+        Parameters {
+            noise_fit_min_span: 65535.0,
+            ..Parameters::default()
+        },
+        Parameters {
+            noise_fit_max_error: 0.0,
+            ..Parameters::default()
+        },
+        Parameters {
+            noise_patches_per_bin: 1000000,
+            ..Parameters::default()
+        },
+        Parameters {
+            noise_fit_min_bins: 128,
+            noise_max_bins: 128,
+            ..Parameters::default()
+        },
+    ] {
+        let estimate =
+            dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &parameters)
+                .unwrap();
+        assert!(estimate.model.is_none());
+        assert!(!estimate.read_noise_resolved);
+        assert!(estimate.dark_sigma_codes.is_some());
+    }
+    let no_refinement = Parameters {
+        noise_refinement_passes: 0,
+        ..Parameters::default()
+    };
+    let unrefined =
+        dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &no_refinement)
+            .unwrap();
+    assert_ne!(
+        serde_json::to_value(&baseline.bins).unwrap(),
+        serde_json::to_value(&unrefined.bins).unwrap()
+    );
+    let span = 16383.0 - 1023.0;
+    image.metadata.noise_profile = Some([0.2 / span, 25.0 / (span * span)]);
+    assert!(range::estimate_noise(&image, &hist).read_noise_resolved);
+    let strict = Parameters {
+        noise_profile_tolerance: 1.0,
+        ..Parameters::default()
+    };
+    let rejected =
+        dng_monochrome::noise::estimate_noise_with_parameters(&image, &hist, &strict).unwrap();
+    assert!(!rejected.read_noise_resolved);
+    assert!(
+        rejected
+            .notes
+            .iter()
+            .any(|note| note.contains("more than 1x"))
+    );
+}
+
+#[test]
+fn configurable_range_targets_coherence_and_snr_keep_manual_bounds_authoritative() {
+    let ramp = image((0..10000).collect(), 100, 0.0, 65535);
+    let hist = Histogram::new(&ramp.pixels).unwrap();
+    let stronger = Parameters {
+        strength_target_min: 2.0,
+        strength_target_max: 2.0,
+        ..Parameters::default()
+    };
+    let options = RangeOptions {
+        clip_strength: 9,
+        ..RangeOptions::default()
+    };
+    let range = range::analyze_with_parameters(&ramp, &hist, options, &stronger).unwrap();
+    assert_eq!((range.lower, range.upper), (200.0, 9799.0));
+    let manual = range::analyze_with_parameters(&ramp, &hist, manual(), &stronger).unwrap();
+    assert_eq!((manual.lower, manual.upper), (0.0, 9999.0));
+
+    let mut pixels: Vec<u16> = (0..65536).map(|i| 2000 + (i % 256) as u16 * 12).collect();
+    for y in 30..50 {
+        for x in 30..50 {
+            pixels[y * 256 + x] = 400;
+        }
+        for x in 100..120 {
+            pixels[y * 256 + x] = 12000;
+        }
+    }
+    let coherent = image(pixels, 256, 0.0, 65535);
+    let hist = Histogram::new(&coherent.pixels).unwrap();
+    let neighborhood = Parameters {
+        coherent_radius: 2,
+        coherent_neighbors: 13,
+        ..Parameters::default()
+    };
+    let protected =
+        range::analyze_with_parameters(&coherent, &hist, conservative(), &neighborhood).unwrap();
+    assert_eq!((protected.lower, protected.upper), (400.0, 12000.0));
+    let insufficient = Parameters {
+        coherent_min_support: 1000000,
+        ..neighborhood
+    };
+    let clipped =
+        range::analyze_with_parameters(&coherent, &hist, conservative(), &insufficient).unwrap();
+    assert!(clipped.lower > 400.0 && clipped.upper < 12000.0);
+    let no_knee = Parameters {
+        tail_knee_score: 1.0,
+        ..insufficient
+    };
+    let retained =
+        range::analyze_with_parameters(&coherent, &hist, conservative(), &no_knee).unwrap();
+    assert_eq!((retained.lower, retained.upper), (400.0, 12000.0));
+
+    let mut calibrated = image((1023..11023).collect(), 10000, 1023.0, 16383);
+    calibrated.metadata.noise_profile = Some([0.0, (20.0f64 / 15360.0).powi(2)]);
+    let hist = Histogram::new(&calibrated.pixels).unwrap();
+    for snr in [1.0, 2.0, 3.0] {
+        let parameters = Parameters {
+            dark_snr: snr,
+            ..Parameters::default()
+        };
+        let range = range::analyze_with_parameters(&calibrated, &hist, conservative(), &parameters)
+            .unwrap();
+        assert_eq!(range.lower, 1023.0 + 20.0 * snr);
+        let range = range::analyze_with_parameters(
+            &calibrated,
+            &hist,
+            RangeOptions {
+                dark: Some(0.0),
+                ..conservative()
+            },
+            &parameters,
+        )
+        .unwrap();
+        assert_eq!(range.lower, 1023.0);
+    }
+    let mut ties = vec![100; 100];
+    ties[0] = 0;
+    ties[99] = 200;
+    let tied = image(ties, 10, 0.0, 255);
+    let hist = Histogram::new(&tied.pixels).unwrap();
+    let parameters = Parameters {
+        tied_span: 2.0,
+        ..Parameters::default()
+    };
+    let range = range::analyze_with_parameters(&tied, &hist, options, &parameters).unwrap();
+    assert_eq!((range.lower, range.upper), (99.0, 101.0));
+}
+
+#[test]
+fn extreme_tone_parameters_remain_finite_monotonic_and_endpoint_preserving() {
+    let image = image(
+        (0..=65535)
+            .map(|i| ((f64::from(i) / 65535.0).powi(4) * 65535.0).round() as u16)
+            .collect(),
+        256,
+        0.0,
+        65535,
+    );
+    let hist = Histogram::new(&image.pixels).unwrap();
+    let mut range = range::analyze(&image, &hist, manual()).unwrap();
+    range.noise = Default::default();
+    for bins in [16, 257] {
+        for (power, prior, minimum, cap) in [
+            (0.0, 0.000001, 0.0, 64.0),
+            (4.0, 0.000001, 1.0, 64.0),
+            (0.5, 0.15, 0.0, 1.0),
+            (4.0, 100.0, 0.0, 64.0),
+        ] {
+            for ev in [-16.0, 16.0] {
+                for radius in [0, 16] {
+                    let parameters = Parameters {
+                        tone_bins: bins,
+                        tone_density_power: power,
+                        tone_density_prior: prior,
+                        tone_slope_min: minimum,
+                        tone_cap_min: cap,
+                        tone_cap_max: cap,
+                        tone_min_exposure_ev: ev,
+                        tone_max_exposure_ev: ev,
+                        tone_exposure_bias: ev,
+                        tone_smoothing_radius: radius,
+                        tone_smoothing_passes: 1,
+                        tone_solver_upper: (1.0 / prior).max(32.0),
+                        tone_solver_iterations: 128,
+                        tone_contrast_strength: 1.0,
+                        ..Parameters::default()
+                    };
+                    let curve =
+                        ToneCurve::fit_with_parameters(&hist, &range, true, 0.0, &parameters)
+                            .unwrap_or_else(|error| panic!("{parameters:?}: {error}"));
+                    let mut previous = 0.0;
+                    for i in 0..=1000 {
+                        let value = curve.map(f64::from(i) / 1000.0);
+                        assert!(value.is_finite() && (0.0..=1.0).contains(&value));
+                        assert!(value >= previous);
+                        previous = value;
+                    }
+                    assert_eq!(curve.map(0.0), 0.0);
+                    assert_eq!(curve.map(1.0), 1.0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn original_default_processing_fingerprints() {
+    let expected = [
+        [
+            (6717569564993042814, 6953471804162552853),
+            (9533947061431649438, 14967674621621298926),
+        ],
+        [
+            (12103359711031240887, 14661262307880227674),
+            (15488340430656129726, 7694179671921873682),
+        ],
+        [
+            (15607283465254012220, 9231956993350605572),
+            (17409184533110170649, 8099323266574252888),
+        ],
+    ];
+    let skewed = image(
+        (0..=65535)
+            .map(|i| ((f64::from(i) / 65535.0).powi(4) * 65535.0).round() as u16)
+            .collect(),
+        256,
+        0.0,
+        65535,
+    );
+    for (case, image) in [
+        skewed,
+        noisy_scene(0.2, 25.0, false, false),
+        noisy_scene(3.0, 900.0, true, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hist = Histogram::new(&image.pixels).unwrap();
+        let range = range::analyze(&image, &hist, RangeOptions::default()).unwrap();
+        for optimized in [false, true] {
+            let rendered = tone::render(
+                &image,
+                &hist,
+                &range,
+                optimized,
+                None,
+                FunctionPolicy::Clip,
+                tone::Transfers {
+                    png: Transfer::Linear,
+                    jpeg: Transfer::Srgb,
+                },
+            )
+            .unwrap();
+            let fingerprint = |values: Vec<u64>| {
+                values
+                    .into_iter()
+                    .fold(0xcbf29ce484222325u64, |hash, value| {
+                        (hash ^ value).wrapping_mul(0x100000001b3)
+                    })
+            };
+            assert_eq!(
+                (
+                    fingerprint(rendered.png.iter().map(|v| u64::from(*v)).collect()),
+                    fingerprint(rendered.jpeg.iter().map(|v| u64::from(*v)).collect()),
+                ),
+                expected[case][usize::from(optimized)],
+                "original default pixels changed: case={case}, optimized={optimized}",
+            );
+        }
+    }
+}
 
 fn image(pixels: Vec<u16>, width: usize, black: f64, white: u16) -> MonoImage {
     assert_eq!(pixels.len() % width, 0);
@@ -636,6 +974,7 @@ fn tone_curve_is_bounded_monotonic_and_endpoint_preserving() {
     for exposure_factor in [0.25, 0.5, 1.0, 2.0, 8.0] {
         let curve = ToneCurve {
             optimized: true,
+            optimize_strength: 1.0,
             exposure_factor,
             input_median: 0.1,
             contrast_strength: 0.0,
@@ -700,7 +1039,10 @@ fn png_transfer_and_jpeg_are_visually_consistent() {
         false,
         None,
         FunctionPolicy::Clip,
-        png_transfer(Transfer::Linear),
+        tone::Transfers {
+            png: Transfer::Linear,
+            jpeg: Transfer::Srgb,
+        },
     )
     .unwrap();
     assert_eq!(linear.png, image.pixels);
@@ -712,7 +1054,10 @@ fn png_transfer_and_jpeg_are_visually_consistent() {
         false,
         None,
         FunctionPolicy::Clip,
-        png_transfer(Transfer::Srgb),
+        tone::Transfers {
+            png: Transfer::Srgb,
+            jpeg: Transfer::Srgb,
+        },
     )
     .unwrap();
     assert_eq!(srgb.jpeg, linear.jpeg);
