@@ -1,0 +1,34 @@
+[package]
+name = "dng-monochrome"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Precision-preserving monochrome DNG development to 16-bit PNG and grayscale JPEG"
+license = "Apache-2.0"
+repository = "https://github.com/lukaszgryglicki/dng-monochrome"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+jpeg-encoder = "0.7"
+png = "0.18"
+rawler = "0.8"
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.23"
+walkdir = "2.5"
+
+[dev-dependencies]
+jpeg-decoder = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package.rawler]
+opt-level = 2
+
+[profile.dev.package.jxl-oxide]
+opt-level = 2

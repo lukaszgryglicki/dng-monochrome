@@ -1,0 +1,12 @@
+/target/
+/dng-mono/
+/tests/fixtures/local/
+*.secret
+*.rs.bk
+*.dng
+*.DNG
+*.png
+*.PNG
+*.jp*g
+*.JP*G
+.DS_Store
