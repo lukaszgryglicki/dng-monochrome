@@ -28,13 +28,14 @@ use walkdir::WalkDir;
         Both carry photographic EXIF. Optimization is on by default, clipping strength is 3, \
         PNG transfer is linear and JPEG transfer is sRGB.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
-        Pipeline: crop/orient -> range stretch -> optional optimize -> function -> boundary policy -> transfer.\n\
+        Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function -> policy -> transfers.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
         dng-monochrome photos/ -o dng-mono --both --report\n  \
         dng-monochrome shot.DNG -clip-strength 9 -best\n  \
         dng-monochrome shot.DNG -dark 0.8 -light 1.2% -func 'sin(pi*x)^2' -func-scale\n  \
-        dng-monochrome shot.DNG --dark 0 --light 0 --transfer linear\n\
+        dng-monochrome shot.DNG --no-optimize --dark 0 --light 0\n  \
+        dng-monochrome shot.DNG --png-transfer linear --jpeg-transfer srgb\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
         asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp.\n\

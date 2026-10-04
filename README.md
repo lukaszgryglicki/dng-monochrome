@@ -10,8 +10,9 @@ filtering**. It is never reduced to 8-bit, RGB, or an indexed palette.
 JPEG uses the same developed image with perceptually appropriate quantization,
 not the most significant byte of a linear raw value.
 
-**Defaults:** linear PNG (`gAMA=1`), automatic clipping strength **4**, and
-grayscale JPEG quality **90**. Standard photographic EXIF is copied to both
+**Defaults:** photographic optimization **on**, clipping strength **3**,
+linear PNG (`gAMA=1`), and sRGB grayscale JPEG quality **90**.
+Standard photographic EXIF is copied to both
 formats, including ISO, exposure time and the recorded aperture/lens metadata.
 
 ## Build
@@ -75,24 +76,32 @@ dng-monochrome /path/to/photos -o /path/to/dng-mono --both --report
 dng-monochrome -dark 0.8 -light 1.2% -o adjusted *.DNG
 
 # Exact minimum-to-maximum stretch, without automatic tail clipping.
-dng-monochrome --dark 0 --light 0 shot.DNG
+dng-monochrome --no-optimize --dark 0 --light 0 shot.DNG
 
 # Manual tone mapping; single-dash and double-dash long flags both work.
 dng-monochrome -func 'x^.5' -o bright shot.DNG
 dng-monochrome -func 'sin(x*pi)' -func-scale -o mapped shot.DNG
 
-# Optional photographic optimization.
+# Photographic optimization is enabled by default; -best is still accepted.
 dng-monochrome -best -o best *.DNG
+dng-monochrome -no-optimize -o unoptimized *.DNG
 
 # Adjust automatic clipping without choosing fixed manual percentages.
 dng-monochrome -clip-strength 1 -o conservative *.DNG
 dng-monochrome -clip-strength 9 -best -o stronger *.DNG
 
 # Linear PNG without tail clipping for further numerical processing or editing.
-dng-monochrome --dark 0 --light 0 --transfer linear -o linear shot.DNG
+dng-monochrome --no-optimize --dark 0 --light 0 -o linear shot.DNG
 
 # Display-encoded PNG for viewers that ignore linear PNG gamma.
 dng-monochrome --transfer srgb -o display shot.DNG
+
+# Linear-quantized JPEG as well as linear PNG, for viewers preferring that look.
+dng-monochrome --transfer linear -o both-linear shot.DNG
+
+# Independent transfer choices; explicit per-format values override --transfer.
+dng-monochrome --png-transfer linear --jpeg-transfer srgb shot.DNG
+dng-monochrome --jpg-transfer linear -o linear-jpeg shot.DNG
 
 # Detailed diagnostics, or silent conversion (errors remain visible).
 dng-monochrome -debug shot.DNG
@@ -125,14 +134,17 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--dark PERCENT` | Override darkest-pixel clipping; automatic if omitted |
 | `--light PERCENT` | Override lightest-pixel clipping; automatic if omitted |
-| `--clip-strength 1..9` | Automatic clipping strength; default **4**. Level 1 is conservative; level 9 aims around 1-2% per end |
+| `--clip-strength 1..9` | Automatic clipping strength; default **3**. Level 1 is conservative; level 9 aims around 1-2% per end |
 | `--func EXPR` | Quoted real-valued function of normalized lightness `x` |
 | `--func-clip` | Clamp finite function results to `[0,1]`; default function policy |
 | `--func-scale` | Rescale the minimum and maximum results actually present in this image to `[0,1]` |
 | `--func-wrap` | Wrap finite out-of-range results modulo one; leave existing `[0,1]` values unchanged |
-| `--optimize, --best` | Noise-aware photographic exposure/contrast optimization; prints a 21-point tone mapping; off by default |
-| `--both` | Generate ordinary and optimized versions; conflicts with `--optimize` |
-| `--transfer srgb\|linear` | PNG encoding; default **`linear`**. JPEG is always display-encoded |
+| `--optimize, --best` | Explicitly enable photographic optimization, which is already **on by default** |
+| `--no-optimize` | Skip photographic optimization; retain range selection and any custom function |
+| `--both` | Generate unoptimized `auto/` and optimized `best/` versions; conflicts with explicit optimization toggles |
+| `--transfer srgb\|linear` | Set **both** formats; unspecified means the separate defaults below |
+| `--png-transfer srgb\|linear` | PNG encoding, default **`linear`**; overrides `--transfer` |
+| `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`srgb`**; alias `--jpg-transfer`; overrides `--transfer` |
 | `--jpeg-quality 1..100` | JPEG quality; default `90` for sharing; PNG is the lossless master |
 | `--threads 0..256` | Processing workers; `0` detects available hardware parallelism |
 | `--no-crop` | Retain the full raw raster instead of the recommended DNG crop |
@@ -165,10 +177,12 @@ cost noticeably more CPU time on large, noisy images.
 3. Select lower and upper endpoints, automatically or from the requested
    full-histogram percentiles.
 4. Map `x = clamp((raw - lower) / (upper - lower), 0, 1)`.
-5. If requested, apply the monotonic photographic optimization curve.
+5. Apply the monotonic photographic optimization curve unless `--no-optimize`
+   is set (or this is the `auto/` half of `--both`).
 6. If requested, evaluate `--func` and apply its clip/scale/wrap policy.
 7. Encode the result using the selected PNG transfer and round to `0..65535`.
-   Produce JPEG samples from that final PNG representation in display space.
+   Produce JPEG samples from that final PNG representation using the selected
+   JPEG transfer.
 
 All calculations after decoding use `f64`. Each expression is evaluated once
 per occupied raw code, not once per pixel, and cached in a lookup table.
@@ -229,7 +243,7 @@ improve visible contrast. Let `p1` be the actual strength-1 clipping percentage
 at an automatic end and `k` its detected histogram-knee percentage (0-2).
 The strength-9 target is `p9 = max(p1, clamp(1 + k/2, 1, 2))`. At strength `s`,
 the requested percentile is `p1 + (s-1)/8 * (p9-p1)`. Thus level 9 normally
-approaches **1-2%**, not 9% or 10%; default level **4** is a moderate compromise.
+approaches **1-2%**, not 9% or 10%; default level **3** is a moderate compromise.
 No existing calibrated/conservative clipping is undone. Ties can make actual
 clipping smaller; a tied interval is bounded with an explicit warning rather
 than collapsed. These higher levels are intentional contrast trimming, **not
@@ -262,6 +276,7 @@ produce a warning.
 This is a reproducible global photographic rendering, not a claim that one
 curve is aesthetically best for every scene. Maximizing variance alone tends
 to crush intermediate tones and amplify noise, so that is not the objective.
+It is enabled by default; use `--no-optimize` for range-only development.
 
 First search exposure factors `a` from 0.25 to 64 in eighth-stop increments.
 Balance a display midtone near 0.43, the 10th-to-90th-percentile contrast and
@@ -285,18 +300,20 @@ images are not given artificial contrast. Reports contain exposure, predicted
 midtone noise and all curve control points. Deliberately low-key/high-key
 photographs may still be better without this mode.
 
-Every successful best conversion prints `0.00->...`, `0.05->...`, through
-`1.00->...` (21 samples, five output decimals). These are the best curve's
+Every successful optimized conversion prints `0.05->...`, `0.10->...`, through
+`0.95->...` (19 samples, five output decimals). The fixed identity endpoints
+0 and 1 are omitted. These are the best curve's
 **normalized linear** input/output values, before `--func` and the output
 transfer, not raw codes or sRGB byte values. `--silent` suppresses this line.
 
 ### Expressions
 
 `x` is **linear normalized light**, after range selection and optional
-optimization, but **before** the final sRGB transfer. Thus `x^2` darkens,
+optimization, but **before** either output transfer. Thus `x^2` darkens,
 `x^.5` / `sqrt(x)` lifts shadows, and `x/2` halves linear intensity.
-Use `--transfer linear` when the actual PNG numbers should directly represent
-your function's output.
+PNG is linear by default, so its numbers directly represent the processed
+intensities. Add `--no-optimize` when the function should act on only the
+range-normalized input rather than on the default photographic rendering.
 
 The parser supports:
 
@@ -347,16 +364,30 @@ stack, so long chains do not recursively evaluate an AST.
 
 Default PNG pixels store **linear intensities with `gAMA=1.0`**, preserving the
 selected numerical data without an extra display-transfer quantization.
-`--transfer srgb` instead uses the standard sRGB transfer and an `sRGB` chunk.
+`--png-transfer srgb` instead uses the standard sRGB transfer and an `sRGB`
+chunk. The shared `--transfer` option changes both formats; `--png-transfer`
+and `--jpeg-transfer` override it regardless of argument order.
 A color-managed viewer can display either correctly; a viewer that ignores
 linear PNG gamma may show the default version too dark. JPEG is useful for
 ordinary viewing/sharing regardless of a viewer's PNG gamma support.
 
-JPEG is native single-channel grayscale. With an sRGB PNG, its input samples
-are `round(PNG16 / 257)`. With the default linear PNG, its final quantized
-intensities are first sRGB-encoded and then rounded to eight bits. The default
+JPEG is native single-channel grayscale and defaults to sRGB. When both
+transfers match, its samples are `round(PNG16 / 257)`. For linear PNG / sRGB
+JPEG, the final PNG intensities are first sRGB-encoded; for sRGB PNG / linear
+JPEG, they are first sRGB-decoded. They are then rounded to eight bits.
+Thus JPEG always approximates the final quantized master, not an unrelated
+intermediate image. The default
 JPEG quality is 90 with optimized Huffman tables. Quality 100 is still a
 lossy JPEG, not a lossless substitute for PNG.
+
+`--jpeg-transfer linear` (or `--jpg-transfer linear`) deliberately stores
+linear-quantized bytes. This may resemble a linear PNG in an unmanaged viewer
+such as a particular Geeqie configuration, but appearance depends on color
+management. Linear JPEG has coarser shadow gradation than sRGB JPEG; the latter
+remains the recommended sharing default. Linear JPEG is marked with EXIF
+Gamma=1 and uncalibrated colorspace; many viewers still assume sRGB.
+Reports expose `png_transfer` and `jpeg_transfer`; the legacy `transfer` key
+also records the PNG transfer.
 
 Stretching a 14-bit range into 16-bit output does not create two new bits of
 information. Reports distinguish container precision, white-level bits,
@@ -406,6 +437,11 @@ GPS when present. Original rational exposure/aperture values are preserved,
 not recalculated from a lens menu selection. Orientation becomes 1 because
 pixels were physically oriented; dimensions, sample depth, colorspace and
 processing software describe the output.
+
+Normal progress includes ISO, aperture and the original rational exposure
+time. If standard FNumber is absent, an available APEX ApertureValue is shown
+as its f-number equivalent with an `(APEX)` label; missing values are explicit.
+This does not correct an inaccurate lens-menu selection.
 
 Raw-only calibration, thumbnails, XMP and proprietary MakerNotes are not
 copied blindly: their offsets and raw-development settings may be invalid in
@@ -462,7 +498,14 @@ over 5,000-character formulas, 100 nested parentheses, precedence, all boundary
 policies, overflow/domain failures and 4,000 arbitrary-input parser cases.
 CLI tests cover every flag, shell-expanded multi-file input, recursion, both
 variants, collisions, overwrite protection, reports, and invalid combinations.
-The 21-point best mapping and silent/debug behavior are also checked.
+The 19-point best mapping, default optimization/opt-out, all transfer pairs,
+per-format override precedence, ISO/f/t display and silent/debug behavior are
+also checked. To fully decode and check a generated collection:
+
+```sh
+DNG_MONO_OUTPUTS=/path/to/dng-mono \
+  cargo test --test collection -- --ignored --nocapture
+```
 
 Private photographs are not bundled. Set `DNG_MONO_SAMPLE` for the optional
 original-Leica tests; they require a representative M11 Monochrom 14-bit file
