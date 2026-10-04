@@ -106,7 +106,7 @@ impl Default for RangeOptions {
         Self {
             dark: None,
             light: None,
-            clip_strength: 4,
+            clip_strength: 3,
         }
     }
 }

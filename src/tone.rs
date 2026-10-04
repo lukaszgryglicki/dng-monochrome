@@ -16,6 +16,21 @@ pub enum Transfer {
     Linear,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Transfers {
+    pub png: Transfer,
+    pub jpeg: Transfer,
+}
+
+impl Default for Transfers {
+    fn default() -> Self {
+        Self {
+            png: Transfer::Linear,
+            jpeg: Transfer::Srgb,
+        }
+    }
+}
+
 const TONE_BINS: usize = 1024;
 
 #[derive(Clone, Debug, Serialize)]
@@ -214,7 +229,7 @@ pub fn render(
     optimized: bool,
     expression: Option<&Expression>,
     policy: FunctionPolicy,
-    transfer: Transfer,
+    transfers: Transfers,
 ) -> Result<Rendered> {
     let tone = ToneCurve::fit(hist, range, optimized, image.metadata.black_level);
     let mut values: Vec<f64> = (0..LEVELS)
@@ -224,7 +239,7 @@ pub fn render(
     let png_table: Vec<u16> = values
         .par_iter()
         .map(|&x| {
-            let value = match transfer {
+            let value = match transfers.png {
                 Transfer::Srgb => srgb_encode(x),
                 Transfer::Linear => x,
             };
@@ -235,9 +250,10 @@ pub fn render(
         .par_iter()
         .map(|&v| {
             let value = f64::from(v) / 65535.0;
-            let display = match transfer {
-                Transfer::Srgb => value,
-                Transfer::Linear => srgb_encode(value),
+            let display = match (transfers.png, transfers.jpeg) {
+                (Transfer::Srgb, Transfer::Linear) => srgb_decode(value),
+                (Transfer::Linear, Transfer::Srgb) => srgb_encode(value),
+                (Transfer::Srgb, Transfer::Srgb) | (Transfer::Linear, Transfer::Linear) => value,
             };
             (display.clamp(0.0, 1.0) * 255.0).round() as u8
         })

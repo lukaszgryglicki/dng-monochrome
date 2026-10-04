@@ -29,6 +29,7 @@ pub struct SensorMetadata {
     pub standard_output_sensitivity: Option<u32>,
     pub exposure_seconds: Option<f64>,
     pub aperture_f_number: Option<f64>,
+    pub aperture_value_apex: Option<f64>,
     pub focal_length_mm: Option<f64>,
     pub lens_model: Option<String>,
     pub noise_profile: Option<[f64; 2]>,
@@ -87,6 +88,15 @@ pub fn decode(path: &Path, no_crop: bool) -> Result<MonoImage> {
         if let Some(aperture) = exif.fnumber {
             ensure!(aperture.d != 0, "invalid EXIF aperture denominator");
             image.metadata.aperture_f_number = Some(f64::from(aperture.n) / f64::from(aperture.d));
+        }
+        if let Some(aperture) = exif.aperture_value {
+            ensure!(aperture.d != 0, "invalid EXIF APEX aperture denominator");
+            let apex = f64::from(aperture.n) / f64::from(aperture.d);
+            ensure!(
+                (apex * 0.5).exp2().is_finite(),
+                "EXIF APEX aperture is out of range"
+            );
+            image.metadata.aperture_value_apex = Some(apex);
         }
         if let Some(focal) = exif.focal_length {
             ensure!(focal.d != 0, "invalid EXIF focal-length denominator");
@@ -206,6 +216,7 @@ fn from_raw(raw: rawler::RawImage, no_crop: bool) -> Result<MonoImage> {
             standard_output_sensitivity: None,
             exposure_seconds: None,
             aperture_f_number: None,
+            aperture_value_apex: None,
             focal_length_mm: None,
             lens_model: None,
             noise_profile: None,

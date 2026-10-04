@@ -16,7 +16,8 @@ pub struct Dng {
     pub iso: Option<u32>,
     pub noise_profile: Option<[f64; 2]>,
     pub exposure: [u32; 2],
-    pub aperture: [u32; 2],
+    pub aperture: Option<[u32; 2]>,
+    pub apex: Option<[u32; 2]>,
     pub lens_model: String,
 }
 
@@ -36,7 +37,8 @@ impl Dng {
             iso: Some(125),
             noise_profile: None,
             exposure: [1, 125],
-            aperture: [28, 10],
+            aperture: Some([28, 10]),
+            apex: None,
             lens_model: "Recorded manual M lens".into(),
             pixels: (0..n)
                 .map(|i| (1023 + u64::from(i) * 15360 / u64::from(n - 1)) as u16)
@@ -118,12 +120,6 @@ impl Dng {
                 1,
                 [long(self.exposure[0]), long(self.exposure[1])].concat(),
             ),
-            (
-                0x829d,
-                5,
-                1,
-                [long(self.aperture[0]), long(self.aperture[1])].concat(),
-            ),
             (0x9003, 2, 20, b"2026:10:03 12:34:56\0".to_vec()),
             (0x920a, 5, 1, [long(35), long(1)].concat()),
             (
@@ -133,6 +129,11 @@ impl Dng {
                 [self.lens_model.as_bytes(), b"\0"].concat(),
             ),
         ];
+        for (tag, value) in [(0x829d, self.aperture), (0x9202, self.apex)] {
+            if let Some([n, d]) = value {
+                exif_tags.push((tag, 5, 1, [long(n), long(d)].concat()));
+            }
+        }
         tags.push((34665, 4, 1, long(0)));
         if let Some(iso) = self.iso {
             exif_tags.extend([

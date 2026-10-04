@@ -1,11 +1,11 @@
 use crate::{
     raw::{MonoImage, SensorMetadata},
-    tone::{Rendered, Transfer},
+    tone::{Rendered, Transfer, Transfers},
 };
 use anyhow::{Context, Result, ensure};
 use rawler::{
     formats::tiff::{
-        Value,
+        Rational, Value,
         writer::{DirectoryWriter, TiffWriter},
     },
     tags::{ExifTag, TiffCommonTag},
@@ -86,7 +86,7 @@ pub fn save(
     image: &MonoImage,
     rendered: &Rendered,
     report: &impl Serialize,
-    transfer: Transfer,
+    transfers: Transfers,
     quality: u8,
     overwrite: bool,
 ) -> Result<()> {
@@ -96,14 +96,22 @@ pub fn save(
         .context("output has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     paths.check(overwrite)?;
-    let png_exif = photographic_exif(image, transfer, 16)?;
-    let jpeg_exif = photographic_exif(image, Transfer::Srgb, 8)?;
+    let png_exif = photographic_exif(image, transfers.png, 16)?;
+    let jpeg_exif = photographic_exif(image, transfers.jpeg, 8)?;
     ensure!(
         jpeg_exif.len() <= 65527,
         "photographic EXIF exceeds JPEG's 65527-byte metadata limit; no metadata was silently discarded"
     );
     let (png, jpeg) = rayon::join(
-        || encode_png(parent, &image.metadata, &rendered.png, transfer, &png_exif),
+        || {
+            encode_png(
+                parent,
+                &image.metadata,
+                &rendered.png,
+                transfers.png,
+                &png_exif,
+            )
+        },
         || encode_jpeg(parent, &image.metadata, &rendered.jpeg, quality, &jpeg_exif),
     );
     let png = png.context("encoding 16-bit PNG")?;
@@ -228,6 +236,9 @@ fn photographic_exif(image: &MonoImage, transfer: Transfer, bits: u16) -> Result
     );
     if let Some(iso) = metadata.standard_output_sensitivity {
         exif.add_tag(ExifTag::StandardOutputSensitivity, iso);
+    }
+    if bits == 8 && transfer == Transfer::Linear {
+        exif.add_untyped_tag(0xa500, Rational { n: 1, d: 1 });
     }
     let exif_offset = exif.build(&mut tiff)?;
     root.add_tag(ExifTag::ExifOffset, exif_offset);

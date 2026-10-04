@@ -27,6 +27,7 @@ fn image(pixels: Vec<u16>, width: usize, black: f64, white: u16) -> MonoImage {
             standard_output_sensitivity: None,
             exposure_seconds: None,
             aperture_f_number: None,
+            aperture_value_apex: None,
             focal_length_mm: None,
             lens_model: None,
             noise_profile: None,
@@ -39,6 +40,13 @@ fn manual() -> RangeOptions {
         dark: Some(0.0),
         light: Some(0.0),
         ..RangeOptions::default()
+    }
+}
+
+fn png_transfer(png: Transfer) -> tone::Transfers {
+    tone::Transfers {
+        png,
+        ..tone::Transfers::default()
     }
 }
 
@@ -67,7 +75,7 @@ fn full_sixteen_bit_histogram_and_linear_output_are_lossless() {
         false,
         None,
         FunctionPolicy::Clip,
-        Transfer::Linear,
+        png_transfer(Transfer::Linear),
     )
     .unwrap();
     assert_eq!(out.png, image.pixels);
@@ -210,7 +218,7 @@ fn clipping_strength_is_monotonic_and_manual_ends_always_win() {
     let image = image((0..=65535).collect(), 256, 0.0, 65535);
     let hist = Histogram::new(&image.pixels).unwrap();
     let (mut lower, mut upper) = (0.0, 65535.0);
-    assert_eq!(RangeOptions::default().clip_strength, 4);
+    assert_eq!(RangeOptions::default().clip_strength, 3);
     for strength in 1..=9 {
         let options = RangeOptions {
             clip_strength: strength,
@@ -564,7 +572,7 @@ fn constant_black_saturated_and_tiny_images_do_not_invent_contrast() {
             false,
             None,
             FunctionPolicy::Clip,
-            Transfer::Linear,
+            png_transfer(Transfer::Linear),
         )
         .unwrap();
         assert!(out.png.iter().all(|&v| v == expected));
@@ -661,7 +669,7 @@ fn optimizer_lifts_dark_midtones_and_keeps_highlights() {
         false,
         None,
         FunctionPolicy::Clip,
-        Transfer::Srgb,
+        png_transfer(Transfer::Srgb),
     )
     .unwrap();
     let best = tone::render(
@@ -671,7 +679,7 @@ fn optimizer_lifts_dark_midtones_and_keeps_highlights() {
         true,
         None,
         FunctionPolicy::Clip,
-        Transfer::Srgb,
+        png_transfer(Transfer::Srgb),
     )
     .unwrap();
     assert!(best.png[5000] > auto.png[5000]);
@@ -692,7 +700,7 @@ fn png_transfer_and_jpeg_are_visually_consistent() {
         false,
         None,
         FunctionPolicy::Clip,
-        Transfer::Linear,
+        png_transfer(Transfer::Linear),
     )
     .unwrap();
     assert_eq!(linear.png, image.pixels);
@@ -704,7 +712,7 @@ fn png_transfer_and_jpeg_are_visually_consistent() {
         false,
         None,
         FunctionPolicy::Clip,
-        Transfer::Srgb,
+        png_transfer(Transfer::Srgb),
     )
     .unwrap();
     assert_eq!(srgb.jpeg, linear.jpeg);
@@ -730,7 +738,7 @@ fn function_order_and_scale_are_numerically_correct() {
         false,
         Some(&expression),
         FunctionPolicy::Clip,
-        Transfer::Linear,
+        png_transfer(Transfer::Linear),
     )
     .unwrap();
     assert_eq!(clipped.png, [0, 8192, 16384, 24576, 32768]);
@@ -741,7 +749,7 @@ fn function_order_and_scale_are_numerically_correct() {
         false,
         Some(&expression),
         FunctionPolicy::Scale,
-        Transfer::Linear,
+        png_transfer(Transfer::Linear),
     )
     .unwrap();
     assert_eq!(scaled.png, [0, 16384, 32768, 49151, 65535]);
@@ -753,13 +761,52 @@ fn function_order_and_scale_are_numerically_correct() {
         true,
         Some(&expression),
         FunctionPolicy::Clip,
-        Transfer::Linear,
+        png_transfer(Transfer::Linear),
     )
     .unwrap();
     for (i, &value) in best.png.iter().enumerate() {
         let x = i as f64 / 4.0;
         let y = best.tone.map(x);
         assert_eq!(value, (y * y * 65535.0).round() as u16);
+    }
+}
+
+#[test]
+fn every_png_jpeg_transfer_combination_matches_independent_quantization() {
+    let image = image((0..=65535).collect(), 256, 0.0, 65535);
+    let hist = Histogram::new(&image.pixels).unwrap();
+    let range = range::analyze(&image, &hist, manual()).unwrap();
+    for png in [Transfer::Linear, Transfer::Srgb] {
+        for jpeg in [Transfer::Linear, Transfer::Srgb] {
+            let result = tone::render(
+                &image,
+                &hist,
+                &range,
+                false,
+                None,
+                FunctionPolicy::Clip,
+                tone::Transfers { png, jpeg },
+            )
+            .unwrap();
+            for (i, (&p, &j)) in result.png.iter().zip(&result.jpeg).enumerate() {
+                let x = i as f64 / 65535.0;
+                let encoded = if png == Transfer::Linear {
+                    x
+                } else {
+                    tone::srgb_encode(x)
+                };
+                assert_eq!(p, (encoded * 65535.0).round() as u16);
+                let stored = f64::from(p) / 65535.0;
+                let expected = if png == jpeg {
+                    stored
+                } else if png == Transfer::Linear {
+                    tone::srgb_encode(stored)
+                } else {
+                    tone::srgb_decode(stored)
+                };
+                assert_eq!(j, (expected * 255.0).round() as u8);
+            }
+        }
     }
 }
 
@@ -781,7 +828,7 @@ fn parallelism_does_not_change_range_or_pixels() {
             true,
             None,
             FunctionPolicy::Clip,
-            Transfer::Srgb,
+            png_transfer(Transfer::Srgb),
         )
         .unwrap();
         (

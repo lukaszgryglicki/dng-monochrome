@@ -130,12 +130,13 @@ fn both_formats_preserve_photographic_exif_and_normalize_output_geometry() {
                     assert_eq!(number(&exif[&0xa003].1, little), height);
                     assert_eq!(
                         number(&exif[&0xa001].1, little),
-                        if is_png && transfer == "linear" {
-                            65535
-                        } else {
-                            1
-                        }
+                        if transfer == "linear" { 65535 } else { 1 }
                     );
+                    if !is_png && transfer == "linear" {
+                        assert_eq!(exif[&0xa500].0, 5);
+                        assert_eq!(number(&exif[&0xa500].1[..4], little), 1);
+                        assert_eq!(number(&exif[&0xa500].1[4..], little), 1);
+                    }
                     assert!(
                         !exif.contains_key(&0x927c),
                         "do not retain invalid MakerNote offsets"
@@ -180,8 +181,7 @@ fn gps_photographer_and_apex_aperture_are_preserved_without_inventing_fnumber() 
         expression::FunctionPolicy,
         output::{self, OutputPaths},
         range::{self, Histogram, RangeOptions},
-        raw,
-        tone::{self, Transfer},
+        raw, tone,
     };
     use rawler::{exif::ExifGPS, formats::tiff::Rational};
     let tmp = tempfile::tempdir().unwrap();
@@ -219,7 +219,7 @@ fn gps_photographer_and_apex_aperture_are_preserved_without_inventing_fnumber() 
         false,
         None,
         FunctionPolicy::Clip,
-        Transfer::Linear,
+        tone::Transfers::default(),
     )
     .unwrap();
     let paths = OutputPaths::new(&tmp.path().join("out/photo"), false);
@@ -228,7 +228,7 @@ fn gps_photographer_and_apex_aperture_are_preserved_without_inventing_fnumber() 
         &image,
         &rendered,
         &serde_json::json!({}),
-        Transfer::Linear,
+        tone::Transfers::default(),
         90,
         false,
     )

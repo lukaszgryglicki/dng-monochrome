@@ -90,8 +90,12 @@ fn help_version_and_missing_arguments() {
     )
     .unwrap();
     assert_eq!(defaults.jpeg_quality, 90);
-    assert_eq!(defaults.clip_strength, 4);
-    assert_eq!(defaults.transfer, dng_monochrome::tone::Transfer::Linear);
+    assert_eq!(defaults.clip_strength, 3);
+    assert_eq!(
+        defaults.transfers(),
+        dng_monochrome::tone::Transfers::default()
+    );
+    assert!(defaults.optimization_enabled());
     for flag in ["--help", "-help", "-h"] {
         let output = success(Command::new(BIN).arg(flag).output().unwrap());
         let text = String::from_utf8(output.stdout).unwrap();
@@ -105,8 +109,11 @@ fn help_version_and_missing_arguments() {
             "--func-scale",
             "--func-wrap",
             "--optimize",
+            "--no-optimize",
             "--both",
             "--transfer",
+            "--png-transfer",
+            "--jpeg-transfer",
             "--jpeg-quality",
             "--threads",
             "--no-crop",
@@ -255,10 +262,10 @@ fn manual_clipping_outputs_do_not_depend_on_auto_strength() {
 }
 
 #[test]
-fn best_prints_twenty_one_mapping_samples_before_the_custom_function() {
+fn best_prints_nineteen_interior_samples_before_the_custom_function() {
     let tmp = tempfile::tempdir().unwrap();
     let (input, _) = fixture(tmp.path());
-    let first = success(run(&input, &tmp.path().join("best"), &["--best"]));
+    let first = success(run(&input, &tmp.path().join("best"), &[]));
     let second = success(run(
         &input,
         &tmp.path().join("function"),
@@ -275,18 +282,19 @@ fn best_prints_twenty_one_mapping_samples_before_the_custom_function() {
     let text = line(&first);
     assert!(text.contains("before --func and output transfer"));
     let points: Vec<_> = text.split(": ").nth(1).unwrap().split(", ").collect();
-    assert_eq!(points.len(), 21);
+    assert_eq!(points.len(), 19);
     let mut previous = 0.0;
     for (i, pair) in points.iter().enumerate() {
         let (x, y) = pair.split_once("->").unwrap();
-        assert_eq!(x, format!("{:.2}", i as f64 / 20.0));
+        assert_eq!(x, format!("{:.2}", (i + 1) as f64 / 20.0));
         assert_eq!(y.split('.').nth(1).unwrap().len(), 5);
         let value: f64 = y.parse().unwrap();
         assert!(value >= previous && (0.0..=1.0).contains(&value));
         previous = value;
     }
-    assert_eq!(points[0], "0.00->0.00000");
-    assert_eq!(points[20], "1.00->1.00000");
+    assert!(points[0].starts_with("0.05->"));
+    assert!(points[18].starts_with("0.95->"));
+    assert!(!text.contains("0.00->") && !text.contains("1.00->"));
     let quiet = success(run(
         &input,
         &tmp.path().join("quiet-best"),
@@ -357,6 +365,172 @@ fn every_single_dash_option_and_complex_expression_execute_together() {
 }
 
 #[test]
+fn optimization_defaults_on_and_has_only_the_requested_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    let default = tmp.path().join("default");
+    let explicit = tmp.path().join("explicit");
+    let off = tmp.path().join("off");
+    success(run(&input, &default, &["--report"]));
+    success(run(&input, &explicit, &["--optimize", "--report"]));
+    let result = success(run(&input, &off, &["-no-optimize", "--report"]));
+    assert_eq!(json(&default.join("photo.json"))["mode"], "best");
+    assert_eq!(json(&off.join("photo.json"))["mode"], "auto");
+    assert_eq!(
+        fs::read(default.join("photo.png")).unwrap(),
+        fs::read(explicit.join("photo.png")).unwrap()
+    );
+    assert_ne!(
+        read_png(&default.join("photo.png")).pixels,
+        read_png(&off.join("photo.png")).pixels
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("best mapping"));
+    for flags in [
+        vec!["--no-best"],
+        vec!["-no-best"],
+        vec!["--no-optimize", "--best"],
+        vec!["--no-optimize", "--optimize"],
+        vec!["--no-optimize", "--both"],
+    ] {
+        assert_eq!(
+            run(&input, &tmp.path().join("invalid"), &flags)
+                .status
+                .code(),
+            Some(2)
+        );
+    }
+}
+
+#[test]
+fn independent_transfers_and_shared_overrides_have_exact_precedence() {
+    use dng_monochrome::tone::{
+        Transfer::{Linear, Srgb},
+        Transfers,
+    };
+    for (flags, expected) in [
+        (
+            vec![],
+            Transfers {
+                png: Linear,
+                jpeg: Srgb,
+            },
+        ),
+        (
+            vec!["-transfer", "linear"],
+            Transfers {
+                png: Linear,
+                jpeg: Linear,
+            },
+        ),
+        (
+            vec!["--transfer=srgb"],
+            Transfers {
+                png: Srgb,
+                jpeg: Srgb,
+            },
+        ),
+        (
+            vec!["--png-transfer", "srgb"],
+            Transfers {
+                png: Srgb,
+                jpeg: Srgb,
+            },
+        ),
+        (
+            vec!["-jpg-transfer", "linear"],
+            Transfers {
+                png: Linear,
+                jpeg: Linear,
+            },
+        ),
+        (
+            vec!["--transfer", "linear", "--jpeg-transfer", "srgb"],
+            Transfers {
+                png: Linear,
+                jpeg: Srgb,
+            },
+        ),
+        (
+            vec!["--jpeg-transfer", "linear", "--transfer", "srgb"],
+            Transfers {
+                png: Srgb,
+                jpeg: Linear,
+            },
+        ),
+    ] {
+        let args = ["dng-monochrome", "photo.DNG"].into_iter().chain(flags);
+        let cli =
+            dng_monochrome::cli::Cli::try_parse_compat(args.map(std::ffi::OsString::from)).unwrap();
+        assert_eq!(cli.transfers(), expected);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    for png_transfer in ["linear", "srgb"] {
+        for jpeg_transfer in ["linear", "srgb"] {
+            let out = tmp.path().join(format!("{png_transfer}-{jpeg_transfer}"));
+            success(run(
+                &input,
+                &out,
+                &[
+                    "--no-optimize",
+                    "--dark",
+                    "0",
+                    "--light",
+                    "0",
+                    "--png-transfer",
+                    png_transfer,
+                    "--jpg-transfer",
+                    jpeg_transfer,
+                    "--jpeg-quality",
+                    "100",
+                    "--report",
+                ],
+            ));
+            let png = read_png(&out.join("photo.png"));
+            let (_, _, jpeg) = read_jpeg(&out.join("photo.jpg"));
+            assert_eq!(png.srgb, png_transfer == "srgb");
+            let report = json(&out.join("photo.json"));
+            assert_eq!(report["png_transfer"], png_transfer);
+            assert_eq!(report["jpeg_transfer"], jpeg_transfer);
+            for (&p, &j) in png.pixels.iter().zip(&jpeg) {
+                let stored = f64::from(p) / 65535.0;
+                let expected = if png_transfer == jpeg_transfer {
+                    stored
+                } else if png_transfer == "linear" {
+                    dng_monochrome::tone::srgb_encode(stored)
+                } else {
+                    dng_monochrome::tone::srgb_decode(stored)
+                };
+                assert!((i32::from(j) - (expected * 255.0).round() as i32).abs() <= 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn default_progress_prints_real_iso_aperture_and_rational_exposure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, mut dng) = fixture(tmp.path());
+    let first = success(run(&input, &tmp.path().join("standard"), &[]));
+    assert!(String::from_utf8_lossy(&first.stderr).contains("ISO 125, f/2.80, t 1/125s"));
+    dng.iso = Some(160000);
+    dng.aperture = None;
+    dng.apex = Some([6, 1]);
+    dng.exposure = [1, 50];
+    dng.write(&input);
+    let second = success(run(&input, &tmp.path().join("apex"), &["--report"]));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("ISO 160000, f/8.00 (APEX), t 1/50s"));
+    let report = json(&tmp.path().join("apex/photo.json"));
+    assert!(report["metadata"]["aperture_f_number"].is_null());
+    assert_eq!(report["metadata"]["aperture_value_apex"], 6.0);
+    dng.iso = None;
+    dng.apex = None;
+    dng.write(&input);
+    let missing = success(run(&input, &tmp.path().join("missing"), &[]));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("ISO unknown, f/unknown"));
+}
+
+#[test]
 fn long_expression_cli_result_matches_independent_pixel_calculation() {
     let tmp = tempfile::tempdir().unwrap();
     let (input, dng) = fixture(tmp.path());
@@ -365,6 +539,7 @@ fn long_expression_cli_result_matches_independent_pixel_calculation() {
         &input,
         &output,
         &[
+            "--no-optimize",
             "--dark",
             "0",
             "--light",
@@ -401,6 +576,7 @@ fn all_function_policies_and_leading_minus_are_exercised_end_to_end() {
             &input,
             &output,
             &[
+                "--no-optimize",
                 "--dark=0",
                 "-light=0%",
                 "--transfer=linear",

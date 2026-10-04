@@ -3,7 +3,7 @@ use crate::{
     output::{self, OutputPaths},
     range::{self, Histogram, RangeOptions},
     raw,
-    tone::{self, Transfer},
+    tone::{self, Transfer, Transfers},
 };
 use anyhow::{Context, Result, ensure};
 use clap::{ArgGroup, Parser};
@@ -25,7 +25,8 @@ use walkdir::WalkDir;
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
         true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
         maximum lossless compression and default linear transfer; JPEGs are display-encoded 8-bit grayscale. \
-        Both carry photographic EXIF. Default auto-clipping strength is 4; level 1 favors preservation.",
+        Both carry photographic EXIF. Optimization is on by default, clipping strength is 3, \
+        PNG transfer is linear and JPEG transfer is sRGB.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
         Pipeline: crop/orient -> range stretch -> optional optimize -> function -> boundary policy -> transfer.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
@@ -62,7 +63,7 @@ pub struct Cli {
         help = "Discard this percent of lightest pixels from the full histogram; default: detect")]
     pub light: Option<f64>,
 
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=9),
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=9),
         help = "Automatic clipping strength: 1 conservative, 9 about 1-2% per tail; manual ends override")]
     pub clip_strength: u8,
 
@@ -98,10 +99,17 @@ pub struct Cli {
     #[arg(
         long,
         visible_alias = "best",
-        conflicts_with = "both",
-        help = "Apply noise-aware photographic exposure/contrast optimization and print its 21-point mapping"
+        conflicts_with_all = ["both", "no_optimize"],
+        help = "Apply photographic exposure/contrast optimization (default) and print its interior mapping"
     )]
     pub optimize: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "both",
+        help = "Disable photographic optimization; apply range selection and any custom function only"
+    )]
+    pub no_optimize: bool,
 
     #[arg(
         long,
@@ -112,10 +120,24 @@ pub struct Cli {
     #[arg(
         long,
         value_enum,
-        default_value = "linear",
-        help = "PNG transfer: linear preserves selected intensities (default); srgb for unmanaged viewers; JPEG is display-encoded"
+        help = "Set BOTH PNG and JPEG transfer; format-specific options take precedence"
     )]
-    pub transfer: Transfer,
+    pub transfer: Option<Transfer>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "PNG transfer; default linear, overrides --transfer"
+    )]
+    pub png_transfer: Option<Transfer>,
+
+    #[arg(
+        long,
+        visible_alias = "jpg-transfer",
+        value_enum,
+        help = "JPEG transfer; default srgb, overrides --transfer; linear has coarser shadows"
+    )]
+    pub jpeg_transfer: Option<Transfer>,
 
     #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
         help = "Grayscale JPEG quality, 1-100")]
@@ -137,7 +159,7 @@ pub struct Cli {
     )]
     pub report: bool,
 
-    #[arg(long, conflicts_with_all = ["optimize", "both", "function", "report", "overwrite"],
+    #[arg(long, conflicts_with_all = ["optimize", "no_optimize", "both", "function", "report", "overwrite"],
         help = "Only print one JSON range-analysis object per input; create no output files")]
     pub analyze: bool,
 
@@ -178,6 +200,21 @@ impl Cli {
             FunctionPolicy::Clip
         }
     }
+
+    pub fn optimization_enabled(&self) -> bool {
+        !self.no_optimize
+    }
+
+    pub fn transfers(&self) -> Transfers {
+        let defaults = Transfers::default();
+        Transfers {
+            png: self.png_transfer.or(self.transfer).unwrap_or(defaults.png),
+            jpeg: self
+                .jpeg_transfer
+                .or(self.transfer)
+                .unwrap_or(defaults.jpeg),
+        }
+    }
 }
 
 fn parse_percentage(input: &str) -> Result<f64, String> {
@@ -204,6 +241,9 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "clip-strength",
         "func",
         "transfer",
+        "png-transfer",
+        "jpeg-transfer",
+        "jpg-transfer",
         "jpeg-quality",
         "threads",
     ];
@@ -212,6 +252,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "func-scale",
         "func-wrap",
         "optimize",
+        "no-optimize",
         "best",
         "both",
         "no-crop",
@@ -327,10 +368,11 @@ pub fn run(cli: Cli) -> Result<()> {
     range_options.validate()?;
     let expression = cli.function.as_deref().map(Expression::parse).transpose()?;
     let inputs = discover(&cli.inputs)?;
+    let transfers = cli.transfers();
     let modes = if cli.both {
         vec![false, true]
     } else {
-        vec![cli.optimize]
+        vec![cli.optimization_enabled()]
     };
     if !cli.analyze {
         let mut destinations = HashSet::new();
@@ -408,7 +450,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mode = if optimized { "best" } else { "auto" };
                 let result = (|| -> Result<()> {
                     let rendered = tone::render(
-                        &image, &hist, &range, optimized, expression.as_ref(), cli.policy(), cli.transfer,
+                        &image, &hist, &range, optimized, expression.as_ref(), cli.policy(), transfers,
                     )?;
                     let paths = output_paths(&cli, input, optimized);
                     let report = ConversionReport {
@@ -420,13 +462,15 @@ pub fn run(cli: Cli) -> Result<()> {
                         tone: &rendered.tone,
                         function: &rendered.function,
                         output: &rendered.stats,
-                        transfer: cli.transfer,
+                        transfer: transfers.png,
+                        png_transfer: transfers.png,
+                        jpeg_transfer: transfers.jpeg,
                         jpeg_quality: cli.jpeg_quality,
                         png_compression: "maximum (DEFLATE level 9, adaptive filtering)",
                         threads,
                     };
                     output::save(
-                        &paths, &image, &rendered, &report, cli.transfer,
+                        &paths, &image, &rendered, &report, transfers,
                         cli.jpeg_quality, cli.overwrite,
                     )?;
                     if !cli.silent {
@@ -436,13 +480,13 @@ pub fn run(cli: Cli) -> Result<()> {
                                 range.dynamic_range.confidence),
                         );
                         eprintln!(
-                        "[{}/{}] {} [{mode}, strength {}] {:.1}..{:.1}, clip {:.3}%/{:.3}%, approx DR {dr}, raw-code span {:.1} bits, {} codes -> {} (elapsed {:.1}s)",
-                        index + 1, inputs.len(), input.relative.display(), cli.clip_strength, range.lower, range.upper,
+                        "[{}/{}] {} [{mode}, strength {}] {}; {:.1}..{:.1}, clip {:.3}%/{:.3}%, approx DR {dr}, raw-code span {:.1} bits, {} codes -> {} (elapsed {:.1}s)",
+                        index + 1, inputs.len(), input.relative.display(), cli.clip_strength, exposure_summary(&image), range.lower, range.upper,
                         range.clipped_dark_percent, range.clipped_light_percent,
                         range.retained_span_bits, rendered.stats.png_occupied_codes, paths.png.display(), start.elapsed().as_secs_f64(),
                         );
                         if optimized {
-                            let mapping = (0..=20).map(|i| {
+                            let mapping = (1..20).map(|i| {
                                 let x = f64::from(i) / 20.0;
                                 format!("{x:.2}->{:.5}", rendered.tone.map(x))
                             }).collect::<Vec<_>>().join(", ");
@@ -475,6 +519,33 @@ pub fn run(cli: Cli) -> Result<()> {
     })
 }
 
+fn exposure_summary(image: &raw::MonoImage) -> String {
+    let metadata = &image.metadata;
+    let iso = metadata
+        .iso
+        .map_or_else(|| "unknown".into(), |v| v.to_string());
+    let aperture = metadata.aperture_f_number.map_or_else(
+        || {
+            metadata.aperture_value_apex.map_or_else(
+                || "f/unknown".into(),
+                |v| format!("f/{:.2} (APEX)", (v * 0.5).exp2()),
+            )
+        },
+        |v| format!("f/{v:.2}"),
+    );
+    let time = image.source_metadata.exif.exposure_time.map_or_else(
+        || "unknown".into(),
+        |v| {
+            if v.d == 1 {
+                format!("{}s", v.n)
+            } else {
+                format!("{}/{}s", v.n, v.d)
+            }
+        },
+    );
+    format!("ISO {iso}, {aperture}, t {time}")
+}
+
 fn output_paths(cli: &Cli, input: &Input, optimized: bool) -> OutputPaths {
     let root = if cli.both {
         cli.output.join(if optimized { "best" } else { "auto" })
@@ -495,6 +566,8 @@ struct ConversionReport<'a> {
     function: &'a crate::expression::FunctionReport,
     output: &'a tone::RenderStats,
     transfer: Transfer,
+    png_transfer: Transfer,
+    jpeg_transfer: Transfer,
     jpeg_quality: u8,
     png_compression: &'static str,
     threads: usize,
