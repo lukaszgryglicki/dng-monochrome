@@ -11,3 +11,4 @@
 *.JP*G
 .DS_Store
 /dng-monochrome
+/dng-monochrome.static
