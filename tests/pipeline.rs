@@ -7,6 +7,63 @@ use dng_monochrome::{
 };
 
 #[test]
+fn selective_srgb_zero_full_and_midpoint_preserve_all_code_quantization() {
+    let image = image((0..=65535).collect(), 256, 0.0, 65535);
+    let hist = Histogram::new(&image.pixels).unwrap();
+    let range = range::analyze(&image, &hist, manual()).unwrap();
+    let render = |optimized, source: Option<&str>, transfer| {
+        let expression = source.map(|source| Expression::parse(source).unwrap());
+        tone::render(
+            &image,
+            &hist,
+            &range,
+            optimized,
+            expression.as_ref(),
+            FunctionPolicy::Clip,
+            tone::Transfers {
+                png: transfer,
+                jpeg: transfer,
+            },
+        )
+        .unwrap()
+    };
+    for optimized in [false, true] {
+        let baseline = render(optimized, None, Transfer::Linear);
+        let zero = render(optimized, Some("srgb_band(x,0,.35,0)"), Transfer::Linear);
+        assert_eq!(zero.png, baseline.png);
+        assert_eq!(zero.jpeg, baseline.jpeg);
+        let srgb = render(optimized, None, Transfer::Srgb);
+        let full = render(optimized, Some("srgb_band(x,0,1,1)"), Transfer::Linear);
+        assert_eq!(full.png, srgb.png);
+        assert_eq!(full.jpeg, srgb.jpeg);
+        let half = render(optimized, Some("srgb_band(x,0,1,.5)"), Transfer::Linear);
+        let explicit = render(optimized, Some("0.5*x+0.5*srgb(x)"), Transfer::Linear);
+        assert_eq!(half.png, explicit.png);
+        assert_eq!(half.jpeg, explicit.jpeg);
+        let lifted = render(optimized, Some("srgb_band(x,0,.35,.4)"), Transfer::Linear);
+        assert_eq!(lifted.png[0], baseline.png[0]);
+        assert_eq!(lifted.png[65535], baseline.png[65535]);
+        for (code, (&before, &after)) in baseline.png.iter().zip(&lifted.png).enumerate() {
+            let x = baseline.tone.map(f64::from(image.pixels[code]) / 65535.0);
+            assert!(after >= before);
+            if x >= 0.35 {
+                assert_eq!(before, after);
+            }
+        }
+        let codes = |values: &[u8]| -> std::collections::BTreeSet<u8> {
+            image
+                .pixels
+                .iter()
+                .zip(values)
+                .filter(|(code, _)| baseline.tone.map(f64::from(**code) / 65535.0) <= 0.02)
+                .map(|(_, &value)| value)
+                .collect()
+        };
+        assert!(codes(&lifted.jpeg).len() > codes(&baseline.jpeg).len());
+    }
+}
+
+#[test]
 fn configurable_noise_geometry_and_envelope_preserve_known_flat_noise() {
     let pixels = normal_noise(512 * 512)
         .into_iter()

@@ -260,3 +260,115 @@ fn arbitrary_short_input_does_not_panic() {
         }
     }
 }
+
+fn reference_srgb(x: f64) -> f64 {
+    if x <= 0.0031308 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn reference_band(x: f64, start: f64, end: f64, amount: f64) -> f64 {
+    if x <= start || x >= end || amount == 0.0 {
+        return x;
+    }
+    let target = start + (end - start) * reference_srgb((x - start) / (end - start));
+    (1.0 - amount) * x + amount * target
+}
+
+#[test]
+fn selective_srgb_helpers_match_exact_transfer_and_nested_expressions() {
+    compare("srgb(x)", reference_srgb);
+    compare("0.6*x + 0.4*srgb(x)", |x| 0.6 * x + 0.4 * reference_srgb(x));
+    compare("srgb_band(x,0,1,1)", reference_srgb);
+    compare("srgb_band(x,0,1,0)", |x| x);
+    compare(
+        "srgb_band(srgb_band((exp(2*x)-1)/(exp(2)-1),0,.35,.4),.7,1,.2)\
+                     +.01*sin(pi*x)^2",
+        |x| {
+            let base = ((2.0 * x).exp() - 1.0) / (2.0f64.exp() - 1.0);
+            reference_band(reference_band(base, 0.0, 0.35, 0.4), 0.7, 1.0, 0.2)
+                + 0.01 * (std::f64::consts::PI * x).sin().powi(2)
+        },
+    );
+    let expression = Expression::parse("srgb(x)").unwrap();
+    let mut srgb = expression.bind();
+    for x in [0.0, 0.0031308, 0.0031308001, 0.018, 0.18, 1.0, -0.1, 1.5] {
+        assert_eq!(srgb(x), reference_srgb(x));
+    }
+}
+
+#[test]
+fn selective_srgb_bands_preserve_order_endpoints_and_all_untouched_codes() {
+    for (start, end) in [(0.0, 0.35), (0.7, 1.0), (0.0, 1.0), (0.2, 0.8)] {
+        for amount in [0.0, 0.35, 0.4, 0.5, 1.0] {
+            let source = format!("srgb_band(x,{start},{end},{amount})");
+            let expression = Expression::parse(&source).unwrap();
+            let mut function = expression.bind();
+            let mut previous = 0.0;
+            for code in 0..=65535 {
+                let x = f64::from(code) / 65535.0;
+                let y = function(x);
+                assert!(y.is_finite() && (0.0..=1.0).contains(&y), "{source}, x={x}");
+                assert!(y >= previous, "{source}, x={x}: {y} < {previous}");
+                assert!((y - reference_band(x, start, end, amount)).abs() <= 2e-15);
+                if x <= start || x >= end || amount == 0.0 {
+                    assert_eq!(y, x, "{source} changed a protected value");
+                } else {
+                    assert!(y >= x && y <= end);
+                }
+                previous = y;
+            }
+            assert_eq!(function(start), start);
+            assert_eq!(function(end), end);
+            for x in [-1.0, 2.0] {
+                assert_eq!(function(x), x);
+            }
+        }
+    }
+    let expression = Expression::parse("srgb_band(x,0,.35,.4)").unwrap();
+    let mut lift = expression.bind();
+    assert!((lift(0.05) - 0.08795326244941004).abs() < 1e-15);
+    assert!((lift(0.1) - 0.13993659127375752).abs() < 1e-15);
+}
+
+#[test]
+fn selective_srgb_invalid_parameters_and_arity_are_explicit_errors() {
+    for source in [
+        "srgb()",
+        "srgb(x,1)",
+        "srgb_band(x)",
+        "srgb_band(x,0,1)",
+        "srgb_band(x,0,1,.5,2)",
+    ] {
+        assert!(Expression::parse(source).is_err(), "{source}");
+    }
+    let hist = Histogram::new(&[0]).unwrap();
+    for source in [
+        "srgb_band(x,-.1,.5,.4)",
+        "srgb_band(x,0,1.1,.4)",
+        "srgb_band(x,.5,.5,.4)",
+        "srgb_band(x,.7,.3,.4)",
+        "srgb_band(x,0,.5,-.1)",
+        "srgb_band(x,0,.5,1.1)",
+        "srgb_band(x,0,exp(1000),0)",
+        "srgb_band(x,0,1,0/0)",
+        "srgb_band(0/0,0,1,0)",
+    ] {
+        let expression = Expression::parse(source).unwrap();
+        for policy in [
+            FunctionPolicy::Clip,
+            FunctionPolicy::Scale,
+            FunctionPolicy::Wrap,
+        ] {
+            let mut values = vec![0.8; LEVELS];
+            let error =
+                expression::apply(&mut values, &hist, Some(&expression), policy).unwrap_err();
+            assert!(
+                error.to_string().contains("non-finite"),
+                "{source}: {error}"
+            );
+        }
+    }
+}

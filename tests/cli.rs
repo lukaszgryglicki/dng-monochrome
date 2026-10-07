@@ -109,6 +109,7 @@ fn help_version_and_missing_arguments() {
             "--light",
             "--clip-strength",
             "--func",
+            "--tone-band",
             "--func-clip",
             "--func-scale",
             "--func-wrap",
@@ -994,4 +995,295 @@ fn original_leica_sample_produces_both_full_precision_variants() {
         assert_eq!(report["output"]["png_max"], 65535);
         assert!(report["output"]["png_occupied_codes"].as_u64().unwrap() > 4096);
     }
+}
+
+#[test]
+fn selective_srgb_shortcuts_equal_functions_and_preserve_highlights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, dng) = fixture(tmp.path());
+    let original = fs::read(&input).unwrap();
+    let mut reference = None;
+    for (index, flags) in [
+        vec!["--tone-band", "0:.35:.4"],
+        vec!["-tone-band", "0:.35:.4"],
+        vec!["--tone-band=0:.35:.4"],
+        vec!["-tone-band=0:.35:.4"],
+        vec!["--func", "srgb_band(x,0,0.35,0.4)"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = tmp.path().join(index.to_string());
+        let mut options = vec![
+            "--no-optimize",
+            "--dark",
+            "0",
+            "--light",
+            "0",
+            "--report",
+            "--jpeg-quality",
+            "100",
+            "--silent",
+        ];
+        options.extend(flags);
+        let result = success(run(&input, &output, &options));
+        assert!(result.stdout.is_empty() && result.stderr.is_empty());
+        let png = read_png(&output.join("photo.png"));
+        let (_, _, jpeg) = read_jpeg(&output.join("photo.jpg"));
+        assert!(!png.srgb && png.gamma == Some(1.0));
+        let mut lifted = 0;
+        for ((&raw, &actual), &j) in dng.pixels.iter().zip(&png.pixels).zip(&jpeg) {
+            let x = (f64::from(raw) - 1023.0) / 15360.0;
+            let expected = if x > 0.0 && x < 0.35 {
+                let u = x / 0.35;
+                let encoded = if u <= 0.0031308 {
+                    12.92 * u
+                } else {
+                    1.055 * u.powf(1.0 / 2.4) - 0.055
+                };
+                lifted += 1;
+                0.6 * x + 0.4 * 0.35 * encoded
+            } else {
+                x
+            };
+            assert_eq!(actual, (expected * 65535.0).round() as u16);
+            assert!((i32::from(j) - (f64::from(actual) / 257.0).round() as i32).abs() <= 2);
+        }
+        assert!(lifted > 100);
+        let report = json(&output.join("photo.json"));
+        assert_eq!(report["function"]["expression"], "srgb_band(x,0,0.35,0.4)");
+        assert_eq!(report["function"]["policy"], "clip");
+        assert_eq!(report["function"]["outside_unit_range_percent"], 0.0);
+        assert_eq!(report["png_transfer"], "linear");
+        assert_eq!(report["jpeg_transfer"], "linear");
+        let pair = (
+            fs::read(output.join("photo.png")).unwrap(),
+            fs::read(output.join("photo.jpg")).unwrap(),
+        );
+        if let Some(expected) = &reference {
+            assert_eq!(&pair, expected);
+        } else {
+            reference = Some(pair);
+        }
+    }
+    assert_eq!(fs::read(input).unwrap(), original);
+}
+
+#[test]
+fn selective_srgb_multiple_bands_support_both_modes_and_independent_transfers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    for png_transfer in ["linear", "srgb"] {
+        for jpeg_transfer in ["linear", "srgb"] {
+            let output = tmp.path().join(format!("{png_transfer}-{jpeg_transfer}"));
+            success(run(
+                &input,
+                &output,
+                &[
+                    "--tone-band",
+                    ".7:1:.2",
+                    "-tone-band=0:.35:.4",
+                    "--both",
+                    "--report",
+                    "--jpeg-quality",
+                    "100",
+                    "--png-transfer",
+                    png_transfer,
+                    "--jpg-transfer",
+                    jpeg_transfer,
+                ],
+            ));
+            for mode in ["auto", "best"] {
+                let base = output.join(mode).join("photo");
+                let png = read_png(&base.with_extension("png"));
+                let (_, _, jpeg) = read_jpeg(&base.with_extension("jpg"));
+                assert_eq!(png.srgb, png_transfer == "srgb");
+                let report = json(&base.with_extension("json"));
+                assert_eq!(
+                    report["function"]["expression"],
+                    "srgb_band(srgb_band(x,0.7,1,0.2),0,0.35,0.4)"
+                );
+                assert_eq!(report["mode"], mode);
+                assert_eq!(report["png_transfer"], png_transfer);
+                assert_eq!(report["jpeg_transfer"], jpeg_transfer);
+                for (&p, &j) in png.pixels.iter().zip(&jpeg) {
+                    let stored = f64::from(p) / 65535.0;
+                    let expected = if png_transfer == jpeg_transfer {
+                        stored
+                    } else if png_transfer == "linear" {
+                        dng_monochrome::tone::srgb_encode(stored)
+                    } else {
+                        dng_monochrome::tone::srgb_decode(stored)
+                    };
+                    assert!((i32::from(j) - (expected * 255.0).round() as i32).abs() <= 2);
+                }
+            }
+        }
+    }
+    let forward = tmp.path().join("forward");
+    success(run(
+        &input,
+        &forward,
+        &[
+            "--tone-band",
+            "0:.35:.4",
+            "--tone-band",
+            ".7:1:.2",
+            "--both",
+            "--report",
+            "--jpeg-quality",
+            "100",
+        ],
+    ));
+    for mode in ["auto", "best"] {
+        for extension in ["png", "jpg"] {
+            let file = format!("photo.{extension}");
+            assert_eq!(
+                fs::read(forward.join(mode).join(&file)).unwrap(),
+                fs::read(tmp.path().join("linear-linear").join(mode).join(&file)).unwrap(),
+            );
+        }
+    }
+}
+
+#[test]
+fn selective_srgb_zero_amount_is_byte_identical_and_function_policies_still_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    let baseline = tmp.path().join("baseline");
+    success(run(&input, &baseline, &["--both"]));
+    for (index, policy) in ["--func-clip", "--func-scale", "--func-wrap"]
+        .into_iter()
+        .enumerate()
+    {
+        let output = tmp.path().join(index.to_string());
+        success(run(
+            &input,
+            &output,
+            &[
+                "--both",
+                "--tone-band",
+                "0:.35:0",
+                "--tone-band",
+                ".7:1:0",
+                policy,
+            ],
+        ));
+        for mode in ["auto", "best"] {
+            for extension in ["png", "jpg"] {
+                let name = format!("photo.{extension}");
+                assert_eq!(
+                    fs::read(output.join(mode).join(&name)).unwrap(),
+                    fs::read(baseline.join(mode).join(&name)).unwrap(),
+                );
+            }
+        }
+    }
+    let scaled = tmp.path().join("scaled");
+    let expression = tmp.path().join("expression");
+    success(run(
+        &input,
+        &scaled,
+        &["--tone-band", "0:.35:.4", "--func-scale", "--report"],
+    ));
+    success(run(
+        &input,
+        &expression,
+        &[
+            "--func",
+            "srgb_band(x,0,0.35,0.4)",
+            "--func-scale",
+            "--report",
+        ],
+    ));
+    assert_eq!(
+        json(&scaled.join("photo.json"))["function"]["policy"],
+        "scale"
+    );
+    for extension in ["png", "jpg"] {
+        assert_eq!(
+            fs::read(scaled.join(format!("photo.{extension}"))).unwrap(),
+            fs::read(expression.join(format!("photo.{extension}"))).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn selective_srgb_invalid_shortcuts_fail_before_inputs_or_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("missing.DNG");
+    let output = tmp.path().join("never-created");
+    for band in [
+        "",
+        "0:.4",
+        "0:.4:.3:1",
+        ":.4:.3",
+        "0:x:.4",
+        "-.1:.4:.3",
+        "0:1.1:.3",
+        "0:.4:-.1",
+        "0:.4:1.1",
+        ".4:.4:.3",
+        ".7:.3:.4",
+        "NaN:.4:.3",
+        "0:inf:.4",
+        "0:.4:NaN",
+        "0:.4:40%",
+    ] {
+        let result = run(&missing, &output, &["--tone-band", band]);
+        assert_eq!(result.status.code(), Some(2), "{band}");
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("locating input"));
+    }
+    for flags in [
+        vec!["--tone-band", "0:.5:.3", "--tone-band", ".4:1:.2"],
+        vec!["--tone-band", ".4:1:.2", "--tone-band", "0:.5:.3"],
+        vec!["--tone-band", "0:1:0", "--tone-band", "0:.5:.3"],
+        vec!["--tone-band", "0:.5:.3", "--func", "x"],
+        vec!["--tone-band", "0:.5:.3", "--analyze"],
+        vec!["--tone-band", "0:.5:.3", "--func-clip", "--func-wrap"],
+    ] {
+        assert_eq!(
+            run(&missing, &output, &flags).status.code(),
+            Some(2),
+            "{flags:?}"
+        );
+    }
+    for flags in [
+        vec![
+            "--tone-band",
+            "0:.5:.3",
+            "--param-expression-max-bytes",
+            "4",
+        ],
+        vec![
+            "--tone-band",
+            "0:.5:.3",
+            "--tone-band",
+            ".5:1:.2",
+            "--param-expression-max-parentheses",
+            "1",
+        ],
+    ] {
+        let result = run(&missing, &output, &flags);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("expression exceeds"));
+    }
+    assert!(!output.exists());
+    let cli = dng_monochrome::cli::Cli::try_parse_compat(
+        [
+            "dng-monochrome",
+            "unused.DNG",
+            "--tone-band",
+            " 0 : .5 : 4e-1 ",
+            "--tone-band",
+            ".5:1:.2",
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    assert_eq!(
+        cli.expression_source().unwrap().unwrap(),
+        "srgb_band(srgb_band(x,0,0.5,0.4),0.5,1,0.2)"
+    );
 }

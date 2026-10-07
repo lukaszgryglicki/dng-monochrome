@@ -5,6 +5,79 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 
+#[derive(Clone, Copy, Debug)]
+pub struct ToneBand {
+    start: f64,
+    end: f64,
+    amount: f64,
+}
+
+impl ToneBand {
+    fn valid(&self) -> bool {
+        [self.start, self.end, self.amount]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            && self.start < self.end
+    }
+
+    fn map(&self, x: f64) -> f64 {
+        if !self.valid() || !x.is_finite() {
+            return f64::NAN;
+        }
+        if self.amount == 0.0 || x <= self.start || x >= self.end {
+            return x;
+        }
+        let width = self.end - self.start;
+        let target = self.start + width * crate::tone::srgb_encode((x - self.start) / width);
+        ((1.0 - self.amount) * x + self.amount * target).clamp(x, self.end)
+    }
+
+    pub fn expression(bands: &[Self]) -> Result<String> {
+        let mut ordered: Vec<_> = bands.iter().collect();
+        ordered.sort_by(|a, b| a.start.total_cmp(&b.start));
+        ensure!(
+            ordered.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "--tone-band ranges must not overlap; use nested srgb_band calls in --func for explicit composition"
+        );
+        let mut source = "srgb_band(".repeat(bands.len());
+        source.push('x');
+        for band in bands {
+            source.push_str(&format!(",{},{},{})", band.start, band.end, band.amount));
+        }
+        Ok(source)
+    }
+}
+
+impl std::str::FromStr for ToneBand {
+    type Err = String;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        let fields: Vec<_> = source.split(':').collect();
+        if fields.len() != 3 {
+            return Err("expected START:END:AMOUNT, e.g. 0:0.35:0.4".into());
+        }
+        let parse = |index: usize| {
+            fields[index].trim().parse::<f64>().map_err(|_| {
+                format!(
+                    "invalid tone-band value {:?}; expected a number",
+                    fields[index]
+                )
+            })
+        };
+        let band = Self {
+            start: parse(0)?,
+            end: parse(1)?,
+            amount: parse(2)?,
+        };
+        if !band.valid() {
+            return Err(
+                "tone band requires finite 0 <= START < END <= 1 and 0 <= AMOUNT <= 1".into(),
+            );
+        }
+        Ok(band)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionPolicy {
@@ -114,6 +187,7 @@ enum Instruction {
 enum Function {
     Unary(fn(f64) -> f64),
     Binary(fn(f64, f64) -> f64),
+    SrgbBand,
     Clamp,
     Min,
     Max,
@@ -122,6 +196,8 @@ enum Function {
 impl Function {
     fn named(name: &str) -> Result<Self> {
         Ok(match name {
+            "srgb" => Self::Unary(crate::tone::srgb_encode),
+            "srgb_band" => Self::SrgbBand,
             "sqrt" => Self::Unary(f64::sqrt),
             "abs" => Self::Unary(f64::abs),
             "exp" => Self::Unary(f64::exp),
@@ -162,6 +238,7 @@ impl Function {
         match self {
             Self::Unary(_) => count == 1,
             Self::Binary(_) => count == 2,
+            Self::SrgbBand => count == 4,
             Self::Clamp => count == 3,
             Self::Min | Self::Max => count >= 1,
         }
@@ -171,6 +248,12 @@ impl Function {
         match self {
             Self::Unary(f) => f(args[0]),
             Self::Binary(f) => f(args[0], args[1]),
+            Self::SrgbBand => ToneBand {
+                start: args[1],
+                end: args[2],
+                amount: args[3],
+            }
+            .map(args[0]),
             Self::Clamp => {
                 if args[1].is_finite() && args[2].is_finite() && args[1] <= args[2] {
                     args[0].clamp(args[1], args[2])

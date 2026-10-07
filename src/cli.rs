@@ -1,5 +1,5 @@
 use crate::{
-    expression::{Expression, FunctionPolicy},
+    expression::{Expression, FunctionPolicy, ToneBand},
     output::{self, OutputPaths},
     parameters::Parameters,
     range::{self, Histogram, RangeOptions},
@@ -29,20 +29,24 @@ use walkdir::WalkDir;
         Both carry photographic EXIF. Optimization is on by default, clipping strength is 3, \
         PNG and JPEG transfers are both linear. Tunable constants are exposed as --param-* options.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
-        Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function -> policy -> transfers.\n\
+        Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function/tone-band -> policy -> transfers.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
         dng-monochrome photos/ -o dng-mono --both --report\n  \
         dng-monochrome shot.DNG -clip-strength 9 -best\n  \
         dng-monochrome shot.DNG -dark 0.8 -light 1.2% -func 'sin(pi*x)^2' -func-scale\n  \
         dng-monochrome shot.DNG --no-optimize --dark 0 --light 0\n  \
+        dng-monochrome shot.DNG -tone-band 0:0.35:0.4\n  \
         dng-monochrome shot.DNG --png-transfer linear --jpeg-transfer srgb\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
-        asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp.\n\
+        asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp,\n\
+        srgb(x), srgb_band(x,start,end,amount). Tone bands use [0,1] intensities, not percentiles;\n\
+        0 amount is unchanged, 1 is full sRGB shape within the band. Bands must not overlap.\n\
         Powers are right-associative; trig uses radians; write multiplication explicitly.\n\
         NaN/infinity are errors even with clipping. See README for algorithms and limitations.",
-    group(ArgGroup::new("function-policy").args(["func_clip", "func_scale", "func_wrap"]))
+    group(ArgGroup::new("function-policy").args(["func_clip", "func_scale", "func_wrap"])),
+    group(ArgGroup::new("curve").args(["function", "tone_bands"]))
 )]
 pub struct Cli {
     #[arg(required = true, num_args = 1.., value_name = "DNG_OR_DIRECTORY")]
@@ -78,22 +82,30 @@ pub struct Cli {
     pub function: Option<String>,
 
     #[arg(
+        long = "tone-band",
+        value_name = "START:END:AMOUNT",
+        allow_hyphen_values = true,
+        help = "Lift a normalized intensity band toward sRGB; repeat for shadows/highlights; shortcut for --func"
+    )]
+    pub tone_bands: Vec<ToneBand>,
+
+    #[arg(
         long,
-        requires = "function",
+        requires = "curve",
         help = "Clamp finite function results to [0,1] (default policy)"
     )]
     pub func_clip: bool,
 
     #[arg(
         long,
-        requires = "function",
+        requires = "curve",
         help = "Scale actual function min/max to [0,1]; constant results are errors"
     )]
     pub func_scale: bool,
 
     #[arg(
         long,
-        requires = "function",
+        requires = "curve",
         help = "Wrap out-of-range finite results modulo 1; preserve values already in [0,1]"
     )]
     pub func_wrap: bool,
@@ -161,7 +173,7 @@ pub struct Cli {
     )]
     pub report: bool,
 
-    #[arg(long, conflicts_with_all = ["optimize", "no_optimize", "both", "function", "report", "overwrite"],
+    #[arg(long, conflicts_with_all = ["optimize", "no_optimize", "both", "function", "tone_bands", "report", "overwrite"],
         help = "Only print one JSON range-analysis object per input; create no output files")]
     pub analyze: bool,
 
@@ -197,7 +209,22 @@ impl Cli {
         cli.parameters.validate().map_err(|error| {
             Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
         })?;
+        cli.expression_source().map_err(|error| {
+            Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
         Ok(cli)
+    }
+
+    pub fn expression_source(&self) -> Result<Option<String>> {
+        ensure!(
+            self.function.is_none() || self.tone_bands.is_empty(),
+            "--tone-band is a shortcut for --func; combine curves explicitly inside --func instead"
+        );
+        if self.tone_bands.is_empty() {
+            Ok(self.function.clone())
+        } else {
+            ToneBand::expression(&self.tone_bands).map(Some)
+        }
     }
 
     pub fn policy(&self) -> FunctionPolicy {
@@ -249,6 +276,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "light",
         "clip-strength",
         "func",
+        "tone-band",
         "transfer",
         "png-transfer",
         "jpeg-transfer",
@@ -376,8 +404,8 @@ pub fn run(cli: Cli) -> Result<()> {
         clip_strength: cli.clip_strength,
     };
     range_options.validate()?;
-    let expression = cli
-        .function
+    let source = cli.expression_source()?;
+    let expression = source
         .as_deref()
         .map(|source| Expression::parse_with_parameters(source, &cli.parameters))
         .transpose()?;

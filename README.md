@@ -82,6 +82,9 @@ dng-monochrome --no-optimize --dark 0 --light 0 shot.DNG
 dng-monochrome -func 'x^.5' -o bright shot.DNG
 dng-monochrome -func 'sin(x*pi)' -func-scale -o mapped shot.DNG
 
+# Keep the linear look, lifting only values below 0.35 by a moderate amount.
+dng-monochrome -tone-band 0:0.35:0.4 -o shadow-lift shot.DNG
+
 # Photographic optimization is enabled by default; -best is still accepted.
 dng-monochrome -best -o best *.DNG
 dng-monochrome -no-optimize -o unoptimized *.DNG
@@ -136,6 +139,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--light PERCENT` | Override lightest-pixel clipping; automatic if omitted |
 | `--clip-strength 1..9` | Automatic clipping strength; default **3**. Level 1 is conservative; level 9 aims around 1-2% per end |
 | `--func EXPR` | Quoted real-valued function of normalized lightness `x` |
+| `--tone-band START:END:AMOUNT` | Lift only the selected `[0,1]` intensity band; repeat for separate bands. Shorthand for `--func`, mutually exclusive with it; default off |
 | `--func-clip` | Clamp finite function results to `[0,1]`; default function policy |
 | `--func-scale` | Rescale the minimum and maximum results actually present in this image to `[0,1]` |
 | `--func-wrap` | Wrap finite out-of-range results modulo one; leave existing `[0,1]` values unchanged |
@@ -159,7 +163,8 @@ The documented `--long` options also accept `-long`, including `-help`,
 
 Percentages can have an optional `%` suffix. Each must be finite and in
 `[0,100)`, and their sum must be less than 100. Either end can be overridden
-independently. Function policies are mutually exclusive and require `--func`.
+independently. Function policies are mutually exclusive and require `--func`
+or `--tone-band`.
 Verbose/debug and silent are mutually exclusive. Manual percentages always
 override their own end, irrespective of clipping strength.
 
@@ -531,6 +536,7 @@ The parser supports:
 | Hyperbolic | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
 | Rounding/sign | `floor`, `ceil`, `round`, `sign`, `signum` |
 | Multiple arguments | `min(a,b,...)`, `max(a,b,...)`, `pow(a,b)`, `hypot(a,b)`, `clamp(x,lo,hi)` |
+| sRGB tone helpers | `srgb(x)` (exact standard encoding curve), `srgb_band(x,start,end,amount)` (anchored regional blend) |
 
 Trigonometric arguments are radians. Powers associate to the right:
 `2^3^2=512`; powers bind more tightly than unary minus: `-x^2=-(x^2)`.
@@ -562,6 +568,63 @@ The math-only parser has no scripting, files, network, variables other than
 `x`, or complex arithmetic. Default limits are 16,384 input bytes, 128 nested
 parentheses and 256 nested parsing operations; evaluation uses a flat reusable
 stack, so long chains do not recursively evaluate an AST.
+
+### Between the linear and sRGB looks
+
+Use **`--tone-band 0:0.35:0.4`** as a starting point for more shadow detail
+without brightening the whole image. The three numbers are **start, end and
+amount**, each in `[0,1]`, with `start < end`. They refer to normalized lightness
+after range selection and any optimization, **not percentages of pixels**.
+Nothing changes when this option is absent.
+
+```sh
+# Lift shadows below 0.35; leave every value at/above 0.35 unchanged.
+dng-monochrome shot.DNG -tone-band 0:0.35:0.4 -o lifted --report
+
+# Also lift highlights, independently and more gently; keep 0.35..0.7 unchanged.
+dng-monochrome shot.DNG -tone-band 0:0.35:0.4 -tone-band 0.7:1:0.2 -o two-bands
+
+# Whole-range halfway blend of the linear and sRGB curves.
+dng-monochrome shot.DNG -tone-band 0:1:0.5 -o halfway
+
+# Equivalent function, or explicitly combine the lift with other adjustments.
+dng-monochrome shot.DNG -func 'srgb_band(x,0,0.35,0.4)' -o lifted
+dng-monochrome shot.DNG -func 'srgb_band(x^1.1,0,0.35,0.4)' -o custom
+dng-monochrome shot.DNG -func '0.6*x+0.4*srgb(x)' -o global-blend
+```
+
+Amount `0` is exactly unchanged. Amount `1` uses the full sRGB **shape rescaled
+into that band**; for the whole range `0:1:1`, its sample values match the full
+sRGB curve. Within a partial band `[L,U]`, the mapping is:
+
+```text
+u = (x-L)/(U-L)
+target = L + (U-L)*srgb(u)
+y = (1-amount)*x + amount*target
+```
+
+The band endpoints stay fixed and values outside stay unchanged. This avoids
+the brightness jump and tone reversal that a hard cutoff of global `srgb(x)`
+would cause. The joins are continuous, though their slopes need not match.
+For `0:0.35:0.4`, `0.05` becomes about `0.088`, `0.10` becomes `0.140`, and
+`0.35` and all brighter values stay as they were. Increase the end to reach
+more midtones, or increase the amount for stronger lift. Shadow noise becomes
+more visible too; no missing sensor detail is recovered.
+
+Repeat `--tone-band` for non-overlapping ranges; touching endpoints and either
+argument order are allowed. It is a shortcut for the equivalent nested
+`srgb_band` expression saved in the JSON report. To combine with `--func`,
+write those calls inside the expression rather than supplying both options.
+The usual expression limits and policies apply. Leave the default clipping
+policy for unchanged exterior values: `--func-scale` deliberately rescales the
+whole result and may change those values.
+
+These are **tone adjustments, not a new file encoding**. The examples use the
+default linear PNG/JPEG output. Adding an sRGB output transfer encodes the
+already-adjusted values again, so it is not the same halfway-look recipe.
+PNG/EXIF encoding tags remain accurate. Use `--no-optimize` if the curve should
+act on only range-normalized input; otherwise it adjusts the default optimized
+rendering. Different viewers' color management can still change appearance.
 
 ### PNG and JPEG appearance
 
