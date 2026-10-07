@@ -10,6 +10,22 @@ use std::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_dng-monochrome");
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[test]
+fn musl_build_uses_mimalloc() {
+    let result = success(
+        Command::new(BIN)
+            .arg("--version")
+            .env("MIMALLOC_VERBOSE", "1")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("mimalloc:"),
+        "musl builds must use mimalloc rather than musl's contended allocator"
+    );
+}
+
 fn run(input: &Path, output: &Path, flags: &[&str]) -> Output {
     let mut command = Command::new(BIN);
     command.arg(input).arg("--output").arg(output);
@@ -963,7 +979,17 @@ fn symlink_outputs_are_not_followed_and_directory_loops_are_skipped() {
     assert_eq!(fs::read(file).unwrap(), original);
 }
 
-#[cfg(unix)]
+#[test]
+fn unicode_filenames_are_supported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("photo-\u{00e9}.DNG");
+    Dng::ramp(32, 16).write(&input);
+    let output = tmp.path().join("output");
+    success(run(&input, &output, &["--report"]));
+    read_png(&output.join("photo-\u{00e9}.png"));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_filenames_are_supported() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};

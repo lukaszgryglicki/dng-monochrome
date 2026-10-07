@@ -35,7 +35,7 @@ make                         # tests, then stripped release build
 | `make test-real DNG_MONO_SAMPLE=/path/shot.DNG` | Opt-in original-Leica decoder and full conversion tests |
 | `make lint` | Formatting check and Clippy with warnings treated as errors |
 | `make fmt` | Format Rust source |
-| `make static` | Stripped static executable under `target/static/<target>/release/` |
+| `make static` | Stripped static executable under `target/static/<target>/release/`; macOS retains dynamic Apple system libraries |
 | `make clean` | Remove Cargo build artifacts, not input or output photographs |
 
 Both BSD make and GNU make can run these targets. Builds use four jobs by
@@ -45,7 +45,8 @@ automatic CPU detection.
 
 On FreeBSD, `make static` uses the native target with static CRT linking.
 On GNU/Linux it selects the corresponding musl target, which must already be
-installed, for example:
+installed along with a musl C compiler (`musl-gcc`, provided by `musl-tools` on
+Debian/Ubuntu), for example:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -54,8 +55,20 @@ make static
 make static STATIC_TARGET=x86_64-unknown-linux-musl
 ```
 
-The static target checks that the resulting executable really is statically
-linked. It never installs toolchains or changes a shared compiler automatically.
+Linux musl executables use mimalloc to avoid contention in musl's allocator
+during parallel processing. GNU/Linux, FreeBSD, and macOS native builds retain
+their system allocators; mimalloc was not a consistent speed win there and
+increased peak memory in real-photo comparisons. The musl speed/scaling benefit
+also trades for higher peak memory.
+
+On macOS (Apple Silicon or Intel), both `make release` and `make static` require
+the Xcode Command Line Tools. Apple does not support fully static system
+executables: `make static` embeds Rust dependencies but keeps Apple system
+libraries dynamically linked, rejecting non-system dynamic dependencies.
+
+On FreeBSD/Linux, the static target checks that the executable really is
+statically linked. It never installs toolchains or changes a shared compiler
+automatically.
 
 ## Usage
 

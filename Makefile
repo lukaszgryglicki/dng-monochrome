@@ -35,13 +35,26 @@ static:
 		host="$$(rustc -vV | sed -n 's/^host: //p')"; \
 		case "$$host" in \
 			*-linux-gnu) target="$${host%-gnu}-musl" ;; \
-			*-linux-musl|*-freebsd) target="$$host" ;; \
+			*-linux-musl|*-freebsd|*-apple-darwin) target="$$host" ;; \
 			*) echo "Set STATIC_TARGET to a static-capable Rust target" >&2; exit 1 ;; \
 		esac; \
 	fi; \
-	CARGO_TARGET_DIR=target/static RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }-C target-feature=+crt-static" \
+	case "$$target" in \
+		*-apple-darwin) link_flags="-C prefer-dynamic=no" ;; \
+		*) link_flags="-C target-feature=+crt-static" ;; \
+	esac; \
+	CARGO_TARGET_DIR=target/static RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$link_flags" \
 		$(CARGO) build --locked --release --target "$$target" -j $(JOBS); \
 	binary="target/static/$$target/release/dng-monochrome"; \
+	if [ "$${target%-apple-darwin}" != "$$target" ]; then \
+		file "$$binary" | grep -Eq 'Mach-O.*executable' || \
+			{ echo "Build did not produce a macOS executable: $$binary" >&2; exit 1; }; \
+		libraries="$$(otool -L "$$binary")"; \
+		printf '%s\n' "$$libraries" | awk 'NR > 1 && $$1 !~ /^\/(usr\/lib|System\/Library)\// { bad = 1 } END { exit bad || NR < 2 }' || \
+			{ echo "macOS executable has non-system dynamic dependencies: $$libraries" >&2; exit 1; }; \
+		printf 'Standalone macOS executable (Rust dependencies static; Apple system libraries remain dynamic): %s\n' "$$binary"; \
+		exit 0; \
+	fi; \
 	file "$$binary" | grep -Eq 'statically linked|static-pie linked' || \
 		{ echo "Build did not produce a static executable: $$binary" >&2; exit 1; }; \
 	printf 'Static executable: %s\n' "$$binary"

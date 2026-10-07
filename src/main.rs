@@ -1,6 +1,10 @@
 use dng_monochrome::cli::{self, Cli};
 use std::process::ExitCode;
 
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse_compat(std::env::args_os()) {
         Ok(cli) => cli,
