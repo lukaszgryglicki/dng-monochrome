@@ -137,6 +137,7 @@ fn help_version_and_missing_arguments() {
             "--jpeg-transfer",
             "--jpeg-quality",
             "--threads",
+            "--jobs",
             "--no-crop",
             "--report",
             "--analyze",
@@ -804,6 +805,10 @@ fn invalid_flags_values_and_expressions_never_create_success_shaped_output() {
         &["--jpeg-quality", "101"],
         &["--threads", "257"],
         &["--threads", "-1"],
+        &["--jobs", "0"],
+        &["--jobs", "257"],
+        &["--jobs", "-1"],
+        &["--jobs", "1.5"],
         &["--png-compression", "fast"],
         &["--unknown"],
         &["--func", ""],
@@ -874,6 +879,203 @@ fn thread_counts_do_not_change_encoded_pixels_or_bytes() {
             reference = Some(pair);
         }
     }
+}
+
+#[test]
+fn batch_reports_share_the_total_thread_budget_between_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (case, (threads, jobs, allocations)) in [
+        (4, 4, vec![4]),
+        (4, 4, vec![2, 2]),
+        (4, 4, vec![2, 1, 1]),
+        (4, 2, vec![2; 5]),
+        (4, 1, vec![4; 3]),
+        (2, 4, vec![1; 5]),
+        (1, 4, vec![1; 3]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input = tmp.path().join(format!("input-{case}"));
+        fs::create_dir(&input).unwrap();
+        for index in 0..allocations.len() {
+            Dng::ramp(32, 16).write(&input.join(format!("{index}.DNG")));
+        }
+        let output = tmp.path().join(format!("output-{case}"));
+        success(run(
+            &input,
+            &output,
+            &[
+                "--threads",
+                &threads.to_string(),
+                "--jobs",
+                &jobs.to_string(),
+                "--both",
+                "--report",
+            ],
+        ));
+        let effective_jobs = allocations.len().min(jobs).min(threads);
+        for (index, file_threads) in allocations.into_iter().enumerate() {
+            for mode in ["auto", "best"] {
+                let report = json(&output.join(mode).join(format!("{index}.json")));
+                assert_eq!(report["threads"], threads);
+                assert_eq!(report["jobs"], effective_jobs);
+                assert_eq!(report["file_threads"], file_threads);
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_batches_preserve_images_reports_and_complete_progress_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir_all(input.join("nested")).unwrap();
+    let names = ["alpha", "beta", "nested/gamma", "nested/delta"];
+    for (name, width) in names.iter().zip([64, 66, 68, 70]) {
+        Dng::ramp(width, 32).write(&input.join(format!("{name}.DNG")));
+    }
+    for threads in ["1", "4"] {
+        let output = tmp.path().join(threads);
+        let result = success(run(
+            &input,
+            &output,
+            &[
+                "--threads",
+                threads,
+                "--both",
+                "--report",
+                "--tone-band",
+                "0:0.35:0.4",
+            ],
+        ));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("Saved 8 PNG/JPEG pair(s)"));
+        let progress = String::from_utf8(result.stderr).unwrap();
+        let lines: Vec<_> = progress.lines().collect();
+        let mut best = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if line.contains("[best,") {
+                assert!(lines[index + 1].starts_with("  best mapping"), "{progress}");
+                best += 1;
+            }
+        }
+        assert_eq!(best, names.len());
+    }
+    for mode in ["auto", "best"] {
+        for name in names {
+            let serial = tmp.path().join("1").join(mode).join(name);
+            let parallel = tmp.path().join("4").join(mode).join(name);
+            for extension in ["png", "jpg"] {
+                assert_eq!(
+                    fs::read(serial.with_extension(extension)).unwrap(),
+                    fs::read(parallel.with_extension(extension)).unwrap(),
+                );
+            }
+            let mut first = json(&serial.with_extension("json"));
+            let mut second = json(&parallel.with_extension("json"));
+            for report in [&mut first, &mut second] {
+                report.as_object_mut().unwrap().remove("threads");
+                report.as_object_mut().unwrap().remove("jobs");
+                report.as_object_mut().unwrap().remove("file_threads");
+            }
+            assert_eq!(first, second);
+        }
+    }
+}
+
+#[test]
+fn parallel_analysis_keeps_json_order_and_continues_after_bad_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    fs::create_dir(&input).unwrap();
+    for name in ["a", "c", "d"] {
+        Dng::ramp(32, 16).write(&input.join(format!("{name}.DNG")));
+    }
+    fs::write(input.join("b.DNG"), b"not a DNG image").unwrap();
+    let output = tmp.path().join("unused");
+    let result = run(
+        &input,
+        &output,
+        &["--threads", "4", "--analyze", "--silent"],
+    );
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!output.exists());
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    let reports: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 3);
+    for (report, name) in reports.iter().zip(["a.DNG", "c.DNG", "d.DNG"]) {
+        assert_eq!(
+            Path::new(report["source"].as_str().unwrap())
+                .file_name()
+                .unwrap(),
+            name
+        );
+        assert_eq!(report["threads"], 4);
+        assert_eq!(report["jobs"], 4);
+        assert_eq!(report["file_threads"], 1);
+    }
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("ERROR") && stderr.contains("b.DNG"));
+    assert!(stderr.contains("1 input/variant(s) failed; 3 completed successfully"));
+    assert!(!stderr.contains("WARNING") && !stderr.contains("best mapping"));
+}
+
+#[test]
+fn parallel_batch_preflight_prevents_partial_output_before_a_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    fs::create_dir(&input).unwrap();
+    fs::create_dir(&output).unwrap();
+    for name in ["alpha", "beta"] {
+        Dng::ramp(32, 16).write(&input.join(format!("{name}.DNG")));
+    }
+    fs::write(output.join("beta.jpg"), b"preserve existing output").unwrap();
+    let result = run(&input, &output, &["--threads", "4", "--report"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("output exists"));
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    assert_eq!(
+        fs::read(output.join("beta.jpg")).unwrap(),
+        b"preserve existing output"
+    );
+}
+
+#[test]
+fn file_job_cap_defaults_and_aliases_preserve_single_file_parallelism() {
+    let defaults = dng_monochrome::cli::Cli::try_parse_compat(
+        ["dng-monochrome", "photo.DNG"]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    for (index, flags) in [
+        vec!["--jobs", "2"],
+        vec!["-jobs", "2"],
+        vec!["--jobs=2"],
+        vec!["-jobs=2"],
+        vec!["-j", "2"],
+        vec!["-j2"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = tmp.path().join(format!("alias-{index}"));
+        let mut flags = flags;
+        flags.extend(["--threads", "4", "--report"]);
+        success(run(&input, &output, &flags));
+        let report = json(&output.join("photo.json"));
+        assert_eq!(report["threads"], 4);
+        assert_eq!(report["jobs"], 1);
+        assert_eq!(report["file_threads"], 4);
+    }
+    assert_eq!(defaults.threads, 0);
+    assert_eq!(defaults.jobs, 4);
 }
 
 #[test]

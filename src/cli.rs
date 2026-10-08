@@ -14,6 +14,10 @@ use std::{
     ffi::OsString,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 use walkdir::WalkDir;
@@ -158,8 +162,12 @@ pub struct Cli {
     pub jpeg_quality: u8,
 
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256),
-        help = "Worker threads; 0 detects available CPU parallelism (files are processed sequentially)")]
+        help = "Total worker budget, shared between active files; 0 detects available CPU parallelism")]
     pub threads: u16,
+
+    #[arg(short = 'j', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=256),
+        help = "Maximum files processed at once; each gets a share of --threads; 1 processes files sequentially")]
+    pub jobs: u16,
 
     #[arg(
         long,
@@ -283,6 +291,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jpg-transfer",
         "jpeg-quality",
         "threads",
+        "jobs",
     ];
     const FLAGS: &[&str] = &[
         "func-clip",
@@ -323,7 +332,9 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
             }
             let name = text.trim_start_matches('-').split('=').next().unwrap_or("");
             let known_value = VALUES.contains(&name) || name.starts_with("param-");
-            if !text.contains('=') && (known_value && text.starts_with('-') || text == "-o") {
+            if !text.contains('=')
+                && (known_value && text.starts_with('-') || matches!(text, "-o" | "-j"))
+            {
                 value_next = true;
             }
             if text.starts_with('-')
@@ -396,6 +407,62 @@ fn is_dng(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
 }
 
+fn process_files<T: Send>(
+    count: usize,
+    threads: usize,
+    jobs: usize,
+    process: impl Fn(usize) -> T + Sync,
+) -> Result<Vec<T>> {
+    ensure!(
+        count > 0 && threads > 0 && jobs > 0,
+        "file scheduling requires positive input, thread and job counts"
+    );
+    let jobs = jobs.min(count).min(threads);
+    let pools = (0..jobs)
+        .map(|job| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads / jobs + usize::from(job < threads % jobs))
+                .thread_name(move |worker| format!("dng-mono-{job}-{worker}"))
+                .build()
+                .with_context(|| {
+                    format!("creating processing thread pool for file slot {}", job + 1)
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let next = AtomicUsize::new(jobs);
+    let (sender, receiver) = mpsc::channel();
+    let work = |mut index| {
+        while index < count {
+            assert!(
+                sender.send((index, process(index))).is_ok(),
+                "file result receiver must remain alive until processing finishes"
+            );
+            index = next.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    // Launch scopes in the caller, leaving every pool worker available for image work.
+    fn launch(pools: &[rayon::ThreadPool], index: usize, work: &(impl Fn(usize) + Sync)) {
+        if let Some((pool, rest)) = pools.split_first() {
+            pool.in_place_scope(|scope| {
+                scope.spawn(move |_| work(index));
+                launch(rest, index + 1, work);
+            });
+        }
+    }
+    launch(&pools, 0, &work);
+    drop(sender);
+    let mut results: Vec<_> = receiver.into_iter().collect();
+    results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+#[derive(Default)]
+struct FileOutcome {
+    successes: usize,
+    failures: usize,
+    analysis: Option<serde_json::Value>,
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     cli.parameters.validate()?;
     let range_options = RangeOptions {
@@ -439,28 +506,29 @@ pub fn run(cli: Cli) -> Result<()> {
     } else {
         usize::from(cli.threads)
     };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("dng-mono-{i}"))
-        .build()
-        .context("creating processing thread pool")?;
-    pool.install(|| {
-        let mut successes = 0usize;
-        let mut failures = 0usize;
-        for (index, input) in inputs.iter().enumerate() {
+    let jobs = usize::from(cli.jobs).min(threads).min(inputs.len());
+    let results = process_files(
+        inputs.len(),
+        threads,
+        jobs,
+        |index| -> Result<FileOutcome> {
+            let input = &inputs[index];
+            let file_threads = rayon::current_num_threads();
+            let mut outcome = FileOutcome::default();
             let start = Instant::now();
             let decoded = (|| -> Result<_> {
                 let image = raw::decode(&input.path, cli.no_crop)?;
                 let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
-                let range = range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
+                let range =
+                    range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
                 Ok((image, hist, range))
             })();
             let (image, hist, range) = match decoded {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("ERROR {}: {error:#}", input.path.display());
-                    failures += 1;
-                    continue;
+                    outcome.failures += 1;
+                    return Ok(outcome);
                 }
             };
             if !cli.silent {
@@ -474,6 +542,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     "metadata": image.metadata,
                     "range": range,
                     "parameters": cli.parameters,
+                    "threads": threads,
+                    "jobs": jobs,
+                    "file_threads": file_threads,
                 });
                 eprintln!("{}", serde_json::to_string_pretty(&diagnostic)?);
             }
@@ -484,17 +555,25 @@ pub fn run(cli: Cli) -> Result<()> {
                     "metadata": image.metadata,
                     "range": range,
                     "parameters": cli.parameters,
+                    "threads": threads,
+                    "jobs": jobs,
+                    "file_threads": file_threads,
                 });
-                serde_json::to_writer(io::stdout().lock(), &report)?;
-                writeln!(io::stdout().lock())?;
-                successes += 1;
-                continue;
+                outcome.analysis = Some(report);
+                outcome.successes += 1;
+                return Ok(outcome);
             }
             for &optimized in &modes {
                 let mode = if optimized { "best" } else { "auto" };
                 let result = (|| -> Result<()> {
                     let rendered = tone::render_with_parameters(
-                        &image, &hist, &range, optimized, expression.as_ref(), cli.policy(), transfers,
+                        &image,
+                        &hist,
+                        &range,
+                        optimized,
+                        expression.as_ref(),
+                        cli.policy(),
+                        transfers,
                         &cli.parameters,
                     )?;
                     let paths = output_paths(&cli, input, optimized);
@@ -513,63 +592,106 @@ pub fn run(cli: Cli) -> Result<()> {
                         jpeg_quality: cli.jpeg_quality,
                         png_compression: "maximum (DEFLATE level 9, adaptive filtering)",
                         threads,
+                        jobs,
+                        file_threads,
                         parameters: &cli.parameters,
                     };
                     output::save_with_parameters(
-                        &paths, &image, &rendered, &report, transfers,
-                        cli.jpeg_quality, cli.overwrite,
+                        &paths,
+                        &image,
+                        &rendered,
+                        &report,
+                        transfers,
+                        cli.jpeg_quality,
+                        cli.overwrite,
                         &cli.parameters,
                     )?;
                     if !cli.silent {
                         let dr = range.dynamic_range.snr1_stops.map_or_else(
                             || "unavailable (insufficient noise evidence)".to_owned(),
-                            |value| format!("{value:.digits$} bits/stops (noise-limited, {:?} confidence)",
-                                range.dynamic_range.confidence, digits = cli.parameters.progress_dr_decimals),
+                            |value| {
+                                format!(
+                                    "{value:.digits$} bits/stops (noise-limited, {:?} confidence)",
+                                    range.dynamic_range.confidence,
+                                    digits = cli.parameters.progress_dr_decimals
+                                )
+                            },
                         );
-                        eprintln!(
-                        "[{}/{}] {} [{mode}, strength {}] {}; {:.range_digits$}..{:.range_digits$}, clip {:.clip_digits$}%/{:.clip_digits$}%, approx DR {dr}, raw-code span {:.dr_digits$} bits, {} codes -> {} (elapsed {:.elapsed_digits$}s)",
-                        index + 1, inputs.len(), input.relative.display(), cli.clip_strength, exposure_summary(&image, &cli.parameters), range.lower, range.upper,
-                        range.clipped_dark_percent, range.clipped_light_percent,
-                        range.retained_span_bits, rendered.stats.png_occupied_codes, paths.png.display(), start.elapsed().as_secs_f64(),
-                        range_digits = cli.parameters.progress_range_decimals,
-                        clip_digits = cli.parameters.progress_clip_decimals,
-                        dr_digits = cli.parameters.progress_dr_decimals,
-                        elapsed_digits = cli.parameters.progress_elapsed_decimals,
+                        let mut progress = format!(
+                            "[{}/{}] {} [{mode}, strength {}, {file_threads} threads] {}; {:.range_digits$}..{:.range_digits$}, clip {:.clip_digits$}%/{:.clip_digits$}%, approx DR {dr}, raw-code span {:.dr_digits$} bits, {} codes -> {} (elapsed {:.elapsed_digits$}s)",
+                            index + 1,
+                            inputs.len(),
+                            input.relative.display(),
+                            cli.clip_strength,
+                            exposure_summary(&image, &cli.parameters),
+                            range.lower,
+                            range.upper,
+                            range.clipped_dark_percent,
+                            range.clipped_light_percent,
+                            range.retained_span_bits,
+                            rendered.stats.png_occupied_codes,
+                            paths.png.display(),
+                            start.elapsed().as_secs_f64(),
+                            range_digits = cli.parameters.progress_range_decimals,
+                            clip_digits = cli.parameters.progress_clip_decimals,
+                            dr_digits = cli.parameters.progress_dr_decimals,
+                            elapsed_digits = cli.parameters.progress_elapsed_decimals,
                         );
                         if optimized {
-                            let mapping = (1..cli.parameters.mapping_steps).map(|i| {
-                                let x = i as f64 / cli.parameters.mapping_steps as f64;
-                                format!("{x:.input_digits$}->{:.output_digits$}", rendered.tone.map(x),
-                                    input_digits = cli.parameters.mapping_input_decimals,
-                                    output_digits = cli.parameters.mapping_output_decimals)
-                            }).collect::<Vec<_>>().join(", ");
-                            eprintln!("  best mapping (normalized linear, before --func and output transfer): {mapping}");
+                            let mapping = (1..cli.parameters.mapping_steps)
+                                .map(|i| {
+                                    let x = i as f64 / cli.parameters.mapping_steps as f64;
+                                    format!(
+                                        "{x:.input_digits$}->{:.output_digits$}",
+                                        rendered.tone.map(x),
+                                        input_digits = cli.parameters.mapping_input_decimals,
+                                        output_digits = cli.parameters.mapping_output_decimals
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            progress.push_str(&format!("\n  best mapping (normalized linear, before --func and output transfer): {mapping}"));
                         }
+                        eprintln!("{progress}");
                     }
                     Ok(())
                 })();
                 match result {
-                    Ok(()) => successes += 1,
+                    Ok(()) => outcome.successes += 1,
                     Err(error) => {
                         eprintln!("ERROR {} [{mode}]: {error:#}", input.path.display());
-                        failures += 1;
+                        outcome.failures += 1;
                     }
                 }
             }
+            Ok(outcome)
+        },
+    )?;
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for result in results {
+        let result = result?;
+        successes += result.successes;
+        failures += result.failures;
+        if let Some(report) = result.analysis {
+            let mut stdout = io::stdout().lock();
+            serde_json::to_writer(&mut stdout, &report)?;
+            writeln!(stdout)?;
         }
-        ensure!(
-            failures == 0,
-            "{failures} input/variant(s) failed; {successes} completed successfully"
-        );
-        if !cli.analyze && !cli.silent {
-            writeln!(
-                io::stdout().lock(),
-                "Saved {successes} PNG/JPEG pair(s) from {} DNG(s) using {threads} threads to {}",
-                inputs.len(), cli.output.display()
-            )?;
-        }
-        Ok(())
-    })
+    }
+    ensure!(
+        failures == 0,
+        "{failures} input/variant(s) failed; {successes} completed successfully"
+    );
+    if !cli.analyze && !cli.silent {
+        writeln!(
+            io::stdout().lock(),
+            "Saved {successes} PNG/JPEG pair(s) from {} DNG(s) using {threads} threads ({jobs} files at once) to {}",
+            inputs.len(),
+            cli.output.display()
+        )?;
+    }
+    Ok(())
 }
 
 fn exposure_summary(image: &raw::MonoImage, parameters: &Parameters) -> String {
@@ -635,5 +757,120 @@ struct ConversionReport<'a> {
     jpeg_quality: u8,
     png_compression: &'static str,
     threads: usize,
+    jobs: usize,
+    file_threads: usize,
     parameters: &'a Parameters,
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::process_files;
+    use std::{
+        collections::HashSet,
+        sync::{
+            Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn worker_budget_is_divided_between_capped_file_slots() {
+        for (threads, jobs, expected) in [
+            (16, 4, vec![16]),
+            (16, 4, vec![8, 8]),
+            (16, 4, vec![6, 5, 5]),
+            (16, 4, vec![4; 16]),
+            (4, 1, vec![4; 7]),
+            (3, 4, vec![1; 7]),
+            (1, 4, vec![1; 3]),
+        ] {
+            let actual = process_files(expected.len(), threads, jobs, |_| {
+                rayon::current_num_threads()
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn files_and_their_nested_workers_run_concurrently_without_oversubscription() {
+        let arrived = (Mutex::new(0), Condvar::new());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let results = process_files(6, 16, 2, |index| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            assert_eq!(rayon::current_num_threads(), 8);
+            let workers = rayon::broadcast(|_| {
+                if index < 2 {
+                    let (lock, condition) = &arrived;
+                    let mut count = lock.lock().unwrap();
+                    *count += 1;
+                    condition.notify_all();
+                    let (count, _) = condition
+                        .wait_timeout_while(count, Duration::from_secs(10), |n| *n < 16)
+                        .unwrap();
+                    assert_eq!(*count, 16, "all workers must be able to run together");
+                }
+                std::thread::current().id()
+            });
+            active.fetch_sub(1, Ordering::SeqCst);
+            (index, workers)
+        })
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let mut workers = HashSet::new();
+        for (index, (actual, ids)) in results.into_iter().enumerate() {
+            assert_eq!(actual, index);
+            assert_eq!(ids.len(), 8);
+            workers.extend(ids);
+        }
+        assert_eq!(workers.len(), 16);
+    }
+
+    #[test]
+    fn queued_files_are_processed_once_and_errors_remain_in_input_order() {
+        let calls: Vec<_> = (0..19).map(|_| AtomicUsize::new(0)).collect();
+        let results = process_files(calls.len(), 4, 2, |index| {
+            assert_eq!(calls[index].fetch_add(1, Ordering::Relaxed), 0);
+            assert_eq!(rayon::current_num_threads(), 2);
+            if index % 3 == 0 {
+                Err(index)
+            } else {
+                Ok(index)
+            }
+        })
+        .unwrap();
+        for (index, result) in results.into_iter().enumerate() {
+            assert_eq!(
+                result,
+                if index % 3 == 0 {
+                    Err(index)
+                } else {
+                    Ok(index)
+                }
+            );
+            assert_eq!(calls[index].load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn scheduler_rejects_invalid_budgets_and_propagates_worker_panics() {
+        for (count, threads, jobs) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            assert!(process_files(count, threads, jobs, |_| unreachable!()).is_err());
+        }
+        let finished = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            process_files(2, 2, 2, |index| {
+                if index == 0 {
+                    panic!("worker failure");
+                }
+                finished.store(true, Ordering::SeqCst);
+            })
+        });
+        assert!(result.is_err());
+        assert!(finished.load(Ordering::SeqCst));
+    }
 }

@@ -163,7 +163,8 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--png-transfer srgb\|linear` | PNG encoding, default **`linear`**; overrides `--transfer` |
 | `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`linear`**; alias `--jpg-transfer`; overrides `--transfer` |
 | `--jpeg-quality 1..100` | JPEG quality; default `90` for sharing; PNG is the lossless master |
-| `--threads 0..256` | Processing workers; `0` detects available hardware parallelism |
+| `--threads 0..256` | Total processing-worker budget shared across files; `0` detects available hardware parallelism |
+| `-j, --jobs 1..256` | Maximum files processed concurrently; default **4**; `1` keeps files sequential while using all workers within each |
 | `--no-crop` | Retain the full raw raster instead of the recommended DNG crop |
 | `--report` | Write per-pair JSON with settings, thresholds, clipping and precision statistics |
 | `--analyze` | Analyze only, creating no output files; cannot combine with tone/functions, `--both`, reports or overwrite |
@@ -406,8 +407,23 @@ EXIF rationals or JSON numeric precision.
 All calculations after decoding use `f64`. Each expression is evaluated once
 per occupied raw code, not once per pixel, and cached in a lookup table.
 Histogram construction, noise sampling, pixel mapping and supported raw
-decompression use Rayon. PNG and JPEG encoding run concurrently. Files are
-processed sequentially to avoid keeping many 18/36/60-megapixel images in RAM.
+decompression use Rayon. PNG and JPEG encoding can run concurrently within
+each file's worker budget.
+
+`--threads` is the **total** worker budget, not a per-file multiplier.
+Up to `min(--jobs, threads, input count)` files run at once, with that budget
+divided as evenly as possible between file slots. For example, 16 threads give
+one file 16 workers, two files eight each, or four active files four each.
+Remainders go to the first slots (16 threads / three files gives 6, 5, 5).
+Each slot takes another queued file when finished; its worker allocation stays
+fixed for the run. Slots become idle when no queued files remain.
+
+The default `--jobs 4` bounds simultaneous 18/36/60-megapixel image buffers.
+More concurrent files use more RAM and may contend for storage; tune with
+`--jobs 1`, `--jobs 2`, or `--jobs 8`. `--jobs 1` restores sequential-file
+processing without disabling within-file parallelism. A single input always
+gets the full thread budget. Reports include total `threads`, effective file
+slots `jobs`, and the assigned `file_threads`.
 
 Large, Medium and Small are not special-cased: dimensions and precision come
 from DNG metadata. A 16-bit container does **not** imply 16 bits of original
@@ -748,6 +764,9 @@ reports the failure. Failed staging cleans up temporary files.
 When overwriting images that already have a JSON sidecar, include `--report`
 so it cannot silently become stale. Progress/warnings/errors go to standard
 error; the completion line or `--analyze` JSON goes to standard output.
+Parallel progress appears as variants finish, with each best mapping kept
+beside its progress line; bracketed file numbers refer to discovery order.
+`--analyze` retains discovery order and emits its JSON lines after analysis.
 Batch conversion continues after individual input/variant failures and exits
 nonzero if any failed. Syntax errors exit with code 2; processing errors with
 code 1; successful conversion/help/version with code 0.
@@ -778,6 +797,8 @@ over 5,000-character formulas, 100 nested parentheses, precedence, all boundary
 policies, overflow/domain failures and 4,000 arbitrary-input parser cases.
 CLI tests cover every flag, shell-expanded multi-file input, recursion, both
 variants, collisions, overwrite protection, reports, and invalid combinations.
+Scheduling tests verify concurrent files and within-file workers, exact shared
+budgets, file caps, queued inputs, and unchanged images across batch settings.
 The default 19-point best mapping, optimization/opt-out, all transfer pairs,
 per-format override precedence, ISO/f/t display and silent/debug behavior are
 also checked. Parameter tests cover every option's implicit/explicit defaults,
