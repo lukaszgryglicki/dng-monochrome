@@ -8,6 +8,10 @@ use std::{
 use tempfile::TempDir;
 
 fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) {
+    make_build(host, format, libraries, &["static"])
+}
+
+fn make_build(host: &str, format: &str, libraries: &str, goals: &[&str]) -> (TempDir, Output) {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("Makefile"),
@@ -32,7 +36,17 @@ fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) 
         ("otool", "printf '%s\\n' \"$MOCK_LIBRARIES\"\n"),
         (
             "cargo",
-            "printf '%s\\n' \"$RUSTFLAGS\" > flags\n\
+            "printf '%s %s\\n' \"${CARGO_TARGET_DIR:-target}\" \"$*\" >> calls\n\
+             if test \"$1\" = clean; then\n\
+               rm -rf target\n\
+               exit 0\n\
+             fi\n\
+             if test \"${CARGO_TARGET_DIR:-target}\" = target; then\n\
+               mkdir -p target/release\n\
+               printf 'dynamic executable\\n' > target/release/dng-monochrome\n\
+               exit 0\n\
+             fi\n\
+             printf '%s\\n' \"$RUSTFLAGS\" > flags\n\
              printf '%s\\n' \"$@\" > arguments\n\
              test \"$CARGO_TARGET_DIR\" = target/static\n\
              test \"$DNG_MONO_STATIC\" = 1\n\
@@ -48,7 +62,7 @@ fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) 
                shift\n\
              done\n\
              mkdir -p \"target/static/$target/release\"\n\
-             : > \"target/static/$target/release/dng-monochrome\"\n",
+             printf 'static:%s\\n' \"$target\" > \"target/static/$target/release/dng-monochrome\"\n",
         ),
     ] {
         let path = tools.join(name);
@@ -58,9 +72,16 @@ fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) 
     let mut paths = vec![tools];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let result = Command::new("make")
-        .args(["static", "CARGO=cargo", "JOBS=2", "STATIC_TARGET="])
+        .args([
+            "CARGO=cargo",
+            "JOBS=2",
+            "STATIC_TARGET=",
+            "INSTALL_DIR=installed scripts",
+        ])
+        .args(goals)
         .current_dir(directory.path())
         .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("CARGO_TARGET_DIR")
         .env("MOCK_HOST", host)
         .env("MOCK_FORMAT", format)
         .env("MOCK_LIBRARIES", libraries)
@@ -68,6 +89,87 @@ fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) 
         .output()
         .unwrap();
     (directory, result)
+}
+
+#[test]
+fn install_uses_selected_target_and_clean_preserves_all_three_executables() {
+    assert!(include_str!("../Makefile").contains("INSTALL_DIR ?= /data/scripts"));
+    for (host, selection, target) in [
+        ("x86_64-unknown-linux-gnu", "", "x86_64-unknown-linux-musl"),
+        ("x86_64-unknown-linux-musl", "", "x86_64-unknown-linux-musl"),
+        ("x86_64-unknown-freebsd", "", "x86_64-unknown-freebsd"),
+        ("aarch64-apple-darwin", "", "aarch64-apple-darwin"),
+        ("x86_64-apple-darwin", "", "x86_64-apple-darwin"),
+        (
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ),
+    ] {
+        let format = if target.ends_with("-apple-darwin") {
+            "Mach-O 64-bit executable"
+        } else {
+            "ELF 64-bit executable, statically linked"
+        };
+        for goals in [
+            &["install"][..],
+            &["release", "static", "install", "clean"][..],
+        ] {
+            let selection = format!("STATIC_TARGET={selection}");
+            let mut arguments = goals.to_vec();
+            arguments.push(&selection);
+            let (directory, result) = make_build(
+                host,
+                format,
+                "program:\n/usr/lib/libSystem.B.dylib",
+                &arguments,
+            );
+            assert!(result.status.success(), "{host}: {result:?}");
+            let expected_static = format!("static:{target}\n");
+            for (name, expected) in [
+                ("dng-monochrome", "dynamic executable\n"),
+                ("dng-monochrome.static", expected_static.as_str()),
+                ("installed scripts/dng-monochrome", expected_static.as_str()),
+            ] {
+                let path = directory.path().join(name);
+                assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(directory.path().join("calls"))
+                    .unwrap()
+                    .lines()
+                    .filter(|line| line.contains(" build "))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                directory.path().join("target").exists(),
+                !goals.contains(&"clean")
+            );
+            assert!(
+                !directory
+                    .path()
+                    .join("installed scripts/dng-monochrome.static")
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn install_reports_destination_errors() {
+    let (_directory, result) = make_build(
+        "x86_64-unknown-linux-musl",
+        "ELF executable, statically linked",
+        "",
+        &["install", "INSTALL_DIR=Makefile"],
+    );
+    assert!(!result.status.success());
+    assert!(!result.stderr.is_empty());
 }
 
 #[test]
@@ -110,19 +212,27 @@ fn x265_build(checksum: &str) -> (TempDir, Output) {
     let root = directory.path().join("x265");
     let source = root.join("x265_4.1");
     let tools = directory.path().join("tools");
-    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(source.join("source")).unwrap();
     fs::create_dir(&tools).unwrap();
     fs::write(root.join("x265_4.1.tar.gz"), b"cached source").unwrap();
     fs::write(source.join(".unpacked"), b"").unwrap();
     fs::write(source.join("COPYING"), b"license").unwrap();
+    fs::write(
+        source.join("source/CMakeLists.txt"),
+        "cmake_policy(SET CMP0025 OLD)\ncmake_policy(SET CMP0054 OLD)\n",
+    )
+    .unwrap();
     let script = directory.path().join("build-static-x265.sh");
     fs::write(&script, include_str!("../scripts/build-static-x265.sh")).unwrap();
     for (name, body) in [
-        ("sha256", "printf '%s\\n' \"$MOCK_CHECKSUM\"\n"),
         ("curl", "echo 'unexpected download' >&2; exit 1\n"),
         (
             "cmake",
-            "printf '%s\\n' \"$*\" >> \"$MOCK_ROOT/commands\"\n\
+            "if test \"$1\" = -E && test \"$2\" = sha256sum; then\n\
+               printf '%s  %s\\n' \"$MOCK_CHECKSUM\" \"$3\"\n\
+               exit 0\n\
+             fi\n\
+             printf '%s\\n' \"$*\" >> \"$MOCK_ROOT/commands\"\n\
                  case \"$1\" in\n\
                    --build) printf archive > \"$2/libx265.a\" ;;\n\
                    --install)\n\
@@ -161,6 +271,10 @@ fn freebsd_x265_recipe_builds_all_depths_and_complete_static_metadata() {
         x265_build("a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29");
     assert!(result.status.success(), "{:?}", result);
     let root = directory.path().join("x265");
+    assert_eq!(
+        fs::read_to_string(root.join("x265_4.1/source/CMakeLists.txt")).unwrap(),
+        "cmake_policy(SET CMP0025 NEW)\ncmake_policy(SET CMP0054 NEW)\n",
+    );
     let commands = fs::read_to_string(root.join("commands")).unwrap();
     let configurations: Vec<_> = commands
         .lines()

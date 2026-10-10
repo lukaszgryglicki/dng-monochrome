@@ -11,25 +11,32 @@ archive="$root/x265_$version.tar.gz"
 source="$root/x265_$version"
 prefix="$root/install"
 
+verify_checksum() {
+    digest="$(cmake -E sha256sum "$1")"
+    if [ "${digest%% *}" != "$checksum" ]; then
+        echo "x265 source checksum mismatch: $1" >&2
+        exit 1
+    fi
+}
+
 if [ ! -f "$archive" ]; then
     curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
         --output "$archive.part" \
         "https://download.videolan.org/pub/videolan/x265/x265_$version.tar.gz"
-    if [ "$(sha256 -q "$archive.part")" != "$checksum" ]; then
-        echo "x265 source checksum mismatch: $archive.part" >&2
-        exit 1
-    fi
+    verify_checksum "$archive.part"
     mv "$archive.part" "$archive"
 fi
-if [ "$(sha256 -q "$archive")" != "$checksum" ]; then
-    echo "x265 source checksum mismatch: $archive" >&2
-    exit 1
-fi
+verify_checksum "$archive"
 if [ ! -f "$source/.unpacked" ]; then
     mkdir -p "$source"
     tar -xf "$archive" -C "$source" --strip-components=1
     touch "$source/.unpacked"
 fi
+# CMake 4 no longer permits these obsolete policy modes in x265 4.1.
+sed -e 's/SET CMP0025 OLD/SET CMP0025 NEW/' \
+    -e 's/SET CMP0054 OLD/SET CMP0054 NEW/' \
+    "$source/source/CMakeLists.txt" > "$source/source/CMakeLists.txt.tmp"
+mv "$source/source/CMakeLists.txt.tmp" "$source/source/CMakeLists.txt"
 mkdir -p "$prefix/lib"
 
 configure() {
@@ -57,7 +64,7 @@ configure "$root/8bit" -DHIGH_BIT_DEPTH=OFF -DEXPORT_C_API=ON \
 cmake --install "$root/8bit"
 cp "$source/COPYING" "$prefix/COPYING.x265"
 
-# Upstream metadata omits multilib archives and names FreeBSD's shared unwinder.
+# Upstream metadata omits multilib archives and can name a shared unwinder.
 pc="$prefix/lib/pkgconfig/x265.pc"
 sed -e 's/^Libs.private: */Libs.private: -lx265_main10 -lx265_main12 /' \
     -e 's/-lgcc_s/-lgcc_eh/g' "$pc" > "$pc.tmp"

@@ -28,7 +28,10 @@ dcraw, ImageMagick, or external image-conversion process is required.
 # FreeBSD
 sudo pkg install cmake pkgconf x265 aom libde265
 # Debian/Ubuntu
-sudo apt install build-essential cmake pkg-config libx265-dev libaom-dev libde265-dev
+sudo apt install build-essential cmake pkg-config libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev
+
+# macOS (Xcode Command Line Tools and Homebrew)
+brew install cmake pkgconf x265 aom libde265
 
 make                         # tests, then stripped release build
 ./target/release/dng-monochrome -help
@@ -41,6 +44,10 @@ it must supply x265 and AOM encoders supporting 8/10/12-bit monochrome images.
 Normal builds retain HEIF decoders for round-trip tests. Missing encoders are
 explicit errors when that format is requested, never silently skipped.
 
+Ubuntu's AOM CMake package can reference `aomdec`/`aomenc` even though the
+converter does not execute them; `aom-tools` supplies those build-time targets.
+`libnuma-dev` supplies the linker dependency advertised by Ubuntu's x265 package.
+
 | Target | Result |
 | --- | --- |
 | `make`, `make all` | Tests and release build |
@@ -51,12 +58,24 @@ explicit errors when that format is requested, never silently skipped.
 | `make lint` | Formatting check and Clippy with warnings treated as errors |
 | `make fmt` | Format Rust source |
 | `make static` | Stripped static executable under `target/static/<target>/release/`; macOS retains dynamic Apple system libraries |
-| `make clean` | Remove Cargo build artifacts, not input or output photographs |
+| `make install` | Build both profiles; copy both executables to repository root and the static one to `/data/scripts` |
+| `make clean` | Remove Cargo build artifacts, preserving repository-root executables and photographs |
 
 Both BSD make and GNU make can run these targets. Builds use four jobs by
 default (`JOBS=8` overrides this); tests use four concurrent test threads
 (`TEST_THREADS=2` overrides this). These limits do not constrain the converter's
 automatic CPU detection.
+
+`make install` copies the normal release executable to `./dng-monochrome`, the
+selected static executable to `./dng-monochrome.static`, and that static
+executable to `/data/scripts/dng-monochrome`. `STATIC_TARGET` selects the same
+target for building and installation. Override the installation directory
+with `INSTALL_DIR=/your/path`; it must be writable by the invoking user.
+Both repository-root executables are ignored by Git.
+
+`make release static install clean` performs the complete sequence. `make clean`
+preserves both repository-root executables and the installed copy. Omit `clean`
+to keep incremental build caches.
 
 On FreeBSD, `make static` uses the native target with static CRT linking.
 It also needs `ninja`, `nasm` (on x86), and `curl`. The ports x265 static archive
@@ -76,6 +95,17 @@ rustup target add x86_64-unknown-linux-musl
 make static
 # Override target selection when needed; cross-compilation also needs a linker:
 make static STATIC_TARGET=x86_64-unknown-linux-musl
+```
+
+In a **musl-native** build environment, the same private x265 helper can supply
+the missing static multilib archive (Alpine's `x265-dev` provides only the
+shared library). With CMake, Ninja, `nasm` on x86, `curl`, a C/C++ toolchain and
+static libaom already available:
+
+```sh
+sh scripts/build-static-x265.sh target/static/x265 4
+PKG_CONFIG_PATH="$(pwd)/target/static/x265/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+    make static
 ```
 
 Linux musl executables use mimalloc to avoid contention in musl's allocator

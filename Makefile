@@ -3,6 +3,18 @@ CARGO ?= cargo
 JOBS ?= 4
 TEST_THREADS ?= 4
 STATIC_TARGET ?=
+INSTALL_DIR ?= /data/scripts
+
+RESOLVE_STATIC_TARGET = \
+	target="$(STATIC_TARGET)"; \
+	if [ -z "$$target" ]; then \
+		host="$$(rustc -vV | sed -n 's/^host: //p')"; \
+		case "$$host" in \
+			*-linux-gnu) target="$${host%-gnu}-musl" ;; \
+			*-linux-musl|*-freebsd|*-apple-darwin) target="$$host" ;; \
+			*) echo "Set STATIC_TARGET to a static-capable Rust target" >&2; exit 1 ;; \
+		esac; \
+	fi
 
 all: test build
 
@@ -30,15 +42,7 @@ lint:
 
 static:
 	@set -eu; \
-	target="$(STATIC_TARGET)"; \
-	if [ -z "$$target" ]; then \
-		host="$$(rustc -vV | sed -n 's/^host: //p')"; \
-		case "$$host" in \
-			*-linux-gnu) target="$${host%-gnu}-musl" ;; \
-			*-linux-musl|*-freebsd|*-apple-darwin) target="$$host" ;; \
-			*) echo "Set STATIC_TARGET to a static-capable Rust target" >&2; exit 1 ;; \
-		esac; \
-	fi; \
+	$(RESOLVE_STATIC_TARGET); \
 	case "$$target" in \
 		*-apple-darwin) link_flags="-C prefer-dynamic=no" ;; \
 		*-freebsd) \
@@ -66,7 +70,15 @@ static:
 		{ echo "Build did not produce a static executable: $$binary" >&2; exit 1; }; \
 	printf 'Static executable: %s\n' "$$binary"
 
+install: release static
+	@set -eu; \
+	$(RESOLVE_STATIC_TARGET); \
+	install -m 755 target/release/dng-monochrome dng-monochrome; \
+	install -m 755 "target/static/$$target/release/dng-monochrome" dng-monochrome.static; \
+	mkdir -p "$(INSTALL_DIR)"; \
+	install -m 755 dng-monochrome.static "$(INSTALL_DIR)/dng-monochrome"
+
 clean:
 	$(CARGO) clean
 
-.PHONY: all build release debug test test-real fmt lint static clean
+.PHONY: all build release debug test test-real fmt lint static install clean
