@@ -61,7 +61,7 @@ install_packages() {
                 as_root apt-get update
                 as_root apt-get install -y --no-install-recommends --no-upgrade \
                     build-essential cmake pkg-config ninja-build nasm curl ca-certificates \
-                    file python3 perl libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev
+                    file python3 perl util-linux libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev
             elif command -v apk >/dev/null 2>&1; then
                 as_root apk add build-base cmake pkgconf ninja nasm curl ca-certificates \
                     file python3 perl linux-headers x265-dev aom-dev aom-static \

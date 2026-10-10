@@ -36,7 +36,7 @@ esac
 toolchain="$root/${archive%.tgz}"
 cc="$toolchain/bin/$arch-linux-musl-gcc"
 cxx="$toolchain/bin/$arch-linux-musl-g++"
-ar="$toolchain/bin/$arch-linux-musl-ar"
+ar="$toolchain/bin/$arch-linux-musl-gcc-ar"
 pc="$root/x265/install/lib/pkgconfig:$root/aom/lib/pkgconfig"
 fingerprint="$(cat "$scripts/musl-sdk.sh" "$scripts/build-static-x265.sh" | cksum)"
 
@@ -67,6 +67,10 @@ download() {
 
 case "$action" in
     prepare)
+        command -v flock >/dev/null 2>&1 || fail "Missing SDK preparation tool: flock"
+        mkdir -p "$root"
+        exec 9> "$root/.prepare.lock"
+        flock 9
         if ready; then
             printf 'Musl C/C++ and codec SDK already prepared: %s\n' "$root"
             exit 0
@@ -77,6 +81,9 @@ case "$action" in
             tar -xzf "$root/$archive" -C "$root"
             touch "$toolchain/.unpacked"
         fi
+        for tool in "$cc" "$cxx" "$ar"; do
+            [ -x "$tool" ] || fail "Missing compiler tool in the musl SDK: $tool"
+        done
         download https://storage.googleapis.com/aom-releases/libaom-3.12.1.tar.gz \
             "$root/libaom-3.12.1.tar.gz" \
             27521fe1cffd89a8875552f1758de89c19a47aa1640ee20930ac420a03d964eb9ae10c4b0f55e518c37d4d59f06657aee2bfa84eedad35683648bd658e06da73
@@ -86,6 +93,11 @@ case "$action" in
             tar -xzf "$root/libaom-3.12.1.tar.gz" -C "$source" --strip-components=1
             touch "$source/.unpacked"
         fi
+        # NASM 3's -hf lists formats only; AOM also checks optimization options.
+        optimization="$source/build/cmake/aom_optimization.cmake"
+        sed 's/${CMAKE_ASM_NASM_COMPILER} -hf/${CMAKE_ASM_NASM_COMPILER} -h all/' \
+            "$optimization" > "$optimization.tmp"
+        mv "$optimization.tmp" "$optimization"
         cmake -S "$source" -B "$root/aom-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$root/aom" \
             -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_SYSTEM_NAME=Linux \
@@ -118,6 +130,7 @@ EOF
             "$root/codec-probe"
         fi
         printf '%s\n' "$fingerprint" > "$root/.ready"
+        ready || fail "The musl SDK is incomplete after preparation: $root"
         printf 'Prepared native musl C/C++ and codec SDK: %s\n' "$root"
         ;;
     check)
@@ -127,9 +140,15 @@ EOF
         ready || fail "Missing or outdated musl C/C++ and codec SDK: $root"
         key="$(printf '%s' "$target" | tr '-' '_')"
         upper="$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')"
-        exec env "CC_$key=$cc" "CXX_$key=$cxx" "AR_$key=$ar" \
+        exec env -u "PKG_CONFIG_PATH_$key" -u "PKG_CONFIG_PATH_$target" \
+            -u TARGET_PKG_CONFIG_PATH \
+            "CC_$key=$cc" "CXX_$key=$cxx" "AR_$key=$ar" \
+            "CC_$target=$cc" "CXX_$target=$cxx" "AR_$target=$ar" \
             "CARGO_TARGET_${upper}_LINKER=$cc" \
             PKG_CONFIG_ALLOW_CROSS=1 PKG_CONFIG_PATH="$pc" PKG_CONFIG_LIBDIR="$pc" \
+            "PKG_CONFIG_LIBDIR_$key=$pc" "PKG_CONFIG_LIBDIR_$target=$pc" \
+            PKG_CONFIG_SYSROOT_DIR=/ "PKG_CONFIG_SYSROOT_DIR_$key=/" \
+            "PKG_CONFIG_SYSROOT_DIR_$target=/" \
             CMAKE_PREFIX_PATH="$root/x265/install:$root/aom" \
             DNG_MONO_MUSL_ROOT="$root" DNG_MONO_MUSL_TOOLCHAIN="$toolchain" \
             DNG_MONO_MUSL_PROCESSOR="$arch" "$@"
