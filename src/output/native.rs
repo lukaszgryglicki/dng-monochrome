@@ -249,10 +249,18 @@ fn encode_heif(
                 c"ssim".as_ptr(),
             ))?;
         }
+        // Large single HEVC NAL units exceed libde265's 16 MiB input limit.
+        let (tile_width, tile_height) = if encoding.format == Format::Heic {
+            (metadata.width.min(2048), metadata.height.min(2048))
+        } else {
+            (metadata.width, metadata.height)
+        };
+        let columns = metadata.width.div_ceil(tile_width);
+        let rows = metadata.height.div_ceil(tile_height);
         let mut image = ptr::null_mut();
         heif_result(heif::heif_image_create(
-            width,
-            height,
+            tile_width as i32,
+            tile_height as i32,
             heif::heif_colorspace_heif_colorspace_monochrome,
             heif::heif_chroma_heif_chroma_monochrome,
             &mut image,
@@ -262,8 +270,8 @@ fn encode_heif(
         heif_result(heif::heif_image_add_plane(
             image.as_ptr(),
             channel,
-            width,
-            height,
+            tile_width as i32,
+            tile_height as i32,
             i32::from(encoding.bits),
         ))?;
         let mut stride = 0;
@@ -271,27 +279,13 @@ fn encode_heif(
         let stride = usize::try_from(stride).context("invalid HEIF plane stride")?;
         let sample_bytes = if encoding.bits > 8 { 2 } else { 1 };
         ensure!(
-            !plane.is_null() && stride >= metadata.width * sample_bytes,
+            !plane.is_null() && stride >= tile_width * sample_bytes,
             "invalid HEIF output plane"
         );
         let length = stride
-            .checked_mul(metadata.height)
+            .checked_mul(tile_height)
             .context("HEIF plane size overflow")?;
         let plane = slice::from_raw_parts_mut(plane, length);
-        plane
-            .par_chunks_exact_mut(stride)
-            .zip(pixels.par_chunks_exact(metadata.width))
-            .for_each(|(row, source)| {
-                row.fill(0);
-                for (target, &sample) in row.chunks_exact_mut(sample_bytes).zip(source) {
-                    let sample = quantize(sample, encoding.bits);
-                    if sample_bytes == 1 {
-                        target[0] = sample as u8;
-                    } else {
-                        target.copy_from_slice(&sample.to_ne_bytes());
-                    }
-                }
-            });
         let profile = Owned::new(
             heif::heif_nclx_color_profile_alloc(),
             heif::heif_nclx_color_profile_free,
@@ -321,15 +315,74 @@ fn encode_heif(
         )?;
         (*options.as_ptr()).output_nclx_profile = profile.as_ptr();
         (*options.as_ptr()).macOS_compatibility_workaround_no_nclx_profile = 0;
-        let mut handle = ptr::null_mut();
-        heif_result(heif::heif_context_encode_image(
-            context.as_ptr(),
-            image.as_ptr(),
-            encoder.as_ptr(),
-            options.as_ptr(),
-            &mut handle,
-        ))?;
-        let handle = Owned::new(handle, release_heif_handle, "encoded HEIF image")?;
+        let grid = if columns > 1 || rows > 1 {
+            let mut handle = ptr::null_mut();
+            heif_result(heif::heif_context_add_grid_image(
+                context.as_ptr(),
+                width as u32,
+                height as u32,
+                columns as u32,
+                rows as u32,
+                options.as_ptr(),
+                &mut handle,
+            ))?;
+            Some(Owned::new(handle, release_heif_handle, "HEIF image grid")?)
+        } else {
+            None
+        };
+        let mut single_image = None;
+        for tile_y in 0..rows {
+            for tile_x in 0..columns {
+                plane
+                    .par_chunks_exact_mut(stride)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        row.fill(0);
+                        let source_y = (tile_y * tile_height + y).min(metadata.height - 1);
+                        let source = &pixels[source_y * metadata.width..][..metadata.width];
+                        for (x, target) in row
+                            .chunks_exact_mut(sample_bytes)
+                            .take(tile_width)
+                            .enumerate()
+                        {
+                            let source_x = (tile_x * tile_width + x).min(metadata.width - 1);
+                            let sample = quantize(source[source_x], encoding.bits);
+                            if sample_bytes == 1 {
+                                target[0] = sample as u8;
+                            } else {
+                                target.copy_from_slice(&sample.to_ne_bytes());
+                            }
+                        }
+                    });
+                if let Some(grid) = &grid {
+                    heif_result(heif::heif_context_add_image_tile(
+                        context.as_ptr(),
+                        grid.as_ptr(),
+                        tile_x as u32,
+                        tile_y as u32,
+                        image.as_ptr(),
+                        encoder.as_ptr(),
+                    ))?;
+                } else {
+                    let mut handle = ptr::null_mut();
+                    heif_result(heif::heif_context_encode_image(
+                        context.as_ptr(),
+                        image.as_ptr(),
+                        encoder.as_ptr(),
+                        options.as_ptr(),
+                        &mut handle,
+                    ))?;
+                    single_image = Some(Owned::new(
+                        handle,
+                        release_heif_handle,
+                        "encoded HEIF image",
+                    )?);
+                }
+            }
+        }
+        let handle = grid
+            .or(single_image)
+            .context("missing encoded HEIF image")?;
         heif_result(heif::heif_context_add_exif_metadata(
             context.as_ptr(),
             handle.as_ptr(),

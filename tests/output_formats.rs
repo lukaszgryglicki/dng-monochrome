@@ -222,6 +222,41 @@ fn quantized(pixels: &[u16], bits: u8) -> Vec<u16> {
         .collect()
 }
 
+fn heif_tiling(path: &Path) -> libheif_sys::heif_image_tiling {
+    use libheif_sys as heif;
+    let bytes = fs::read(path).unwrap();
+    let _library = LibHeif::new_checked().unwrap();
+    unsafe {
+        let context = heif::heif_context_alloc();
+        assert!(!context.is_null());
+        assert_eq!(
+            heif::heif_context_read_from_memory_without_copy(
+                context,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                std::ptr::null(),
+            )
+            .code,
+            heif::heif_error_code_heif_error_Ok
+        );
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(
+            heif::heif_context_get_primary_image_handle(context, &mut handle).code,
+            heif::heif_error_code_heif_error_Ok
+        );
+        let mut tiling = std::mem::MaybeUninit::<heif::heif_image_tiling>::zeroed();
+        (*tiling.as_mut_ptr()).version = 1;
+        assert_eq!(
+            heif::heif_image_handle_get_image_tiling(handle, 0, tiling.as_mut_ptr()).code,
+            heif::heif_error_code_heif_error_Ok
+        );
+        let tiling = tiling.assume_init();
+        heif::heif_image_handle_release(handle);
+        heif::heif_context_free(context);
+        tiling
+    }
+}
+
 #[test]
 fn flags_are_independent_support_both_dash_styles_and_last_switch_wins() {
     assert_eq!(parse(&[]).unwrap().formats.enabled(), [Format::Png]);
@@ -383,30 +418,93 @@ fn odd_and_tiny_geometry_and_srgb_transfer_round_trip() {
 }
 
 #[test]
+fn heic_grids_preserve_precision_metadata_and_partial_edge_tiles() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (width, height, bits) in [
+        (2049, 17, 8),
+        (17, 2049, 10),
+        (4097, 1, 12),
+        (1, 4097, 12),
+        (2051, 2053, 12),
+    ] {
+        let (image, rendered) = fixture(tmp.path(), width, height);
+        let encoding = Encoding::new(
+            Format::Heic,
+            Some(f64::from(bits)),
+            Compression::Lossless,
+            90,
+        )
+        .unwrap();
+        let path = save(
+            &tmp.path().join(format!("grid-{width}x{height}-{bits}")),
+            &image,
+            &rendered,
+            &encoding,
+            Transfer::Srgb,
+        );
+        let tiling = heif_tiling(&path);
+        assert_eq!(
+            (tiling.image_width, tiling.image_height),
+            (width as u32, height as u32)
+        );
+        assert_eq!(
+            (tiling.tile_width, tiling.tile_height),
+            (width.min(2048) as u32, height.min(2048) as u32)
+        );
+        assert_eq!(
+            (tiling.num_columns, tiling.num_rows),
+            (width.div_ceil(2048) as u32, height.div_ceil(2048) as u32)
+        );
+        let decoded = decode(&path, Format::Heic);
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.bits),
+            (width as u32, height as u32, bits)
+        );
+        assert_eq!(decoded.pixels, quantized(&rendered.png, bits));
+        assert_eq!(decoded.transfer, Some(13));
+        assert!(
+            decoded
+                .exif
+                .windows(b"Recorded manual M lens".len())
+                .any(|v| v == b"Recorded manual M lens")
+        );
+    }
+}
+
+#[test]
 fn lossy_quality_changes_compression_and_reconstruction_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let (image, mut rendered) = fixture(tmp.path(), 64, 64);
-    let mut state = 0x51f15eadu32;
-    for value in &mut rendered.png {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        *value = state as u16;
-    }
-    for format in [Format::Heic, Format::Avif, Format::J2k] {
+    for (format, width, height) in [
+        (Format::Heic, 64, 64),
+        (Format::Avif, 64, 64),
+        (Format::J2k, 64, 64),
+        (Format::Heic, 2049, 17),
+    ] {
+        let (image, mut rendered) = fixture(tmp.path(), width, height);
+        let mut state = 0x51f15eadu32;
+        for value in &mut rendered.png {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *value = state as u16;
+        }
         let mut errors = Vec::new();
         let mut sizes = Vec::new();
         for quality in [20, 95] {
             let encoding = Encoding::new(format, Some(11.5), Compression::Lossy, quality).unwrap();
             let path = save(
-                &tmp.path().join(format!("{format}-q{quality}")),
+                &tmp.path()
+                    .join(format!("{format}-{width}x{height}-q{quality}")),
                 &image,
                 &rendered,
                 &encoding,
                 Transfer::Linear,
             );
             let decoded = decode(&path, format);
-            assert_eq!((decoded.width, decoded.height, decoded.bits), (64, 64, 12));
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.bits),
+                (width as u32, height as u32, 12)
+            );
             let error: u64 = decoded
                 .pixels
                 .iter()

@@ -36,7 +36,7 @@ make                         # tests, then stripped release build
 
 The default `bundled-heif` feature compiles packaged libheif source; OpenJPEG is
 also built from its packaged source. Neither replaces a system library.
-To use a system libheif >=1.17 instead, build with `--no-default-features`;
+To use a system libheif >=1.19 instead, build with `--no-default-features`;
 it must supply x265 and AOM encoders supporting 8/10/12-bit monochrome images.
 Normal builds retain HEIF decoders for round-trip tests. Missing encoders are
 explicit errors when that format is requested, never silently skipped.
@@ -237,6 +237,12 @@ the DNG container depth.
 | HEIC / x265 | 8, 10, 12 bits | `placebo`, complexity 100 |
 | AVIF / libaom | 8, 10, 12 bits | speed 0 |
 | JPEG2000 / OpenJPEG | Every integer depth from 1 through 16 bits | Maximum useful wavelet decomposition; reversible transform/rate 0 for lossless |
+
+HEIC images larger than 2048 pixels on either axis use a standard image grid
+with tiles no larger than 2048x2048. This keeps high-resolution, noisy images
+within HEVC decoders' compressed-unit limits without disabling decoder safety
+limits. The image keeps its full dimensions, precision and metadata; each tile
+uses the same maximum compression effort.
 
 If DR exceeds a codec's limit, use its maximum depth and warn. If the estimate
 is unavailable, also use maximum depth with a warning. Ordinary interoperable
