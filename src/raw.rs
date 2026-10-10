@@ -176,10 +176,6 @@ fn from_raw(raw: rawler::RawImage, no_crop: bool) -> Result<MonoImage> {
     );
     let (transpose, flip_x, flip_y) = raw.orientation.to_flips();
     let (width, height) = if transpose { (ch, cw) } else { (cw, ch) };
-    ensure!(
-        width <= usize::from(u16::MAX) && height <= usize::from(u16::MAX),
-        "image dimensions exceed the JPEG limit of 65535 per axis"
-    );
     let mut pixels = vec![0; width * height];
     pixels
         .par_chunks_mut(width)

@@ -1,8 +1,8 @@
 # dng-monochrome
 
-Develop monochrome Leica DNG photographs into **16-bit grayscale PNG** and
-**8-bit grayscale JPEG**, without demosaicing or reducing the raw image to
-an embedded preview.
+Develop monochrome Leica DNG photographs into **16-bit grayscale PNG**, with
+optional **JPEG, HEIC, AVIF and JPEG2000**, without demosaicing or reducing the
+raw image to an embedded preview.
 
 PNG is always lossless, grayscale, 16 bits per pixel, and encoded at the
 encoder's **maximum compression setting: DEFLATE level 9 with adaptive row
@@ -10,21 +10,36 @@ filtering**. It is never reduced to 8-bit, RGB, or an indexed palette.
 JPEG uses the same developed image, quantized according to its selected
 transfer: linear by default, or sRGB when requested.
 
-**Defaults:** photographic optimization **on**, clipping strength **3**,
-linear PNG (`gAMA=1`), and linear grayscale JPEG quality **90**.
-Standard photographic EXIF is copied to both
-formats, including ISO, exposure time and the recorded aperture/lens metadata.
+**Defaults:** save **PNG only**, photographic optimization **on**, clipping
+strength **3**, linear PNG (`gAMA=1`). `-jpg` restores the original companion:
+linear grayscale JPEG quality **90**, with unchanged PNG/JPEG pixels and metadata.
+Standard photographic EXIF is copied to every selected format, including ISO,
+exposure time and the recorded aperture/lens metadata.
 
 ## Build
 
-Rust 1.89 or newer and a native linker are required. The decoder, math parser,
-processing, PNG encoder, and JPEG encoder are Rust code. No LibRaw, dcraw,
-ImageMagick, or external image-conversion process is required.
+Rust 1.89 or newer, C/C++ compilers, CMake, `pkg-config`, and x265, libaom and
+libde265 development files are required. The DNG decoder, math parser,
+processing, PNG encoder, and JPEG encoder are Rust code. HEIC/AVIF use libheif
+with x265/libaom; JPEG2000 uses OpenJPEG. All encoding is in-process: no LibRaw,
+dcraw, ImageMagick, or external image-conversion process is required.
 
 ```sh
+# FreeBSD
+sudo pkg install cmake pkgconf x265 aom libde265
+# Debian/Ubuntu
+sudo apt install build-essential cmake pkg-config libx265-dev libaom-dev libde265-dev
+
 make                         # tests, then stripped release build
 ./target/release/dng-monochrome -help
 ```
+
+The default `bundled-heif` feature compiles packaged libheif source; OpenJPEG is
+also built from its packaged source. Neither replaces a system library.
+To use a system libheif >=1.17 instead, build with `--no-default-features`;
+it must supply x265 and AOM encoders supporting 8/10/12-bit monochrome images.
+Normal builds retain HEIF decoders for round-trip tests. Missing encoders are
+explicit errors when that format is requested, never silently skipped.
 
 | Target | Result |
 | --- | --- |
@@ -44,9 +59,17 @@ default (`JOBS=8` overrides this); tests use four concurrent test threads
 automatic CPU detection.
 
 On FreeBSD, `make static` uses the native target with static CRT linking.
-On GNU/Linux it selects the corresponding musl target, which must already be
-installed along with a musl C compiler (`musl-gcc`, provided by `musl-tools` on
-Debian/Ubuntu), for example:
+It also needs `ninja`, `nasm` (on x86), and `curl`. The ports x265 static archive
+omits its high-bit-depth implementations, so this target downloads a
+SHA256-verified x265 4.1 release and builds a private 8/10/12-bit static SDK under
+`target/static/x265`. Downloads/builds are cached, use `JOBS`, and never overwrite
+installed x265 libraries. AOM and any detected optional native dependencies
+(for example VMAF or sharpyuv) must provide static archives.
+
+On GNU/Linux the target selects musl, which must already be installed along with
+a musl C/C++ toolchain and **musl-built static x265/libaom dependencies**. Point
+pkg-config and the native compiler at that SDK; glibc development archives are
+not a musl SDK. For example, after preparing those native dependencies:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -62,9 +85,11 @@ increased peak memory in real-photo comparisons. The musl speed/scaling benefit
 also trades for higher peak memory.
 
 On macOS (Apple Silicon or Intel), both `make release` and `make static` require
-the Xcode Command Line Tools. Apple does not support fully static system
-executables: `make static` embeds Rust dependencies but keeps Apple system
-libraries dynamically linked, rejecting non-system dynamic dependencies.
+the Xcode Command Line Tools and native codec development files. The static
+target additionally requires complete static x265/libaom dependencies. Apple
+does not support fully static system executables: `make static` embeds the
+application dependencies but keeps Apple system libraries dynamically linked,
+rejecting non-system dynamic dependencies.
 
 On FreeBSD/Linux, the static target checks that the executable really is
 statically linked. It never installs toolchains or changes a shared compiler
@@ -73,11 +98,18 @@ automatically.
 ## Usage
 
 ```sh
-# One PNG/JPEG pair per file; the shell expands *.DNG.
+# One PNG per file; the shell expands *.DNG.
 dng-monochrome *.DNG
 
-# Put xyz.png and xyz.jpg beside xyz.DNG in the working directory.
-dng-monochrome -o . *.DNG
+# Restore the original PNG/JPEG pair beside each DNG.
+dng-monochrome -jpg -o . *.DNG
+
+# Save only the three new formats, losslessly at their selected precision.
+dng-monochrome -no-png -heic -avif -j2k shot.DNG
+
+# Lossy HEIC/AVIF, but lossless JPEG2000; quality does not change effort.
+dng-monochrome -no-png -heic -avif -j2k -lossy -j2k-mode lossless \
+  -heic-quality 95 -avif-quality 90 shot.DNG
 
 # Recursively process a directory, preserving its relative subdirectories.
 dng-monochrome /path/to/photos -o /path/to/dng-mono
@@ -112,12 +144,12 @@ dng-monochrome --no-optimize --dark 0 --light 0 -o linear shot.DNG
 # Display-encoded PNG for viewers that ignore linear PNG gamma.
 dng-monochrome --transfer srgb -o display shot.DNG
 
-# Explicitly select the defaults: linear-quantized JPEG and linear PNG.
-dng-monochrome --transfer linear -o both-linear shot.DNG
+# Linear-quantized JPEG and linear PNG.
+dng-monochrome -jpg --transfer linear -o both-linear shot.DNG
 
 # Use sRGB JPEG for sharing; explicit per-format values override --transfer.
-dng-monochrome --png-transfer linear --jpeg-transfer srgb shot.DNG
-dng-monochrome --jpg-transfer linear -o linear-jpeg shot.DNG
+dng-monochrome -jpg --png-transfer linear --jpeg-transfer srgb shot.DNG
+dng-monochrome -jpg --jpg-transfer linear -o linear-jpeg shot.DNG
 
 # Detailed diagnostics, or silent conversion (errors remain visible).
 dng-monochrome -debug shot.DNG
@@ -128,7 +160,8 @@ dng-monochrome --analyze /path/to/photos > analysis.jsonl
 ```
 
 The default output directory is `./dng-mono`. An input named `xyz.DNG` or
-`xyz.dng` produces `xyz.png` and `xyz.jpg`; `--report` adds `xyz.json`.
+`xyz.dng` produces `xyz.png`; selected companions use `.jpg`, `.heic`, `.avif`
+and `.jp2`. `--report` adds `xyz.json`.
 With `--both`, the relative names are placed under `auto/` and `best/`.
 Multiple directory arguments get a directory-name prefix to keep their trees
 separate. Repeated identical inputs are deduplicated. Conflicting output names
@@ -148,6 +181,14 @@ The documented `--long` options also accept `-long`, including `-help`,
 | --- | --- |
 | `DNG_OR_DIRECTORY ...` | One or more monochrome DNG files or recursively searched directories |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
+| `--png`, `--no-png` | Enable/disable 16-bit PNG; **enabled by default** |
+| `--jpg`, `--no-jpg` | Enable/disable original 8-bit JPEG; default off; aliases `--jpeg`, `--no-jpeg` |
+| `--heic`, `--no-heic` | Enable/disable HEIC; default off |
+| `--avif`, `--no-avif` | Enable/disable AVIF; default off |
+| `--j2k`, `--no-j2k` | Enable/disable JPEG2000 in a `.jp2` container; default off |
+| `--lossless`, `--lossy` | Compression for HEIC/AVIF/JPEG2000; default **lossless**; no effect on PNG/JPEG |
+| `--heic-mode`, `--avif-mode`, `--j2k-mode` | `lossless` or `lossy`; per-format override of the shared mode |
+| `--heic-quality`, `--avif-quality`, `--j2k-quality` | Lossy quality `1..100`, each default **90**; ignored in lossless mode |
 | `--dark PERCENT` | Override darkest-pixel clipping; automatic if omitted |
 | `--light PERCENT` | Override lightest-pixel clipping; automatic if omitted |
 | `--clip-strength 1..9` | Automatic clipping strength; default **3**. Level 1 is conservative; level 9 aims around 1-2% per end |
@@ -159,14 +200,14 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--optimize, --best` | Explicitly enable photographic optimization, which is already **on by default** |
 | `--no-optimize` | Skip photographic optimization; retain range selection and any custom function |
 | `--both` | Generate unoptimized `auto/` and optimized `best/` versions; conflicts with explicit optimization toggles |
-| `--transfer srgb\|linear` | Set **both** formats; unspecified means the separate defaults below |
-| `--png-transfer srgb\|linear` | PNG encoding, default **`linear`**; overrides `--transfer` |
+| `--transfer srgb\|linear` | Set PNG/master and JPEG transfers; unspecified means the separate defaults below |
+| `--png-transfer srgb\|linear` | PNG/master and HEIC/AVIF/JPEG2000 transfer, default **`linear`**; overrides `--transfer` even with `--no-png` |
 | `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`linear`**; alias `--jpg-transfer`; overrides `--transfer` |
-| `--jpeg-quality 1..100` | JPEG quality; default `90` for sharing; PNG is the lossless master |
+| `--jpeg-quality 1..100` | JPEG quality; default `90`; alias `--jpg-quality` |
 | `--threads 0..256` | Total processing-worker budget shared across files; `0` detects available hardware parallelism |
 | `-j, --jobs 1..256` | Maximum files processed concurrently; default **4**; `1` keeps files sequential while using all workers within each |
 | `--no-crop` | Retain the full raw raster instead of the recommended DNG crop |
-| `--report` | Write per-pair JSON with settings, thresholds, clipping and precision statistics |
+| `--report` | Write per-image JSON with settings, thresholds, clipping, precision and native codec plans |
 | `--analyze` | Analyze only, creating no output files; cannot combine with tone/functions, `--both`, reports or overwrite |
 | `--overwrite` | Explicitly permit replacement of existing output files |
 | `-v, --verbose, --debug` | Detailed per-image metadata, noise-model evidence and range diagnostics |
@@ -185,12 +226,45 @@ override their own end, irrespective of clipping strength.
 No lower PNG compression or bit-depth option exists. Maximum compression can
 cost noticeably more CPU time on large, noisy images.
 
+### HEIC, AVIF and JPEG2000 precision
+
+Each enabled new format uses the **lowest supported sample bit depth covering
+the existing noise-measured SNR-1 DR estimate**. This is not a bitrate target or
+the DNG container depth.
+
+| Format | Supported output depths | Maximum compression effort |
+| --- | --- | --- |
+| HEIC / x265 | 8, 10, 12 bits | `placebo`, complexity 100 |
+| AVIF / libaom | 8, 10, 12 bits | speed 0 |
+| JPEG2000 / OpenJPEG | Every integer depth from 1 through 16 bits | Maximum useful wavelet decomposition; reversible transform/rate 0 for lossless |
+
+If DR exceeds a codec's limit, use its maximum depth and warn. If the estimate
+is unavailable, also use maximum depth with a warning. Ordinary interoperable
+x265/AOM output does not provide 14/16-bit HEIC/AVIF; JPEG2000 can retain those
+depths. PNG remains 16-bit and JPEG remains 8-bit regardless of the estimate.
+
+All new images derive from the unchanged developed 16-bit PNG master, including
+when no PNG is saved: `round(master * (2^bits - 1) / 65535)`.
+**Lossless means an exact codec round-trip of these selected-depth samples**,
+not preservation of discarded 16-bit quantization steps or lossless DNG
+development. Lower lossy quality targets smaller files; quality is not a speed
+setting, and maximum effort can be very slow on large photographs.
+JPEG2000 lossy quality maps to the OpenJPEG compression ratio
+`1 + floor((100 - quality) / 2)`. Its lossy mode remains irreversible at quality
+100; use lossless mode for exact values.
+
+Enable/disable pairs use the last supplied switch. Per-format modes override
+the shared mode regardless of order. At least one output must be enabled
+unless `--analyze` is used. Disabled outputs are neither checked nor overwritten.
+`additional_formats` in reports records depth, mode, lossy quality, measured DR
+and whether the codec limit capped it. The companion `dng-png-viewer` supports
+these high-bit-depth monochrome formats without rescaling their stored codes.
+
 ### Advanced `--param-*` tuning
 
 All tunable constants in this application's processing, estimation, expression
 limits, progress formatting and JPEG Huffman encoding are exposed below.
-**With no overrides, the algorithms and PNG pixels are unchanged; the only
-changed rendering default is JPEG transfer from sRGB to linear.**
+**With no overrides, the algorithms and developed PNG/JPEG pixels are unchanged.**
 Existing controls such as `--clip-strength`, `--jpeg-quality`, `--threads`,
 manual percentages and transfers retain their existing names.
 
@@ -400,15 +474,16 @@ EXIF rationals or JSON numeric precision.
 5. Apply the monotonic photographic optimization curve unless `--no-optimize`
    is set (or this is the `auto/` half of `--both`).
 6. If requested, evaluate `--func` and apply its clip/scale/wrap policy.
-7. Encode the result using the selected PNG transfer and round to `0..65535`.
-   Produce JPEG samples from that final PNG representation using the selected
-   JPEG transfer.
+7. Encode the master using the selected PNG transfer and round to `0..65535`.
+   Save only the selected formats. JPEG samples use the selected JPEG transfer;
+   HEIC/AVIF/JPEG2000 quantize this master to their DR-selected precision.
 
 All calculations after decoding use `f64`. Each expression is evaluated once
 per occupied raw code, not once per pixel, and cached in a lookup table.
 Histogram construction, noise sampling, pixel mapping and supported raw
-decompression use Rayon. PNG and JPEG encoding can run concurrently within
-each file's worker budget.
+decompression use Rayon. Selected PNG and JPEG encoding can run concurrently
+within each file's worker budget. The new codecs run sequentially within that
+same budget, not in additional all-CPU pools.
 
 `--threads` is the **total** worker budget, not a per-file multiplier.
 Up to `min(--jobs, threads, input count)` files run at once, with that budget
@@ -649,7 +724,7 @@ policy for unchanged exterior values: `--func-scale` deliberately rescales the
 whole result and may change those values.
 
 These are **tone adjustments, not a new file encoding**. The examples use the
-default linear PNG/JPEG output. Adding an sRGB output transfer encodes the
+default linear master (and linear JPEG when requested). Adding an sRGB output transfer encodes the
 already-adjusted values again, so it is not the same halfway-look recipe.
 PNG/EXIF encoding tags remain accurate. Use `--no-optimize` if the curve should
 act on only range-normalized input; otherwise it adjusts the default optimized
@@ -660,11 +735,12 @@ rendering. Different viewers' color management can still change appearance.
 Default PNG pixels store **linear intensities with `gAMA=1.0`**, preserving the
 selected numerical data without an extra display-transfer quantization.
 `--png-transfer srgb` instead uses the standard sRGB transfer and an `sRGB`
-chunk. The shared `--transfer` option changes both formats; `--png-transfer`
-and `--jpeg-transfer` override it regardless of argument order.
+chunk. The shared `--transfer` option changes all formats; `--png-transfer`
+(including the new codecs) and `--jpeg-transfer` override it regardless of
+argument order.
 A color-managed viewer can display either correctly; a viewer that ignores
 linear PNG gamma may show the default version too dark. Select
-`--jpeg-transfer srgb` for conventional display-encoded JPEG sharing.
+`-jpg --jpeg-transfer srgb` for conventional display-encoded JPEG sharing.
 
 JPEG is native single-channel grayscale and defaults to linear. When both
 transfers match, its samples are `round(PNG16 / 257)`. For linear PNG / sRGB
@@ -726,6 +802,8 @@ and [image-sensor noise measurement limitations](https://www.imatest.com/imaging
 ### Photographic EXIF
 
 PNG carries standard `eXIf` metadata; JPEG carries an EXIF APP1 segment.
+HEIC/AVIF carry EXIF plus full-range NCLX transfer metadata; JPEG2000 carries
+EXIF in a JP2 UUID box.
 The converter copies recognized standard photographic fields: extended ISO,
 exposure time, FNumber when present, ApertureValue, focal length, lens
 information, capture times, exposure compensation, photographer/copyright and
@@ -741,7 +819,7 @@ This does not correct an inaccurate lens-menu selection.
 
 Raw-only calibration, thumbnails, XMP and proprietary MakerNotes are not
 copied blindly: their offsets and raw-development settings may be invalid in
-a PNG/JPEG. Some Leica files expose a proprietary MakerNote `FNumber=1`
+a developed image. Some Leica files expose a proprietary MakerNote `FNumber=1`
 placeholder despite having no standard FNumber; the actual standard
 ApertureValue is preserved, and the tool does not invent or "correct" an
 FNumber from that placeholder. Some viewers display only the legacy 16-bit
@@ -749,15 +827,16 @@ ISO field (65535); the true ISO160000 is retained in the extended tags.
 
 GPS/owner metadata can reveal location/identity when sharing. It is retained
 as requested, not anonymized. Viewers vary in PNG EXIF support; tools such as
-ExifTool can inspect it. Oversized photographic EXIF that cannot fit JPEG's
-APP1 limit causes an explicit error before either companion is published.
+ExifTool can inspect it. When JPEG is selected, photographic EXIF that cannot
+fit its APP1 limit causes an explicit error before any companion is published.
+That JPEG-only limit does not restrict PNG or the new formats.
 
 ## Output safety and failures
 
 Existing outputs are never overwritten without `--overwrite`. Symlink outputs
 and non-regular destinations are rejected. All companions are encoded into
 temporary files before publication, and each file is atomically published.
-The complete PNG/JPEG/JSON set is not a filesystem transaction: if publication
+The complete selected-image/JSON set is not a filesystem transaction: if publication
 of a later companion fails, earlier published files remain and the command
 reports the failure. Failed staging cleans up temporary files.
 
@@ -786,6 +865,9 @@ their real bit depth, grayscale shape, transfer metadata, pixel values, JPEG
 approximation and maximum-compression zlib header. Independent TIFF-byte
 checks cover embedded EXIF, exact ISO160000/exposure/aperture/lens/date values,
 source endianness, oriented/cropped geometry and metadata overflow failures.
+Native codec tests cover every selected depth, all 65,536 master values,
+lossless round trips, tiny/odd images, lossy quality response, transfer/EXIF
+metadata, independent output switches and disabled-output preservation.
 
 Numerical coverage includes all 65,536 raw codes, known Gaussian and
 signal-dependent noise, correlation, texture, censoring/below-black samples,
@@ -806,7 +888,8 @@ both CLI spellings, nondefault values, invalid values/combinations, report and
 processing paths, unchanged default pixel fingerprints, variable noise geometry
 and bias correction, optimizer amount/exposure/contrast, parser limits and
 Huffman-only encoding changes. README defaults are checked against the actual
-CLI declarations. To fully decode and check a generated collection:
+CLI declarations. To fully decode and check a PNG/JPEG collection generated
+with `-jpg --report`:
 
 ```sh
 DNG_MONO_OUTPUTS=/path/to/dng-mono \
@@ -822,7 +905,10 @@ the ignored `tests/fixtures/local/` directory.
 
 This application's source is licensed under [Apache-2.0](LICENSE).
 Dependencies retain their respective licenses. In particular,
-[`rawler`](https://github.com/dnglab/dnglab) is LGPL-2.1; distributing linked
-binaries, especially static binaries, requires observing its corresponding
-source, notices and relinking obligations. The application's Apache license
-does not relicense that dependency. `Cargo.lock` pins the dependency versions.
+[`rawler`](https://github.com/dnglab/dnglab) is LGPL-2.1, libheif is LGPL-3.0,
+and x265 is GPL-2.0-or-later (or separately commercially licensed).
+Distributing linked binaries, especially static binaries, requires observing
+the applicable dependency licensing, source, notice and relinking obligations;
+the application's Apache license does not relicense those libraries.
+`Cargo.lock` pins Rust dependencies; the FreeBSD static recipe pins its x265
+source archive and retains its license.

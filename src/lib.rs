@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod expression;
+pub mod formats;
 pub mod noise;
 pub mod output;
 pub mod parameters;

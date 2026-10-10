@@ -41,9 +41,16 @@ static:
 	fi; \
 	case "$$target" in \
 		*-apple-darwin) link_flags="-C prefer-dynamic=no" ;; \
+		*-freebsd) \
+			link_flags="-C target-feature=+crt-static -C link-arg=-Wl,-Bstatic -C link-arg=-lcxxrt"; \
+			sh scripts/build-static-x265.sh target/static/x265 $(JOBS); \
+			PKG_CONFIG_PATH="$$(pwd)/target/static/x265/install/lib/pkgconfig$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}"; \
+			export PKG_CONFIG_PATH ;; \
 		*) link_flags="-C target-feature=+crt-static" ;; \
 	esac; \
-	CARGO_TARGET_DIR=target/static RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$link_flags" \
+	DNG_MONO_STATIC=1 SYSTEM_DEPS_LIBHEIF_LINK=static PKG_CONFIG_ALL_STATIC=1 \
+		CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) CARGO_TARGET_DIR=target/static \
+		RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$link_flags" \
 		$(CARGO) build --locked --release --target "$$target" -j $(JOBS); \
 	binary="target/static/$$target/release/dng-monochrome"; \
 	if [ "$${target%-apple-darwin}" != "$$target" ]; then \

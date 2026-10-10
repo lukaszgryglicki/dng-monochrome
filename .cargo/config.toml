@@ -1,0 +1,2 @@
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = ".cargo/heif.cmake", relative = true }

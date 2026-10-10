@@ -1,5 +1,6 @@
 use crate::{
     expression::{Expression, FunctionPolicy, ToneBand},
+    formats::{Encoding, Format, OutputOptions},
     output::{self, OutputPaths},
     parameters::Parameters,
     range::{self, Histogram, RangeOptions},
@@ -25,13 +26,17 @@ use walkdir::WalkDir;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Develop monochrome DNGs into full-precision 16-bit grayscale PNGs and grayscale JPEGs.",
+    about = "Develop monochrome DNGs into 16-bit PNG, with optional JPEG, HEIC, AVIF and JPEG2000.",
     long_about = "Develop integer monochrome DNGs without demosaicing. Directories are searched recursively. \
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
         true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
-        maximum lossless compression; JPEGs are 8-bit grayscale. \
-        Both carry photographic EXIF. Optimization is on by default, clipping strength is 3, \
-        PNG and JPEG transfers are both linear. Tunable constants are exposed as --param-* options.",
+        maximum lossless compression; only PNG is saved by default. --jpg restores the original \
+        8-bit JPEG companion. HEIC/AVIF use 8/10/12 bits; JPEG2000 uses 1-16 bits, automatically \
+        selected from the existing noise-measured DR, capped at the codec maximum. \
+        New formats default to lossless compression of the selected-depth samples and share the \
+        developed PNG transfer. All formats carry photographic EXIF. Optimization is on by default, \
+        clipping strength is 3, PNG and JPEG transfers are both linear. \
+        Tunable constants are exposed as --param-* options.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
         Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function/tone-band -> policy -> transfers.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
@@ -41,7 +46,9 @@ use walkdir::WalkDir;
         dng-monochrome shot.DNG -dark 0.8 -light 1.2% -func 'sin(pi*x)^2' -func-scale\n  \
         dng-monochrome shot.DNG --no-optimize --dark 0 --light 0\n  \
         dng-monochrome shot.DNG -tone-band 0:0.35:0.4\n  \
-        dng-monochrome shot.DNG --png-transfer linear --jpeg-transfer srgb\n\
+        dng-monochrome shot.DNG -jpg --png-transfer linear --jpeg-transfer srgb\n  \
+        dng-monochrome shot.DNG -no-png -heic -avif -j2k\n  \
+        dng-monochrome shot.DNG -heic -heic-mode lossy -heic-quality 95\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
         asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp,\n\
@@ -138,14 +145,14 @@ pub struct Cli {
     #[arg(
         long,
         value_enum,
-        help = "Set BOTH PNG and JPEG transfer; format-specific options take precedence"
+        help = "Set the PNG/master and JPEG transfers; format-specific options take precedence"
     )]
     pub transfer: Option<Transfer>,
 
     #[arg(
         long,
         value_enum,
-        help = "PNG transfer; default linear, overrides --transfer"
+        help = "PNG/master transfer, also used by HEIC/AVIF/JPEG2000; default linear, overrides --transfer"
     )]
     pub png_transfer: Option<Transfer>,
 
@@ -157,7 +164,7 @@ pub struct Cli {
     )]
     pub jpeg_transfer: Option<Transfer>,
 
-    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
+    #[arg(long, visible_alias = "jpg-quality", default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
         help = "Grayscale JPEG quality, 1-100")]
     pub jpeg_quality: u8,
 
@@ -177,7 +184,7 @@ pub struct Cli {
 
     #[arg(
         long,
-        help = "Write a JSON sidecar per PNG/JPEG pair with ranges, noise estimates and settings"
+        help = "Write a JSON sidecar per developed image with ranges, noise estimates and codec settings"
     )]
     pub report: bool,
 
@@ -208,6 +215,9 @@ pub struct Cli {
     pub silent: bool,
 
     #[command(flatten)]
+    pub formats: OutputOptions,
+
+    #[command(flatten)]
     pub parameters: Parameters,
 }
 
@@ -218,6 +228,9 @@ impl Cli {
             Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
         })?;
         cli.expression_source().map_err(|error| {
+            Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
+        cli.formats.validate(cli.analyze).map_err(|error| {
             Self::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
         })?;
         Ok(cli)
@@ -290,6 +303,13 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jpeg-transfer",
         "jpg-transfer",
         "jpeg-quality",
+        "jpg-quality",
+        "heic-mode",
+        "avif-mode",
+        "j2k-mode",
+        "heic-quality",
+        "avif-quality",
+        "j2k-quality",
         "threads",
         "jobs",
     ];
@@ -310,6 +330,20 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "verbose",
         "debug",
         "silent",
+        "png",
+        "no-png",
+        "jpg",
+        "jpeg",
+        "no-jpg",
+        "no-jpeg",
+        "heic",
+        "no-heic",
+        "avif",
+        "no-avif",
+        "j2k",
+        "no-j2k",
+        "lossless",
+        "lossy",
     ];
     let mut positional = false;
     let mut value_next = false;
@@ -465,6 +499,7 @@ struct FileOutcome {
 
 pub fn run(cli: Cli) -> Result<()> {
     cli.parameters.validate()?;
+    cli.formats.validate(cli.analyze)?;
     let range_options = RangeOptions {
         dark: cli.dark,
         light: cli.light,
@@ -521,9 +556,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
                 let range =
                     range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
-                Ok((image, hist, range))
+                let encodings = if cli.analyze {
+                    Vec::new()
+                } else {
+                    cli.formats.encodings(range.dynamic_range.snr1_stops)?
+                };
+                Ok((image, hist, range, encodings))
             })();
-            let (image, hist, range) = match decoded {
+            let (image, hist, range, encodings) = match decoded {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("ERROR {}: {error:#}", input.path.display());
@@ -533,6 +573,9 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             if !cli.silent {
                 for warning in &range.warnings {
+                    eprintln!("WARNING {}: {warning}", input.path.display());
+                }
+                for warning in encodings.iter().filter_map(Encoding::warning) {
                     eprintln!("WARNING {}: {warning}", input.path.display());
                 }
             }
@@ -595,8 +638,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         jobs,
                         file_threads,
                         parameters: &cli.parameters,
+                        additional_formats: encodings.clone(),
                     };
-                    output::save_with_parameters(
+                    let warnings = output::save_with_encodings(
                         &paths,
                         &image,
                         &rendered,
@@ -605,8 +649,12 @@ pub fn run(cli: Cli) -> Result<()> {
                         cli.jpeg_quality,
                         cli.overwrite,
                         &cli.parameters,
+                        &encodings,
                     )?;
                     if !cli.silent {
+                        for warning in warnings {
+                            eprintln!("WARNING {}: {warning}", input.path.display());
+                        }
                         let dr = range.dynamic_range.snr1_stops.map_or_else(
                             || "unavailable (insufficient noise evidence)".to_owned(),
                             |value| {
@@ -617,8 +665,13 @@ pub fn run(cli: Cli) -> Result<()> {
                                 )
                             },
                         );
+                        let code_label = if cli.formats.enabled().contains(&Format::Png) {
+                            "codes"
+                        } else {
+                            "master codes"
+                        };
                         let mut progress = format!(
-                            "[{}/{}] {} [{mode}, strength {}, {file_threads} threads] {}; {:.range_digits$}..{:.range_digits$}, clip {:.clip_digits$}%/{:.clip_digits$}%, approx DR {dr}, raw-code span {:.dr_digits$} bits, {} codes -> {} (elapsed {:.elapsed_digits$}s)",
+                            "[{}/{}] {} [{mode}, strength {}, {file_threads} threads] {}; {:.range_digits$}..{:.range_digits$}, clip {:.clip_digits$}%/{:.clip_digits$}%, approx DR {dr}, raw-code span {:.dr_digits$} bits, {} {code_label} -> {} (elapsed {:.elapsed_digits$}s)",
                             index + 1,
                             inputs.len(),
                             input.relative.display(),
@@ -630,13 +683,29 @@ pub fn run(cli: Cli) -> Result<()> {
                             range.clipped_light_percent,
                             range.retained_span_bits,
                             rendered.stats.png_occupied_codes,
-                            paths.png.display(),
+                            paths.primary()?.display(),
                             start.elapsed().as_secs_f64(),
                             range_digits = cli.parameters.progress_range_decimals,
                             clip_digits = cli.parameters.progress_clip_decimals,
                             dr_digits = cli.parameters.progress_dr_decimals,
                             elapsed_digits = cli.parameters.progress_elapsed_decimals,
                         );
+                        if !encodings.is_empty() {
+                            let outputs = encodings
+                                .iter()
+                                .map(|encoding| {
+                                    let quality = encoding
+                                        .quality
+                                        .map_or_else(String::new, |q| format!(", quality {q}"));
+                                    format!(
+                                        "{} {}-bit {:?}{quality}",
+                                        encoding.format, encoding.bits, encoding.compression
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            progress.push_str(&format!("\n  additional outputs (quantized from the 16-bit master): {outputs}"));
+                        }
                         if optimized {
                             let mapping = (1..cli.parameters.mapping_steps)
                                 .map(|i| {
@@ -686,7 +755,8 @@ pub fn run(cli: Cli) -> Result<()> {
     if !cli.analyze && !cli.silent {
         writeln!(
             io::stdout().lock(),
-            "Saved {successes} PNG/JPEG pair(s) from {} DNG(s) using {threads} threads ({jobs} files at once) to {}",
+            "Saved {successes} {} from {} DNG(s) using {threads} threads ({jobs} files at once) to {}",
+            cli.formats.summary(),
             inputs.len(),
             cli.output.display()
         )?;
@@ -738,7 +808,11 @@ fn output_paths(cli: &Cli, input: &Input, optimized: bool) -> OutputPaths {
     } else {
         cli.output.clone()
     };
-    OutputPaths::new(&root.join(&input.relative), cli.report)
+    OutputPaths::with_formats(
+        &root.join(&input.relative),
+        cli.report,
+        &cli.formats.enabled(),
+    )
 }
 
 #[derive(Serialize)]
@@ -760,6 +834,8 @@ struct ConversionReport<'a> {
     jobs: usize,
     file_threads: usize,
     parameters: &'a Parameters,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    additional_formats: Vec<Encoding>,
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ fn command(input: &Path, output: &Path, arguments: &[String]) -> std::process::O
         .arg(input)
         .arg("--output")
         .arg(output)
-        .args(["--threads", "2", "--report"])
+        .args(["--jpg", "--threads", "2", "--report"])
         .args(arguments)
         .output()
         .unwrap()

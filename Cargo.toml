@@ -3,14 +3,20 @@ name = "dng-monochrome"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Precision-preserving monochrome DNG development to 16-bit PNG and grayscale JPEG"
+description = "Precision-preserving monochrome DNG development with selectable image outputs"
 license = "Apache-2.0"
 repository = "https://github.com/lukaszgryglicki/dng-monochrome"
+
+[features]
+default = ["bundled-heif"]
+bundled-heif = ["libheif-sys/embedded-libheif"]
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 jpeg-encoder = "0.7"
+libheif-sys = { version = "5.3", default-features = false, features = ["v1_17"] }
+openjpeg-sys = { version = "1.0.8", features = ["threads"] }
 png = "0.18"
 rawler = "0.8"
 rayon = "1.11"
@@ -24,6 +30,8 @@ mimalloc = "0.1.52"
 
 [dev-dependencies]
 jpeg-decoder = "0.3"
+jpeg2k = { version = "0.10.1", default-features = false, features = ["openjpeg-sys", "strict-mode"] }
+libheif-rs = { version = "2.7", default-features = false, features = ["v1_17"] }
 
 [profile.release]
 lto = "thin"

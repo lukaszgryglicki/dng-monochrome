@@ -28,7 +28,7 @@ fn musl_build_uses_mimalloc() {
 
 fn run(input: &Path, output: &Path, flags: &[&str]) -> Output {
     let mut command = Command::new(BIN);
-    command.arg(input).arg("--output").arg(output);
+    command.arg(input).arg("--jpg").arg("--output").arg(output);
     if !flags
         .iter()
         .any(|flag| flag.starts_with("--threads") || flag.starts_with("-threads"))
@@ -106,6 +106,10 @@ fn help_version_and_missing_arguments() {
     )
     .unwrap();
     assert_eq!(defaults.jpeg_quality, 90);
+    assert_eq!(
+        defaults.formats.enabled(),
+        [dng_monochrome::formats::Format::Png]
+    );
     assert_eq!(defaults.clip_strength, 3);
     assert_eq!(
         defaults.transfers(),
@@ -142,6 +146,24 @@ fn help_version_and_missing_arguments() {
             "--report",
             "--analyze",
             "--overwrite",
+            "--png",
+            "--no-png",
+            "--jpg",
+            "--no-jpg",
+            "--heic",
+            "--no-heic",
+            "--avif",
+            "--no-avif",
+            "--j2k",
+            "--no-j2k",
+            "--lossless",
+            "--lossy",
+            "--heic-mode",
+            "--avif-mode",
+            "--j2k-mode",
+            "--heic-quality",
+            "--avif-quality",
+            "--j2k-quality",
         ] {
             assert!(text.contains(name), "missing {name} in {flag}");
         }
@@ -173,17 +195,12 @@ fn default_output_is_sixteen_bit_grayscale_at_maximum_compression() {
     assert!(progress.contains("raw-code span 13.9 bits"));
     let output = tmp.path().join("dng-mono");
     let png = read_png(&output.join("photo.png"));
-    let (width, height, jpeg) = read_jpeg(&output.join("photo.jpg"));
     assert_eq!((png.width, png.height), (64, 32));
-    assert_eq!((width, height), (64, 32));
     assert!(!png.srgb);
     assert_eq!(png.gamma, Some(1.0));
     assert_eq!(*png.pixels.iter().min().unwrap(), 0);
     assert_eq!(*png.pixels.iter().max().unwrap(), 65535);
-    for (&p, &j) in png.pixels.iter().zip(&jpeg) {
-        let expected = ((u32::from(p) + 128) / 257) as i32;
-        assert!((expected - i32::from(j)).abs() <= 4);
-    }
+    assert!(!output.join("photo.jpg").exists());
     assert!(!output.join("photo.json").exists());
     let bytes = fs::read(output.join("photo.png")).unwrap();
     let mut offset = 8;
@@ -199,6 +216,32 @@ fn default_output_is_sixteen_bit_grayscale_at_maximum_compression() {
         }
         offset += length + 12;
         assert!(offset < bytes.len(), "missing PNG image data");
+    }
+}
+
+#[test]
+fn explicit_jpg_restores_the_legacy_grayscale_pair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    let output = tmp.path().join("out");
+    let result = success(
+        Command::new(BIN)
+            .arg(&input)
+            .arg("-jpg")
+            .arg("-o")
+            .arg(&output)
+            .args(["--threads", "2"])
+            .output()
+            .unwrap(),
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("PNG/JPEG pair(s)"));
+    let png = read_png(&output.join("photo.png"));
+    let (width, height, jpeg) = read_jpeg(&output.join("photo.jpg"));
+    assert_eq!((width, height), (64, 32));
+    assert_eq!(png.gamma, Some(1.0));
+    for (&p, &j) in png.pixels.iter().zip(&jpeg) {
+        let expected = ((u32::from(p) + 128) / 257) as i32;
+        assert!((expected - i32::from(j)).abs() <= 4);
     }
 }
 
@@ -662,7 +705,7 @@ fn shell_expanded_multiple_dngs_generate_matching_png_and_jpeg_names() {
             .current_dir(tmp.path())
             .args([
                 "-c",
-                "\"$1\" --threads 2 -o . --dark 0 --light 0 ./*.DNG",
+                "\"$1\" --jpg --threads 2 -o . --dark 0 --light 0 ./*.DNG",
                 "dng-glob-test",
                 BIN,
             ])

@@ -9,6 +9,10 @@
 *.PNG
 *.jp*g
 *.JP*G
+*.[hH][eE][iI][cC]
+*.[aA][vV][iI][fF]
+*.[jJ][pP]2
+*.[jJ]2[kK]
 .DS_Store
 /dng-monochrome
 /dng-monochrome.static

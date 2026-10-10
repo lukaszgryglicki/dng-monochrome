@@ -85,7 +85,16 @@ fn both_formats_preserve_photographic_exif_and_normalize_output_geometry() {
                     .path()
                     .join(format!("{big_endian}-{orientation}-{transfer}"));
                 let result = Command::new(env!("CARGO_BIN_EXE_dng-monochrome"))
-                    .args(["--silent", "--report", "--transfer", transfer, "-o"])
+                    .args([
+                        "--jpg",
+                        "--threads",
+                        "2",
+                        "--silent",
+                        "--report",
+                        "--transfer",
+                        transfer,
+                        "-o",
+                    ])
                     .arg(&out)
                     .arg(&input)
                     .output()
@@ -164,6 +173,7 @@ fn oversized_jpeg_metadata_is_an_error_without_partial_images() {
     dng.write(&input);
     let out = tmp.path().join("out");
     let result = Command::new(env!("CARGO_BIN_EXE_dng-monochrome"))
+        .args(["--jpg", "--threads", "2"])
         .arg("-o")
         .arg(&out)
         .arg(&input)

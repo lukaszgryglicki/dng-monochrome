@@ -1,4 +1,5 @@
 use crate::{
+    formats::{Encoding, Format},
     parameters::Parameters,
     raw::{MonoImage, SensorMetadata},
     tone::{Rendered, Transfer, Transfers},
@@ -20,29 +21,68 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+mod native;
+
 #[derive(Debug)]
 pub struct OutputPaths {
     pub png: PathBuf,
     pub jpeg: PathBuf,
+    pub heic: PathBuf,
+    pub avif: PathBuf,
+    pub j2k: PathBuf,
     pub report: Option<PathBuf>,
+    formats: Vec<Format>,
 }
 
 impl OutputPaths {
     pub fn new(stem: &Path, report: bool) -> Self {
+        Self::with_formats(stem, report, &[Format::Png, Format::Jpeg])
+    }
+
+    pub fn with_formats(stem: &Path, report: bool, formats: &[Format]) -> Self {
         Self {
             png: stem.with_extension("png"),
             jpeg: stem.with_extension("jpg"),
+            heic: stem.with_extension("heic"),
+            avif: stem.with_extension("avif"),
+            j2k: stem.with_extension("jp2"),
             report: report.then(|| stem.with_extension("json")),
+            formats: formats.to_vec(),
         }
     }
 
+    pub fn path(&self, format: Format) -> &Path {
+        match format {
+            Format::Png => &self.png,
+            Format::Jpeg => &self.jpeg,
+            Format::Heic => &self.heic,
+            Format::Avif => &self.avif,
+            Format::J2k => &self.j2k,
+        }
+    }
+
+    pub fn primary(&self) -> Result<&Path> {
+        self.formats
+            .first()
+            .map(|&format| self.path(format))
+            .context("at least one output format must be selected")
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &Path> {
-        [self.png.as_path(), self.jpeg.as_path()]
-            .into_iter()
+        self.formats
+            .iter()
+            .map(|&format| self.path(format))
             .chain(self.report.as_deref())
     }
 
     pub fn check(&self, overwrite: bool) -> Result<()> {
+        self.primary()?;
+        for (index, format) in self.formats.iter().enumerate() {
+            ensure!(
+                !self.formats[..index].contains(format),
+                "duplicate output format: {format}"
+            );
+        }
         for path in self.all() {
             check_destination(path, overwrite)?;
         }
@@ -114,21 +154,64 @@ pub fn save_with_parameters(
     overwrite: bool,
     parameters: &Parameters,
 ) -> Result<()> {
+    save_with_encodings(
+        paths,
+        image,
+        rendered,
+        report,
+        transfers,
+        quality,
+        overwrite,
+        parameters,
+        &[],
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_with_encodings(
+    paths: &OutputPaths,
+    image: &MonoImage,
+    rendered: &Rendered,
+    report: &impl Serialize,
+    transfers: Transfers,
+    quality: u8,
+    overwrite: bool,
+    parameters: &Parameters,
+    encodings: &[Encoding],
+) -> Result<Vec<String>> {
     parameters.validate()?;
+    for &format in &paths.formats {
+        if !matches!(format, Format::Png | Format::Jpeg) {
+            ensure!(
+                encodings
+                    .iter()
+                    .filter(|encoding| encoding.format == format)
+                    .count()
+                    == 1,
+                "{format} requires exactly one native encoding plan"
+            );
+        }
+    }
+    ensure!(
+        encodings
+            .iter()
+            .all(|encoding| paths.formats.contains(&encoding.format)
+                && !matches!(encoding.format, Format::Png | Format::Jpeg)),
+        "encoding plan includes a disabled or non-native format"
+    );
     let parent = paths
-        .png
+        .primary()?
         .parent()
         .context("output has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     paths.check(overwrite)?;
-    let png_exif = photographic_exif(image, transfers.png, 16)?;
-    let jpeg_exif = photographic_exif(image, transfers.jpeg, 8)?;
-    ensure!(
-        jpeg_exif.len() <= 65527,
-        "photographic EXIF exceeds JPEG's 65527-byte metadata limit; no metadata was silently discarded"
-    );
     let (png, jpeg) = rayon::join(
         || {
+            if !paths.formats.contains(&Format::Png) {
+                return Ok(None);
+            }
+            let png_exif = photographic_exif(image, transfers.png, 16, Format::Png)?;
             encode_png(
                 parent,
                 &image.metadata,
@@ -136,8 +219,17 @@ pub fn save_with_parameters(
                 transfers.png,
                 &png_exif,
             )
+            .map(Some)
         },
         || {
+            if !paths.formats.contains(&Format::Jpeg) {
+                return Ok(None);
+            }
+            let jpeg_exif = photographic_exif(image, transfers.jpeg, 8, Format::Jpeg)?;
+            ensure!(
+                jpeg_exif.len() <= 65527,
+                "photographic EXIF exceeds JPEG's 65527-byte metadata limit; no metadata was silently discarded"
+            );
             encode_jpeg(
                 parent,
                 &image.metadata,
@@ -146,10 +238,36 @@ pub fn save_with_parameters(
                 &jpeg_exif,
                 parameters.jpeg_optimize_huffman,
             )
+            .map(Some)
         },
     );
     let png = png.context("encoding 16-bit PNG")?;
     let jpeg = jpeg.context("encoding grayscale JPEG")?;
+    let mut additional = Vec::new();
+    let mut warnings = Vec::new();
+    for encoding in encodings {
+        let exif = photographic_exif(
+            image,
+            transfers.png,
+            u16::from(encoding.bits),
+            encoding.format,
+        )?;
+        let (file, notes) = native::encode(
+            parent,
+            &image.metadata,
+            &rendered.png,
+            transfers.png,
+            &exif,
+            encoding,
+        )
+        .with_context(|| format!("encoding {} at {} bits", encoding.format, encoding.bits))?;
+        additional.push((encoding.format, file));
+        warnings.extend(
+            notes
+                .into_iter()
+                .map(|note| format!("{}: {note}", encoding.format)),
+        );
+    }
     let json = if paths.report.is_some() {
         let mut file = temporary(parent)?;
         serde_json::to_writer_pretty(file.as_file_mut(), report).context("encoding JSON report")?;
@@ -159,12 +277,19 @@ pub fn save_with_parameters(
     } else {
         None
     };
-    persist(png, &paths.png, overwrite)?;
-    persist(jpeg, &paths.jpeg, overwrite)?;
+    if let Some(png) = png {
+        persist(png, &paths.png, overwrite)?;
+    }
+    if let Some(jpeg) = jpeg {
+        persist(jpeg, &paths.jpeg, overwrite)?;
+    }
+    for (format, file) in additional {
+        persist(file, paths.path(format), overwrite)?;
+    }
     if let (Some(file), Some(path)) = (json, &paths.report) {
         persist(file, path, overwrite)?;
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn temporary(parent: &Path) -> Result<NamedTempFile> {
@@ -218,6 +343,10 @@ fn encode_jpeg(
     exif: &[u8],
     optimize_huffman: bool,
 ) -> Result<NamedTempFile> {
+    ensure!(
+        metadata.width <= usize::from(u16::MAX) && metadata.height <= usize::from(u16::MAX),
+        "image dimensions exceed the JPEG limit of 65535 per axis"
+    );
     let mut file = temporary(parent)?;
     {
         let mut buffer = BufWriter::new(file.as_file_mut());
@@ -236,7 +365,12 @@ fn encode_jpeg(
     Ok(file)
 }
 
-fn photographic_exif(image: &MonoImage, transfer: Transfer, bits: u16) -> Result<Vec<u8>> {
+fn photographic_exif(
+    image: &MonoImage,
+    transfer: Transfer,
+    bits: u16,
+    format: Format,
+) -> Result<Vec<u8>> {
     let metadata = &image.metadata;
     let mut bytes = Cursor::new(Vec::new());
     let mut tiff = TiffWriter::new(&mut bytes)?;
@@ -272,7 +406,7 @@ fn photographic_exif(image: &MonoImage, transfer: Transfer, bits: u16) -> Result
     if let Some(iso) = metadata.standard_output_sensitivity {
         exif.add_tag(ExifTag::StandardOutputSensitivity, iso);
     }
-    if bits == 8 && transfer == Transfer::Linear {
+    if format != Format::Png && transfer == Transfer::Linear {
         exif.add_untyped_tag(0xa500, Rational { n: 1, d: 1 });
     }
     let exif_offset = exif.build(&mut tiff)?;

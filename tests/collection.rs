@@ -1,7 +1,7 @@
 use std::{fs::File, io::BufReader, path::PathBuf};
 
 #[test]
-#[ignore = "set DNG_MONO_OUTPUTS to a generated --both --report output tree"]
+#[ignore = "set DNG_MONO_OUTPUTS to a generated -jpg --both --report output tree"]
 fn generated_collection_decodes_with_matching_pixels_and_reports() {
     let root = PathBuf::from(std::env::var_os("DNG_MONO_OUTPUTS").expect("set DNG_MONO_OUTPUTS"));
     let mut reports = Vec::new();
