@@ -3,6 +3,7 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
+    path::Path,
     process::{Command, Output},
 };
 use tempfile::TempDir;
@@ -12,6 +13,15 @@ fn static_build(host: &str, format: &str, libraries: &str) -> (TempDir, Output) 
 }
 
 fn make_build(host: &str, format: &str, libraries: &str, goals: &[&str]) -> (TempDir, Output) {
+    let directory = make_fixture();
+    let result = make_command(directory.path(), host, format, libraries)
+        .args(goals)
+        .output()
+        .unwrap();
+    (directory, result)
+}
+
+fn make_fixture() -> TempDir {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("Makefile"),
@@ -21,6 +31,28 @@ fn make_build(host: &str, format: &str, libraries: &str, goals: &[&str]) -> (Tem
     let tools = directory.path().join("tools");
     fs::create_dir(&tools).unwrap();
     fs::create_dir(directory.path().join("scripts")).unwrap();
+    fs::create_dir(directory.path().join("mock-libs")).unwrap();
+    for file in ["libstd-fixture.rlib", "libaom.a", "libx265.a"] {
+        fs::write(directory.path().join("mock-libs").join(file), []).unwrap();
+    }
+    fs::write(
+        directory.path().join("scripts/requirements.sh"),
+        include_str!("../scripts/requirements.sh"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("scripts/musl-sdk.sh"),
+        "set -eu\n\
+         case \"$1\" in\n\
+           check) if test \"${MOCK_SDK_MISSING:-0}\" = 1 && ! test -f prepared-sdk; then\n\
+                    echo 'Missing musl SDK. Run make requirements.' >&2; exit 1\n\
+                  fi ;;\n\
+           prepare) printf '%s\\n' \"$*\" >> sdk-calls; touch prepared-sdk ;;\n\
+           run) printf '%s\\n' \"$*\" >> sdk-calls; shift 3; exec \"$@\" ;;\n\
+           *) exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
     fs::write(
         directory.path().join("scripts/build-static-x265.sh"),
         "set -eu\n\
@@ -31,7 +63,63 @@ fn make_build(host: &str, format: &str, libraries: &str, goals: &[&str]) -> (Tem
     )
     .unwrap();
     for (name, body) in [
-        ("rustc", "printf 'host: %s\\n' \"$MOCK_HOST\"\n"),
+        (
+            "rustc",
+            "case \"$1\" in\n\
+               -vV) printf 'host: %s\\n' \"$MOCK_HOST\" ;;\n\
+               --version) printf 'rustc %s (fixture)\\n' \"${MOCK_RUST_VERSION:-1.98.1}\" ;;\n\
+               --print) printf '%s\\n' \"$MOCK_LIBDIR\" ;;\n\
+               *) exit 1 ;;\n\
+             esac\n",
+        ),
+        (
+            "uname",
+            "if test \"$1\" = -m; then printf '%s\\n' \"${MOCK_HOST%%-*}\"; exit; fi\n\
+             case \"$MOCK_HOST\" in\n\
+               *-freebsd) echo FreeBSD ;;\n\
+               *-apple-darwin) echo Darwin ;;\n\
+               *) echo Linux ;;\n\
+             esac\n",
+        ),
+        (
+            "cmake",
+            "test \"$1\" = --version\n\
+             printf 'cmake version %s\\n' \"${MOCK_CMAKE_VERSION:-3.31.0}\"\n",
+        ),
+        (
+            "pkg-config",
+            "if test \"$1\" = --variable=libdir; then echo \"$MOCK_LIBDIR\"; exit; fi\n\
+             for package in \"$@\"; do\n\
+               if test \"$package\" = \"${MOCK_MISSING_PACKAGE:-}\"; then\n\
+                 echo \"Missing package: $package\" >&2; exit 1\n\
+               fi\n\
+             done\n",
+        ),
+        ("ninja", "exit 0\n"),
+        ("nasm", "exit 0\n"),
+        ("id", "echo 1000\n"),
+        (
+            "sudo",
+            "printf '%s\\n' \"$*\" >> privilege-calls\nexec \"$@\"\n",
+        ),
+        ("xcode-select", "exit 0\n"),
+        (
+            "apt-get",
+            "printf '%s\\n' \"$*\" >> package-calls\n\
+             exit \"${MOCK_PACKAGE_STATUS:-0}\"\n",
+        ),
+        (
+            "pkg",
+            "if test \"$1\" = info; then exit 1; fi\n\
+             printf '%s\\n' \"$*\" >> package-calls\n\
+             exit \"${MOCK_PACKAGE_STATUS:-0}\"\n",
+        ),
+        (
+            "brew",
+            "if test \"$1\" = list; then exit 1; fi\n\
+             printf '%s\\n' \"$*\" >> package-calls\n\
+             exit \"${MOCK_PACKAGE_STATUS:-0}\"\n",
+        ),
         ("file", "printf '%s\\n' \"$MOCK_FORMAT\"\n"),
         ("otool", "printf '%s\\n' \"$MOCK_LIBRARIES\"\n"),
         (
@@ -69,26 +157,132 @@ fn make_build(host: &str, format: &str, libraries: &str, goals: &[&str]) -> (Tem
         fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut paths = vec![tools];
+    directory
+}
+
+fn make_command(directory: &Path, host: &str, format: &str, libraries: &str) -> Command {
+    let mut paths = vec![directory.join("tools")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let result = Command::new("make")
+    let mut command = Command::new("make");
+    command
         .args([
             "CARGO=cargo",
             "JOBS=2",
             "STATIC_TARGET=",
             "INSTALL_DIR=installed scripts",
         ])
-        .args(goals)
-        .current_dir(directory.path())
+        .current_dir(directory)
         .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("HOME", directory)
         .env_remove("CARGO_TARGET_DIR")
+        .env("MOCK_LIBDIR", directory.join("mock-libs"))
         .env("MOCK_HOST", host)
         .env("MOCK_FORMAT", format)
         .env("MOCK_LIBRARIES", libraries)
-        .env("RUSTFLAGS", "-C debuginfo=1")
+        .env("RUSTFLAGS", "-C debuginfo=1");
+    command
+}
+
+#[test]
+fn install_checks_missing_prerequisites_before_either_build_without_installing_packages() {
+    for (variable, value, message) in [
+        ("MOCK_MISSING_PACKAGE", "aom", "Missing native"),
+        ("MOCK_RUST_VERSION", "1.88.0", "Rust 1.89+"),
+        ("MOCK_CMAKE_VERSION", "3.21.0", "CMake 3.22+"),
+        ("MOCK_SDK_MISSING", "1", "Missing musl SDK"),
+    ] {
+        let dir = make_fixture();
+        let result = make_command(dir.path(), "x86_64-unknown-linux-gnu", "", "")
+            .arg("install")
+            .env(variable, value)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{variable}: {result:?}");
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains(message), "{error}");
+        assert!(error.contains("make requirements"), "{error}");
+        assert!(!dir.path().join("calls").exists());
+        assert!(!dir.path().join("package-calls").exists());
+        assert!(!dir.path().join("privilege-calls").exists());
+    }
+}
+
+#[test]
+fn install_reports_missing_rust_target_before_building() {
+    let dir = make_fixture();
+    fs::remove_file(dir.path().join("mock-libs/libstd-fixture.rlib")).unwrap();
+    let result = make_command(dir.path(), "x86_64-unknown-linux-gnu", "", "")
+        .arg("install")
         .output()
         .unwrap();
-    (directory, result)
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("Missing Rust standard library for x86_64-unknown-linux-musl"));
+    assert!(error.contains("make requirements"));
+    assert!(!dir.path().join("calls").exists());
+}
+
+#[test]
+fn release_does_not_require_the_musl_sdk() {
+    let dir = make_fixture();
+    let result = make_command(dir.path(), "x86_64-unknown-linux-gnu", "", "")
+        .arg("release")
+        .env("MOCK_SDK_MISSING", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert!(!dir.path().join("sdk-calls").exists());
+}
+
+#[test]
+fn requirements_installs_platform_packages_and_prepares_only_gnu_linux_musl_sdk() {
+    for host in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-freebsd",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ] {
+        let dir = make_fixture();
+        let result = make_command(dir.path(), host, "", "")
+            .arg("requirements")
+            .env("MOCK_SDK_MISSING", "1")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{host}: {result:?}");
+        let packages = fs::read_to_string(dir.path().join("package-calls")).unwrap();
+        assert!(packages.contains("cmake"), "{packages}");
+        assert!(packages.contains("x265"), "{packages}");
+        assert!(packages.contains("aom"), "{packages}");
+        assert!(packages.contains("libde265"), "{packages}");
+        if host.ends_with("-linux-gnu") {
+            assert!(packages.contains("aom-tools"));
+            assert!(packages.contains("libnuma-dev"));
+            assert_eq!(
+                fs::read_to_string(dir.path().join("sdk-calls")).unwrap(),
+                "prepare x86_64-unknown-linux-musl 2\n"
+            );
+        } else {
+            assert!(!dir.path().join("sdk-calls").exists());
+        }
+        assert_eq!(
+            dir.path().join("privilege-calls").exists(),
+            !host.ends_with("-apple-darwin")
+        );
+        assert!(!dir.path().join("calls").exists());
+    }
+}
+
+#[test]
+fn requirements_propagates_package_installation_errors_without_building() {
+    let dir = make_fixture();
+    let result = make_command(dir.path(), "x86_64-unknown-linux-gnu", "", "")
+        .arg("requirements")
+        .env("MOCK_PACKAGE_STATUS", "23")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!dir.path().join("calls").exists());
+    assert!(!dir.path().join("sdk-calls").exists());
 }
 
 #[test]

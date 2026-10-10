@@ -42,6 +42,10 @@ mkdir -p "$prefix/lib"
 configure() {
     build="$1"
     shift
+    if [ -n "${X265_SYSTEM_PROCESSOR:-}" ]; then
+        set -- -DCMAKE_SYSTEM_NAME=Linux \
+            "-DCMAKE_SYSTEM_PROCESSOR=$X265_SYSTEM_PROCESSOR" "$@"
+    fi
     cmake -S "$source/source" -B "$build" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DGIT_ARCHETYPE=1 \
