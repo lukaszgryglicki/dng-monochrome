@@ -989,7 +989,7 @@ fn parallel_batches_preserve_images_reports_and_complete_progress_blocks() {
                 "--both",
                 "--report",
                 "--tone-band",
-                "0:0.35:0.4",
+                "0:0.3:0.4",
             ],
         ));
         assert!(String::from_utf8_lossy(&result.stdout).contains("Saved 8 PNG/JPEG pair(s)"));

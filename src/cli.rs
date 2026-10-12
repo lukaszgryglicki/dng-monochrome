@@ -45,7 +45,7 @@ use walkdir::WalkDir;
         dng-monochrome shot.DNG -clip-strength 9 -best\n  \
         dng-monochrome shot.DNG -dark 0.8 -light 1.2% -func 'sin(pi*x)^2' -func-scale\n  \
         dng-monochrome shot.DNG --no-optimize --dark 0 --light 0\n  \
-        dng-monochrome shot.DNG -tone-band 0:0.35:0.4\n  \
+        dng-monochrome shot.DNG -tone-band 0:0.3:0.4\n  \
         dng-monochrome shot.DNG -jpg --png-transfer linear --jpeg-transfer srgb\n  \
         dng-monochrome shot.DNG -no-png -heic -avif -j2k\n  \
         dng-monochrome shot.DNG -heic -heic-mode lossy -heic-quality 95\n\

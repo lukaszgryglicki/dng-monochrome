@@ -54,7 +54,7 @@ impl std::str::FromStr for ToneBand {
     fn from_str(source: &str) -> Result<Self, Self::Err> {
         let fields: Vec<_> = source.split(':').collect();
         if fields.len() != 3 {
-            return Err("expected START:END:AMOUNT, e.g. 0:0.35:0.4".into());
+            return Err("expected START:END:AMOUNT, e.g. 0:0.3:0.4".into());
         }
         let parse = |index: usize| {
             fields[index].trim().parse::<f64>().map_err(|_| {
