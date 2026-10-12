@@ -18,24 +18,40 @@ exposure time and the recorded aperture/lens metadata.
 
 ## Build
 
-Rust 1.89 or newer, C/C++ compilers, CMake, `pkg-config`, and x265, libaom and
+Rust 1.89 or newer, C/C++ compilers, CMake 3.22+, `pkg-config`, and x265, libaom and
 libde265 development files are required. The DNG decoder, math parser,
 processing, PNG encoder, and JPEG encoder are Rust code. HEIC/AVIF use libheif
 with x265/libaom; JPEG2000 uses OpenJPEG. All encoding is in-process: no LibRaw,
 dcraw, ImageMagick, or external image-conversion process is required.
 
+Start with the explicit setup target, then build/install:
+
 ```sh
-# FreeBSD
-sudo pkg install cmake pkgconf x265 aom libde265
-# Debian/Ubuntu
-sudo apt install build-essential cmake pkg-config libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev
-
-# macOS (Xcode Command Line Tools and Homebrew)
-brew install cmake pkgconf x265 aom libde265
-
-make                         # tests, then stripped release build
-./target/release/dng-monochrome -help
+make requirements            # install/check native and static-build prerequisites
+make install                 # build both profiles and copy the executables
+# Add clean only when finished; it removes incremental build artifacts.
 ```
+
+Run these as your ordinary user, not `sudo make`. Setup uses `sudo` for missing
+system packages on FreeBSD and Debian/Ubuntu, and Homebrew on macOS. It also
+supports native Alpine with `apk`. On macOS, install the Xcode Command Line
+Tools (`xcode-select --install`) and [Homebrew](https://brew.sh/) first;
+`make requirements` then installs the codec/build packages. A working Rust
+1.89+ installation is retained; missing Rust is installed through the native
+package manager or rustup.
+
+On GNU Linux, setup also installs the selected Rust musl target and prepares a
+**native, private musl C/C++ toolchain plus static x265/libaom**. Neither
+`rustup target add` alone nor `musl-tools` supplies that complete C++/codec SDK.
+The first setup downloads checksum-pinned musl.cc GCC 11.2.1 and codec sources,
+then builds the codecs with `JOBS` workers; subsequent runs reuse the cache.
+**No Docker, container, global compiler replacement or shell-profile change
+is required.** Downloads require network access; package installation may
+require your sudo password.
+
+Build targets check prerequisites before compiling. Missing dependencies name
+the problem and tell you to run `make requirements`; ordinary `make install`
+does not install packages or download a toolchain.
 
 The default `bundled-heif` feature compiles packaged libheif source; OpenJPEG is
 also built from its packaged source. Neither replaces a system library.
@@ -50,6 +66,7 @@ converter does not execute them; `aom-tools` supplies those build-time targets.
 
 | Target | Result |
 | --- | --- |
+| `make requirements` | Install native dependencies and prepare the selected static-build toolchain/SDK |
 | `make`, `make all` | Tests and release build |
 | `make build`, `make release` | Optimized, stripped `target/release/dng-monochrome` |
 | `make debug` | `target/debug/dng-monochrome` |
@@ -72,6 +89,8 @@ executable to `/data/scripts/dng-monochrome`. `STATIC_TARGET` selects the same
 target for building and installation. Override the installation directory
 with `INSTALL_DIR=/your/path`; it must be writable by the invoking user.
 Both repository-root executables are ignored by Git.
+For example, on macOS without a writable `/data/scripts`, use
+`make install INSTALL_DIR="$HOME/bin"`.
 
 `make release static install clean` performs the complete sequence. `make clean`
 preserves both repository-root executables and the installed copy. Omit `clean`
@@ -85,28 +104,29 @@ SHA256-verified x265 4.1 release and builds a private 8/10/12-bit static SDK und
 installed x265 libraries. AOM and any detected optional native dependencies
 (for example VMAF or sharpyuv) must provide static archives.
 
-On GNU/Linux the target selects musl, which must already be installed along with
-a musl C/C++ toolchain and **musl-built static x265/libaom dependencies**. Point
-pkg-config and the native compiler at that SDK; glibc development archives are
-not a musl SDK. For example, after preparing those native dependencies:
+On GNU/Linux the target selects musl. `make requirements` prepares everything
+for the default x86-64 or AArch64 target; the x86-64 host can also prepare the
+AArch64 target. `make static` automatically selects the private SDK and scopes
+C/C++ compilers, linker and pkg-config/CMake searches to its musl libraries.
+It never tries to link the system's glibc codec archives into a musl executable.
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
+make requirements
 make static
-# Override target selection when needed; cross-compilation also needs a linker:
-make static STATIC_TARGET=x86_64-unknown-linux-musl
+# Use the same explicit target for preparation and building:
+make requirements static STATIC_TARGET=aarch64-unknown-linux-musl
 ```
 
-In a **musl-native** build environment, the same private x265 helper can supply
-the missing static multilib archive (Alpine's `x265-dev` provides only the
-shared library). With CMake, Ninja, `nasm` on x86, `curl`, a C/C++ toolchain and
-static libaom already available:
+The GNU-host musl SDK lives under
+`${XDG_CACHE_HOME:-$HOME/.cache}/dng-monochrome/`, outside Cargo's `target/`,
+so `make clean` does not remove it. Set `DNG_MONO_SDK_ROOT=/your/cache` for both
+setup and builds to override this location. SDK preparation is serialized;
+partial downloads/builds never count as a ready SDK.
 
-```sh
-sh scripts/build-static-x265.sh target/static/x265 4
-PKG_CONFIG_PATH="$(pwd)/target/static/x265/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-    make static
-```
+In a **musl-native** environment, `make requirements` installs the native
+development/static packages. `make static` automatically builds the same
+private x265 multilib SDK used on FreeBSD, because Alpine's `x265-dev` supplies
+only the shared library. It does not need a second C/C++ toolchain.
 
 Linux musl executables use mimalloc to avoid contention in musl's allocator
 during parallel processing. GNU/Linux, FreeBSD, and macOS native builds retain
@@ -122,8 +142,8 @@ application dependencies but keeps Apple system libraries dynamically linked,
 rejecting non-system dynamic dependencies.
 
 On FreeBSD/Linux, the static target checks that the executable really is
-statically linked. It never installs toolchains or changes a shared compiler
-automatically.
+statically linked. Toolchain/package installation happens only through the
+explicit `requirements` target, not as a side effect of ordinary builds.
 
 ## Usage
 

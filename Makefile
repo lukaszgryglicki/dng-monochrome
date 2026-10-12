@@ -4,45 +4,56 @@ JOBS ?= 4
 TEST_THREADS ?= 4
 STATIC_TARGET ?=
 INSTALL_DIR ?= /data/scripts
+BUILD_PATH = $(HOME)/.cargo/bin:$(PATH):/opt/homebrew/bin:/usr/local/bin
+CHECK_REQUIREMENTS = PATH="$(BUILD_PATH)" CARGO="$(CARGO)" JOBS="$(JOBS)" \
+	STATIC_TARGET="$(STATIC_TARGET)" sh scripts/requirements.sh check "$(MAKECMDGOALS) $(.TARGETS)"
 
 RESOLVE_STATIC_TARGET = \
-	target="$(STATIC_TARGET)"; \
-	if [ -z "$$target" ]; then \
-		host="$$(rustc -vV | sed -n 's/^host: //p')"; \
-		case "$$host" in \
-			*-linux-gnu) target="$${host%-gnu}-musl" ;; \
-			*-linux-musl|*-freebsd|*-apple-darwin) target="$$host" ;; \
-			*) echo "Set STATIC_TARGET to a static-capable Rust target" >&2; exit 1 ;; \
-		esac; \
-	fi
+	export PATH="$(BUILD_PATH)"; \
+	target="$$(STATIC_TARGET="$(STATIC_TARGET)" sh scripts/requirements.sh target)"; \
+	host="$$(rustc -vV | sed -n 's/^host: //p')"
 
 all: test build
 
 build: release
 
+requirements:
+	@PATH="$(BUILD_PATH)" CARGO="$(CARGO)" JOBS="$(JOBS)" STATIC_TARGET="$(STATIC_TARGET)" \
+		sh scripts/requirements.sh install
+
 release:
-	$(CARGO) build --locked --release -j $(JOBS)
+	@$(CHECK_REQUIREMENTS)
+	PATH="$(BUILD_PATH)" $(CARGO) build --locked --release -j $(JOBS)
 
 debug:
-	$(CARGO) build --locked -j $(JOBS)
+	@$(CHECK_REQUIREMENTS)
+	PATH="$(BUILD_PATH)" $(CARGO) build --locked -j $(JOBS)
 
 test:
-	RUST_TEST_THREADS=$(TEST_THREADS) $(CARGO) test --locked -j $(JOBS)
+	@$(CHECK_REQUIREMENTS)
+	PATH="$(BUILD_PATH)" RUST_TEST_THREADS=$(TEST_THREADS) $(CARGO) test --locked -j $(JOBS)
 
 test-real:
 	@test -n "$(DNG_MONO_SAMPLE)" || { echo "Set DNG_MONO_SAMPLE to an original Leica DNG" >&2; exit 1; }
-	DNG_MONO_SAMPLE="$(DNG_MONO_SAMPLE)" RUST_TEST_THREADS=$(TEST_THREADS) $(CARGO) test --locked --release -j $(JOBS) --test decoder --test cli original_leica -- --ignored --nocapture
+	@$(CHECK_REQUIREMENTS)
+	PATH="$(BUILD_PATH)" DNG_MONO_SAMPLE="$(DNG_MONO_SAMPLE)" RUST_TEST_THREADS=$(TEST_THREADS) $(CARGO) test --locked --release -j $(JOBS) --test decoder --test cli original_leica -- --ignored --nocapture
 
 fmt:
-	$(CARGO) fmt --all
+	PATH="$(BUILD_PATH)" $(CARGO) fmt --all
 
 lint:
-	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --locked --all-targets -j $(JOBS) -- -D warnings
+	@$(CHECK_REQUIREMENTS)
+	PATH="$(BUILD_PATH)" $(CARGO) fmt --all -- --check
+	PATH="$(BUILD_PATH)" $(CARGO) clippy --locked --all-targets -j $(JOBS) -- -D warnings
 
 static:
+	@$(CHECK_REQUIREMENTS)
 	@set -eu; \
 	$(RESOLVE_STATIC_TARGET); \
+	set --; \
+	case "$$host:$$target" in \
+		*-linux-gnu:*-linux-musl) set -- sh scripts/musl-sdk.sh run "$$target" $(JOBS) ;; \
+	esac; \
 	case "$$target" in \
 		*-apple-darwin) link_flags="-C prefer-dynamic=no" ;; \
 		*-freebsd) \
@@ -50,12 +61,19 @@ static:
 			sh scripts/build-static-x265.sh target/static/x265 $(JOBS); \
 			PKG_CONFIG_PATH="$$(pwd)/target/static/x265/install/lib/pkgconfig$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}"; \
 			export PKG_CONFIG_PATH ;; \
+		*-linux-musl) \
+			link_flags="-C target-feature=+crt-static"; \
+			if [ "$$#" -eq 0 ]; then \
+				sh scripts/build-static-x265.sh target/static/x265 $(JOBS); \
+				PKG_CONFIG_PATH="$$(pwd)/target/static/x265/install/lib/pkgconfig$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}"; \
+				export PKG_CONFIG_PATH; \
+			fi ;; \
 		*) link_flags="-C target-feature=+crt-static" ;; \
 	esac; \
 	DNG_MONO_STATIC=1 SYSTEM_DEPS_LIBHEIF_LINK=static PKG_CONFIG_ALL_STATIC=1 \
 		CMAKE_BUILD_PARALLEL_LEVEL=$(JOBS) CARGO_TARGET_DIR=target/static \
 		RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }$$link_flags" \
-		$(CARGO) build --locked --release --target "$$target" -j $(JOBS); \
+		"$$@" $(CARGO) build --locked --release --target "$$target" -j $(JOBS); \
 	binary="target/static/$$target/release/dng-monochrome"; \
 	if [ "$${target%-apple-darwin}" != "$$target" ]; then \
 		file "$$binary" | grep -Eq 'Mach-O.*executable' || \
@@ -79,6 +97,6 @@ install: release static
 	install -m 755 dng-monochrome.static "$(INSTALL_DIR)/dng-monochrome"
 
 clean:
-	$(CARGO) clean
+	PATH="$(BUILD_PATH)" $(CARGO) clean
 
-.PHONY: all build release debug test test-real fmt lint static install clean
+.PHONY: all build requirements release debug test test-real fmt lint static install clean
