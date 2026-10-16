@@ -296,6 +296,137 @@ fn flags_are_independent_support_both_dash_styles_and_last_switch_wins() {
 }
 
 #[test]
+fn all_formats_shortcut_preserves_switch_order_and_argument_boundaries() {
+    let formats = [
+        Format::Png,
+        Format::Jpeg,
+        Format::Heic,
+        Format::Avif,
+        Format::J2k,
+    ];
+    for all in ["-all", "--all"] {
+        assert_eq!(parse(&[all]).unwrap().formats.enabled(), formats);
+        for (enable, disable, format) in [
+            ("--png", "-no-png", Format::Png),
+            ("-jpg", "--no-jpeg", Format::Jpeg),
+            ("--heic", "-no-heic", Format::Heic),
+            ("-avif", "--no-avif", Format::Avif),
+            ("--j2k", "-no-j2k", Format::J2k),
+        ] {
+            assert_eq!(parse(&[disable, all]).unwrap().formats.enabled(), formats);
+            let disabled = parse(&[all, disable]).unwrap().formats.enabled();
+            assert_eq!(
+                disabled,
+                formats
+                    .into_iter()
+                    .filter(|&candidate| candidate != format)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(parse(&[enable, all]).unwrap().formats.enabled(), formats);
+            assert_eq!(parse(&[all, enable]).unwrap().formats.enabled(), formats);
+            assert_eq!(
+                parse(&[all, disable, all]).unwrap().formats.enabled(),
+                formats
+            );
+        }
+        let positional = parse(&["--", all]).unwrap();
+        assert_eq!(positional.formats.enabled(), [Format::Png]);
+        assert_eq!(positional.inputs.last().unwrap(), Path::new(all));
+        let value = parse(&["-func", all]).unwrap();
+        assert_eq!(value.function.as_deref(), Some(all));
+        assert_eq!(value.formats.enabled(), [Format::Png]);
+    }
+    assert!(parse(&["--all=true"]).is_err());
+}
+
+#[test]
+fn jpeg2000_sub_eight_bit_precision_requires_explicit_opt_in() {
+    for flag in ["-j2k-allow-low-bits", "--j2k-allow-low-bits"] {
+        for mode in ["-lossless", "-lossy"] {
+            let normal = parse(&["-j2k", mode]).unwrap();
+            let allowed = parse(&["-j2k", mode, flag]).unwrap();
+            for dr in [0.0, 0.99, 1.0, 1.01, 6.2, 7.0, 7.01, 8.0, 8.01, 15.9, 17.0] {
+                let normal = normal.formats.encodings(Some(dr)).unwrap();
+                let allowed = allowed.formats.encodings(Some(dr)).unwrap();
+                assert_eq!(normal[0].bits, (dr.ceil() as u8).clamp(8, 16));
+                assert_eq!(allowed[0].bits, (dr.ceil() as u8).clamp(1, 16));
+                assert_eq!(normal[0].measured_dr, Some(dr));
+                assert_eq!(allowed[0].measured_dr, Some(dr));
+                assert_eq!(normal[0].depth_capped, allowed[0].depth_capped);
+            }
+            assert_eq!(normal.formats.encodings(None).unwrap()[0].bits, 16);
+            assert_eq!(allowed.formats.encodings(None).unwrap()[0].bits, 16);
+        }
+        let other_formats = parse(&["-heic", "-avif", flag]).unwrap();
+        assert_eq!(
+            other_formats
+                .formats
+                .encodings(Some(2.0))
+                .unwrap()
+                .iter()
+                .map(|encoding| encoding.bits)
+                .collect::<Vec<_>>(),
+            [8, 8]
+        );
+        assert_eq!(parse(&[flag]).unwrap().formats.enabled(), [Format::Png]);
+    }
+    assert!(parse(&["--j2k-allow-low-bits=true"]).is_err());
+}
+
+#[test]
+fn all_formats_shortcut_matches_explicit_outputs_and_low_bits_reach_the_codec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("profile.DNG");
+    let mut dng = common::Dng::ramp(16, 8);
+    dng.noise_profile = Some([0.0, 1e-4]);
+    dng.write(&input);
+    let original = fs::read(&input).unwrap();
+    let explicit = tmp.path().join("explicit");
+    let shortcut = tmp.path().join("shortcut");
+    success(run(
+        &input,
+        &explicit,
+        &[
+            "-jpg", "-png", "-heic", "-avif", "-j2k", "-report", "-silent",
+        ],
+    ));
+    success(run(&input, &shortcut, &["-all", "-report", "-silent"]));
+    for extension in ["png", "jpg", "heic", "avif", "jp2", "json"] {
+        assert_eq!(
+            fs::read(explicit.join(format!("profile.{extension}"))).unwrap(),
+            fs::read(shortcut.join(format!("profile.{extension}"))).unwrap(),
+            "{extension}"
+        );
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(shortcut.join("profile.json")).unwrap()).unwrap();
+    let dr = report["range"]["dynamic_range"]["snr1_stops"]
+        .as_f64()
+        .unwrap();
+    assert!(dr > 1.0 && dr <= 7.0, "{dr}");
+    assert_eq!(decode(&shortcut.join("profile.jp2"), Format::J2k).bits, 8);
+    assert_eq!(report["additional_formats"][2]["bits"], 8);
+    let low = tmp.path().join("low");
+    success(run(
+        &input,
+        &low,
+        &[
+            "-no-png",
+            "-j2k",
+            "-j2k-allow-low-bits",
+            "-report",
+            "-silent",
+        ],
+    ));
+    let bits = dr.ceil() as u8;
+    assert_eq!(decode(&low.join("profile.jp2"), Format::J2k).bits, bits);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(low.join("profile.json")).unwrap()).unwrap();
+    assert_eq!(report["additional_formats"][0]["bits"], bits);
+    assert_eq!(fs::read(input).unwrap(), original);
+}
+
+#[test]
 fn codec_modes_and_qualities_override_only_the_requested_format() {
     let cli = parse(&[
         "-heic",

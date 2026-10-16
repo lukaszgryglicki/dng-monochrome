@@ -49,7 +49,13 @@ pub enum Compression {
 pub struct OutputOptions {
     #[arg(
         long,
-        overrides_with = "no_png",
+        overrides_with = "all",
+        help = "Shortcut for --jpg --png --heic --avif --j2k; later format switches override"
+    )]
+    pub all: bool,
+    #[arg(
+        long,
+        overrides_with_all = ["no_png", "png"],
         help = "Save 16-bit grayscale PNG (default)"
     )]
     pub png: bool,
@@ -58,7 +64,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         visible_alias = "jpeg",
-        overrides_with = "no_jpg",
+        overrides_with_all = ["no_jpg", "jpg"],
         help = "Also save the original 8-bit grayscale JPEG"
     )]
     pub jpg: bool,
@@ -71,7 +77,7 @@ pub struct OutputOptions {
     pub no_jpg: bool,
     #[arg(
         long,
-        overrides_with = "no_heic",
+        overrides_with_all = ["no_heic", "heic"],
         help = "Save monochrome HEIC using x265 at maximum effort"
     )]
     pub heic: bool,
@@ -79,7 +85,7 @@ pub struct OutputOptions {
     pub no_heic: bool,
     #[arg(
         long,
-        overrides_with = "no_avif",
+        overrides_with_all = ["no_avif", "avif"],
         help = "Save monochrome AVIF using libaom at maximum effort"
     )]
     pub avif: bool,
@@ -87,12 +93,17 @@ pub struct OutputOptions {
     pub no_avif: bool,
     #[arg(
         long,
-        overrides_with = "no_j2k",
+        overrides_with_all = ["no_j2k", "j2k"],
         help = "Save grayscale JPEG2000 in a .jp2 container"
     )]
     pub j2k: bool,
     #[arg(long, overrides_with = "j2k", help = "Do not save JPEG2000 (default)")]
     pub no_j2k: bool,
+    #[arg(
+        long,
+        help = "Allow automatic JPEG2000 precision below 8 bits (down to 1); default minimum is 8"
+    )]
+    pub j2k_allow_low_bits: bool,
 
     #[arg(
         long,
@@ -139,10 +150,10 @@ impl OutputOptions {
     pub fn enabled(&self) -> Vec<Format> {
         [
             (Format::Png, self.png || !self.no_png),
-            (Format::Jpeg, self.jpg && !self.no_jpg),
-            (Format::Heic, self.heic && !self.no_heic),
-            (Format::Avif, self.avif && !self.no_avif),
-            (Format::J2k, self.j2k && !self.no_j2k),
+            (Format::Jpeg, (self.all || self.jpg) && !self.no_jpg),
+            (Format::Heic, (self.all || self.heic) && !self.no_heic),
+            (Format::Avif, (self.all || self.avif) && !self.no_avif),
+            (Format::J2k, (self.all || self.j2k) && !self.no_j2k),
         ]
         .into_iter()
         .filter_map(|(format, enabled)| enabled.then_some(format))
@@ -173,7 +184,12 @@ impl OutputOptions {
                     Format::J2k => (self.j2k_mode, self.j2k_quality),
                     Format::Png | Format::Jpeg => unreachable!(),
                 };
-                Encoding::new(format, measured_dr, mode.unwrap_or(default), quality)
+                let mut encoding =
+                    Encoding::new(format, measured_dr, mode.unwrap_or(default), quality)?;
+                if format == Format::J2k && !self.j2k_allow_low_bits {
+                    encoding.bits = encoding.bits.max(8);
+                }
+                Ok(encoding)
             })
             .collect()
     }

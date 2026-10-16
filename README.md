@@ -231,11 +231,13 @@ The documented `--long` options also accept `-long`, including `-help`,
 | --- | --- |
 | `DNG_OR_DIRECTORY ...` | One or more monochrome DNG files or recursively searched directories |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
+| `--all` | Shortcut for `--jpg --png --heic --avif --j2k`; later format switches override |
 | `--png`, `--no-png` | Enable/disable 16-bit PNG; **enabled by default** |
 | `--jpg`, `--no-jpg` | Enable/disable original 8-bit JPEG; default off; aliases `--jpeg`, `--no-jpeg` |
 | `--heic`, `--no-heic` | Enable/disable HEIC; default off |
 | `--avif`, `--no-avif` | Enable/disable AVIF; default off |
 | `--j2k`, `--no-j2k` | Enable/disable JPEG2000 in a `.jp2` container; default off |
+| `--j2k-allow-low-bits` | Permit automatic JPEG2000 depth below 8 bits; default minimum **8** |
 | `--lossless`, `--lossy` | Compression for HEIC/AVIF/JPEG2000; default **lossless**; no effect on PNG/JPEG |
 | `--heic-mode`, `--avif-mode`, `--j2k-mode` | `lossless` or `lossy`; per-format override of the shared mode |
 | `--heic-quality`, `--avif-quality`, `--j2k-quality` | Lossy quality `1..100`, each default **90**; ignored in lossless mode |
@@ -286,7 +288,7 @@ the DNG container depth.
 | --- | --- | --- |
 | HEIC / x265 | 8, 10, 12 bits | `placebo`, complexity 100 |
 | AVIF / libaom | 8, 10, 12 bits | speed 0 |
-| JPEG2000 / OpenJPEG | Every integer depth from 1 through 16 bits | Maximum useful wavelet decomposition; reversible transform/rate 0 for lossless |
+| JPEG2000 / OpenJPEG | 8 through 16 bits; 1 through 16 with `--j2k-allow-low-bits` | Maximum useful wavelet decomposition; reversible transform/rate 0 for lossless |
 
 HEIC images larger than 2048 pixels on either axis use a standard image grid
 with tiles no larger than 2048x2048. This keeps high-resolution, noisy images
@@ -309,7 +311,9 @@ JPEG2000 lossy quality maps to the OpenJPEG compression ratio
 `1 + floor((100 - quality) / 2)`. Its lossy mode remains irreversible at quality
 100; use lossless mode for exact values.
 
-Enable/disable pairs use the last supplied switch. Per-format modes override
+Enable/disable pairs use the last supplied switch. `-all` enables all five
+formats at that position, so `-all -no-jpg` saves everything except JPEG,
+while `-no-jpg -all` saves all five. Per-format modes override
 the shared mode regardless of order. At least one output must be enabled
 unless `--analyze` is used. Disabled outputs are neither checked nor overwritten.
 `additional_formats` in reports records depth, mode, lossy quality, measured DR
