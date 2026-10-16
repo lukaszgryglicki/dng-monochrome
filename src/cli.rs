@@ -31,7 +31,8 @@ use walkdir::WalkDir;
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
         true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
         maximum lossless compression; only PNG is saved by default. --jpg restores the original \
-        8-bit JPEG companion. --all enables all five formats. HEIC/AVIF use 8/10/12 bits; \
+        8-bit JPEG companion. --all enables all five formats; --none disables them before \
+        selecting individual formats. HEIC/AVIF use 8/10/12 bits; \
         JPEG2000 uses 8-16 bits (1-16 with --j2k-allow-low-bits), automatically selected \
         from the existing noise-measured DR, capped at the codec maximum. \
         New formats default to lossless compression of the selected-depth samples and share the \
@@ -332,6 +333,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "debug",
         "silent",
         "all",
+        "none",
         "png",
         "no-png",
         "jpg",
@@ -372,6 +374,19 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                     .into_iter()
                     .map(OsString::from)
                     .collect();
+            }
+            if matches!(text, "-none" | "--none") {
+                return [
+                    "--none",
+                    "--no-jpg",
+                    "--no-png",
+                    "--no-heic",
+                    "--no-avif",
+                    "--no-j2k",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
             }
             let name = text.trim_start_matches('-').split('=').next().unwrap_or("");
             let known_value = VALUES.contains(&name) || name.starts_with("param-");

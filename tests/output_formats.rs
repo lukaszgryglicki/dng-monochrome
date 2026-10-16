@@ -340,6 +340,103 @@ fn all_formats_shortcut_preserves_switch_order_and_argument_boundaries() {
 }
 
 #[test]
+fn none_shortcut_preserves_switch_order_and_argument_boundaries() {
+    let all_formats = [
+        Format::Png,
+        Format::Jpeg,
+        Format::Heic,
+        Format::Avif,
+        Format::J2k,
+    ];
+    for none in ["-none", "--none"] {
+        assert!(parse(&[none]).is_err());
+        assert!(
+            parse(&["-analyze", none])
+                .unwrap()
+                .formats
+                .enabled()
+                .is_empty()
+        );
+        for all in ["-all", "--all"] {
+            assert_eq!(parse(&[none, all]).unwrap().formats.enabled(), all_formats);
+            assert!(
+                parse(&["-analyze", all, none])
+                    .unwrap()
+                    .formats
+                    .enabled()
+                    .is_empty()
+            );
+        }
+        for (enable, disable, format) in [
+            ("-png", "--no-png", Format::Png),
+            ("--jpeg", "-no-jpg", Format::Jpeg),
+            ("-heic", "--no-heic", Format::Heic),
+            ("--avif", "-no-avif", Format::Avif),
+            ("-j2k", "--no-j2k", Format::J2k),
+        ] {
+            assert_eq!(parse(&[none, enable]).unwrap().formats.enabled(), [format]);
+            assert!(
+                parse(&["-analyze", enable, none])
+                    .unwrap()
+                    .formats
+                    .enabled()
+                    .is_empty()
+            );
+            assert!(
+                parse(&["-analyze", disable, none, none])
+                    .unwrap()
+                    .formats
+                    .enabled()
+                    .is_empty()
+            );
+            assert!(
+                parse(&["-analyze", none, disable])
+                    .unwrap()
+                    .formats
+                    .enabled()
+                    .is_empty()
+            );
+        }
+        let positional = parse(&["--", none]).unwrap();
+        assert_eq!(positional.formats.enabled(), [Format::Png]);
+        assert_eq!(positional.inputs.last().unwrap(), Path::new(none));
+        let value = parse(&["-func", none]).unwrap();
+        assert_eq!(value.function.as_deref(), Some(none));
+        assert_eq!(value.formats.enabled(), [Format::Png]);
+    }
+    assert!(parse(&["--none=true"]).is_err());
+}
+
+#[test]
+fn none_then_one_format_writes_only_that_format_and_matches_explicit_switches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("single.dng");
+    common::Dng::ramp(16, 8).write(&input);
+    let before = fs::read(&input).unwrap();
+    for (flag, extension) in [("-j2k", "jp2"), ("--jpg", "jpg"), ("-png", "png")] {
+        let explicit = tmp.path().join(format!("explicit-{extension}"));
+        let shortcut = tmp.path().join(format!("shortcut-{extension}"));
+        let options = if extension == "png" {
+            vec!["-png", "-silent"]
+        } else {
+            vec!["-no-png", flag, "-silent"]
+        };
+        success(run(&input, &explicit, &options));
+        success(run(&input, &shortcut, &["-all", "--none", flag, "-silent"]));
+        assert_eq!(fs::read_dir(&shortcut).unwrap().count(), 1);
+        assert_eq!(
+            fs::read(shortcut.join(format!("single.{extension}"))).unwrap(),
+            fs::read(explicit.join(format!("single.{extension}"))).unwrap()
+        );
+    }
+    let empty = tmp.path().join("empty");
+    let output = run(&input, &empty, &["-none"]);
+    assert!(!output.status.success());
+    assert!(!empty.exists());
+    assert_eq!(fs::read(input).unwrap(), before);
+}
+
+#[test]
 fn jpeg2000_sub_eight_bit_precision_requires_explicit_opt_in() {
     for flag in ["-j2k-allow-low-bits", "--j2k-allow-low-bits"] {
         for mode in ["-lossless", "-lossy"] {

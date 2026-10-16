@@ -232,6 +232,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `DNG_OR_DIRECTORY ...` | One or more monochrome DNG files or recursively searched directories |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k`; later format switches override |
+| `--none` | Disable all five formats before selecting individual ones, e.g. `-none -j2k` |
 | `--png`, `--no-png` | Enable/disable 16-bit PNG; **enabled by default** |
 | `--jpg`, `--no-jpg` | Enable/disable original 8-bit JPEG; default off; aliases `--jpeg`, `--no-jpeg` |
 | `--heic`, `--no-heic` | Enable/disable HEIC; default off |
@@ -313,7 +314,8 @@ JPEG2000 lossy quality maps to the OpenJPEG compression ratio
 
 Enable/disable pairs use the last supplied switch. `-all` enables all five
 formats at that position, so `-all -no-jpg` saves everything except JPEG,
-while `-no-jpg -all` saves all five. Per-format modes override
+while `-no-jpg -all` saves all five. `-none` disables all five at its position;
+`-none -j2k` saves only JPEG2000. Per-format modes override
 the shared mode regardless of order. At least one output must be enabled
 unless `--analyze` is used. Disabled outputs are neither checked nor overwritten.
 `additional_formats` in reports records depth, mode, lossy quality, measured DR

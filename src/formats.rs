@@ -49,17 +49,23 @@ pub enum Compression {
 pub struct OutputOptions {
     #[arg(
         long,
-        overrides_with = "all",
+        overrides_with_all = ["all", "none"],
         help = "Shortcut for --jpg --png --heic --avif --j2k; later format switches override"
     )]
     pub all: bool,
+    #[arg(
+        long,
+        overrides_with_all = ["all", "none"],
+        help = "Disable all output formats; re-enable the desired formats afterward"
+    )]
+    pub none: bool,
     #[arg(
         long,
         overrides_with_all = ["no_png", "png"],
         help = "Save 16-bit grayscale PNG (default)"
     )]
     pub png: bool,
-    #[arg(long, overrides_with = "png", help = "Do not save PNG")]
+    #[arg(long, overrides_with_all = ["png", "no_png"], help = "Do not save PNG")]
     pub no_png: bool,
     #[arg(
         long,
@@ -71,7 +77,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         visible_alias = "no-jpeg",
-        overrides_with = "jpg",
+        overrides_with_all = ["jpg", "no_jpg"],
         help = "Do not save JPEG (default)"
     )]
     pub no_jpg: bool,
@@ -81,7 +87,7 @@ pub struct OutputOptions {
         help = "Save monochrome HEIC using x265 at maximum effort"
     )]
     pub heic: bool,
-    #[arg(long, overrides_with = "heic", help = "Do not save HEIC (default)")]
+    #[arg(long, overrides_with_all = ["heic", "no_heic"], help = "Do not save HEIC (default)")]
     pub no_heic: bool,
     #[arg(
         long,
@@ -89,7 +95,7 @@ pub struct OutputOptions {
         help = "Save monochrome AVIF using libaom at maximum effort"
     )]
     pub avif: bool,
-    #[arg(long, overrides_with = "avif", help = "Do not save AVIF (default)")]
+    #[arg(long, overrides_with_all = ["avif", "no_avif"], help = "Do not save AVIF (default)")]
     pub no_avif: bool,
     #[arg(
         long,
@@ -97,7 +103,7 @@ pub struct OutputOptions {
         help = "Save grayscale JPEG2000 in a .jp2 container"
     )]
     pub j2k: bool,
-    #[arg(long, overrides_with = "j2k", help = "Do not save JPEG2000 (default)")]
+    #[arg(long, overrides_with_all = ["j2k", "no_j2k"], help = "Do not save JPEG2000 (default)")]
     pub no_j2k: bool,
     #[arg(
         long,
@@ -149,7 +155,7 @@ pub struct OutputOptions {
 impl OutputOptions {
     pub fn enabled(&self) -> Vec<Format> {
         [
-            (Format::Png, self.png || !self.no_png),
+            (Format::Png, self.png || (!self.no_png && !self.none)),
             (Format::Jpeg, (self.all || self.jpg) && !self.no_jpg),
             (Format::Heic, (self.all || self.heic) && !self.no_heic),
             (Format::Avif, (self.all || self.avif) && !self.no_avif),
