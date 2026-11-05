@@ -1,7 +1,7 @@
 # dng-monochrome
 
 Develop monochrome Leica DNG photographs into **16-bit grayscale PNG**, with
-optional **JPEG, HEIC, AVIF and JPEG2000**, without demosaicing or reducing the
+optional **JPEG, HEIC, AVIF, JPEG2000 and JPEG XL**, without demosaicing or reducing the
 raw image to an embedded preview.
 
 PNG is always lossless, grayscale, 16 bits per pixel, and encoded at the
@@ -18,10 +18,10 @@ exposure time and the recorded aperture/lens metadata.
 
 ## Build
 
-Rust 1.89 or newer, C/C++ compilers, CMake 3.22+, `pkg-config`, and x265, libaom and
+Rust 1.89 or newer, C/C++ compilers, libclang, CMake 3.22+, Ninja, `pkg-config`, and x265, libaom and
 libde265 development files are required. The DNG decoder, math parser,
 processing, PNG encoder, and JPEG encoder are Rust code. HEIC/AVIF use libheif
-with x265/libaom; JPEG2000 uses OpenJPEG. All encoding is in-process: no LibRaw,
+with x265/libaom; JPEG2000 uses OpenJPEG and JPEG XL uses libjxl. All encoding is in-process: no LibRaw,
 dcraw, ImageMagick, or external image-conversion process is required.
 
 Start with the explicit setup target, then build/install:
@@ -53,8 +53,10 @@ Build targets check prerequisites before compiling. Missing dependencies name
 the problem and tell you to run `make requirements`; ordinary `make install`
 does not install packages or download a toolchain.
 
-The default `bundled-heif` feature compiles packaged libheif source; OpenJPEG is
-also built from its packaged source. Neither replaces a system library.
+The default `bundled-heif` feature compiles packaged libheif source; OpenJPEG and
+libjxl are also built from their packaged sources. None replaces a system library.
+The JPEG XL bindings use Clang/libclang at build time (provided by the native Clang
+toolchain on FreeBSD/macOS, or `clang` and `libclang-dev` on Debian/Ubuntu).
 To use a system libheif >=1.19 instead, build with `--no-default-features`;
 it must supply x265 and AOM encoders supporting 8/10/12-bit monochrome images.
 Normal builds retain HEIF decoders for round-trip tests. Missing encoders are
@@ -231,17 +233,19 @@ The documented `--long` options also accept `-long`, including `-help`,
 | --- | --- |
 | `DNG_OR_DIRECTORY ...` | One or more monochrome DNG files or recursively searched directories |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
-| `--all` | Shortcut for `--jpg --png --heic --avif --j2k`; later format switches override |
-| `--none` | Disable all five formats before selecting individual ones, e.g. `-none -j2k` |
+| `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
+| `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |
 | `--png`, `--no-png` | Enable/disable 16-bit PNG; **enabled by default** |
 | `--jpg`, `--no-jpg` | Enable/disable original 8-bit JPEG; default off; aliases `--jpeg`, `--no-jpeg` |
 | `--heic`, `--no-heic` | Enable/disable HEIC; default off |
 | `--avif`, `--no-avif` | Enable/disable AVIF; default off |
 | `--j2k`, `--no-j2k` | Enable/disable JPEG2000 in a `.jp2` container; default off |
 | `--j2k-allow-low-bits` | Permit automatic JPEG2000 depth below 8 bits; default minimum **8** |
-| `--lossless`, `--lossy` | Compression for HEIC/AVIF/JPEG2000; default **lossless**; no effect on PNG/JPEG |
-| `--heic-mode`, `--avif-mode`, `--j2k-mode` | `lossless` or `lossy`; per-format override of the shared mode |
-| `--heic-quality`, `--avif-quality`, `--j2k-quality` | Lossy quality `1..100`, each default **90**; ignored in lossless mode |
+| `--jxl`, `--no-jxl` | Enable/disable grayscale JPEG XL in a `.jxl` container; default off |
+| `--jxl-allow-low-bits` | Permit automatic JPEG XL depth below 8 bits; default minimum **8** |
+| `--lossless`, `--lossy` | Compression for HEIC/AVIF/JPEG2000/JPEG XL; default **lossless**; no effect on PNG/JPEG |
+| `--heic-mode`, `--avif-mode`, `--j2k-mode`, `--jxl-mode` | `lossless` or `lossy`; per-format override of the shared mode |
+| `--heic-quality`, `--avif-quality`, `--j2k-quality`, `--jxl-quality` | Lossy quality `1..100`, each default **90**; ignored in lossless mode |
 | `--dark PERCENT` | Override darkest-pixel clipping; automatic if omitted |
 | `--light PERCENT` | Override lightest-pixel clipping; automatic if omitted |
 | `--clip-strength 1..9` | Automatic clipping strength; default **3**. Level 1 is conservative; level 9 aims around 1-2% per end |
@@ -254,7 +258,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--no-optimize` | Skip photographic optimization; retain range selection and any custom function |
 | `--both` | Generate unoptimized `auto/` and optimized `best/` versions; conflicts with explicit optimization toggles |
 | `--transfer srgb\|linear` | Set PNG/master and JPEG transfers; unspecified means the separate defaults below |
-| `--png-transfer srgb\|linear` | PNG/master and HEIC/AVIF/JPEG2000 transfer, default **`linear`**; overrides `--transfer` even with `--no-png` |
+| `--png-transfer srgb\|linear` | PNG/master and HEIC/AVIF/JPEG2000/JPEG XL transfer, default **`linear`**; overrides `--transfer` even with `--no-png` |
 | `--jpeg-transfer srgb\|linear` | JPEG encoding, default **`linear`**; alias `--jpg-transfer`; overrides `--transfer` |
 | `--jpeg-quality 1..100` | JPEG quality; default `90`; alias `--jpg-quality` |
 | `--threads 0..256` | Total processing-worker budget shared across files; `0` detects available hardware parallelism |
@@ -279,7 +283,7 @@ override their own end, irrespective of clipping strength.
 No lower PNG compression or bit-depth option exists. Maximum compression can
 cost noticeably more CPU time on large, noisy images.
 
-### HEIC, AVIF and JPEG2000 precision
+### HEIC, AVIF, JPEG2000 and JPEG XL precision
 
 Each enabled new format uses the **lowest supported sample bit depth covering
 the existing noise-measured SNR-1 DR estimate**. This is not a bitrate target or
@@ -290,6 +294,10 @@ the DNG container depth.
 | HEIC / x265 | 8, 10, 12 bits | `placebo`, complexity 100 |
 | AVIF / libaom | 8, 10, 12 bits | speed 0 |
 | JPEG2000 / OpenJPEG | 8 through 16 bits; 1 through 16 with `--j2k-allow-low-bits` | Maximum useful wavelet decomposition; reversible transform/rate 0 for lossless |
+| JPEG XL / libjxl | 8 through 16 bits; 1 through 16 with `--jxl-allow-low-bits` | Effort 10 (`glacier`) |
+
+JPEG XL quality 100 uses libjxl's smallest nonzero distance in lossy mode;
+select lossless mode for exact selected-depth samples.
 
 HEIC images larger than 2048 pixels on either axis use a standard image grid
 with tiles no larger than 2048x2048. This keeps high-resolution, noisy images
@@ -299,7 +307,7 @@ uses the same maximum compression effort.
 
 If DR exceeds a codec's limit, use its maximum depth and warn. If the estimate
 is unavailable, also use maximum depth with a warning. Ordinary interoperable
-x265/AOM output does not provide 14/16-bit HEIC/AVIF; JPEG2000 can retain those
+x265/AOM output does not provide 14/16-bit HEIC/AVIF; JPEG2000 and JPEG XL can retain those
 depths. PNG remains 16-bit and JPEG remains 8-bit regardless of the estimate.
 
 All new images derive from the unchanged developed 16-bit PNG master, including
@@ -311,10 +319,12 @@ setting, and maximum effort can be very slow on large photographs.
 JPEG2000 lossy quality maps to the OpenJPEG compression ratio
 `1 + floor((100 - quality) / 2)`. Its lossy mode remains irreversible at quality
 100; use lossless mode for exact values.
+JPEG XL quality uses libjxl's standard quality-to-distance mapping; use its
+lossless mode for guaranteed exact selected-depth samples.
 
-Enable/disable pairs use the last supplied switch. `-all` enables all five
+Enable/disable pairs use the last supplied switch. `-all` enables all six
 formats at that position, so `-all -no-jpg` saves everything except JPEG,
-while `-no-jpg -all` saves all five. `-none` disables all five at its position;
+while `-no-jpg -all` saves all six. `-none` disables all six at its position;
 `-none -j2k` saves only JPEG2000. Per-format modes override
 the shared mode regardless of order. At least one output must be enabled
 unless `--analyze` is used. Disabled outputs are neither checked nor overwritten.

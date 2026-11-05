@@ -4,6 +4,7 @@ use crate::{
     tone::Transfer,
 };
 use anyhow::{Context, Result, ensure};
+use jxl_sys as jxl;
 use libheif_sys as heif;
 use openjpeg_sys as jp2;
 use rayon::prelude::*;
@@ -18,6 +19,16 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 use tempfile::NamedTempFile;
+
+// jxl-sys supplies the C++ runtime link on Linux/macOS, but not FreeBSD.
+#[cfg(target_os = "freebsd")]
+#[link(name = "c++")]
+unsafe extern "C" {}
+
+// Resolve C++ symbols before jxl-sys's unconditional shared-runtime link.
+#[cfg(all(target_env = "musl", target_feature = "crt-static"))]
+#[link(name = "stdc++", kind = "static", modifiers = "+whole-archive,-bundle")]
+unsafe extern "C" {}
 
 pub(super) fn encode(
     parent: &Path,
@@ -35,7 +46,7 @@ pub(super) fn encode(
     );
     let valid_depth = match encoding.format {
         Format::Heic | Format::Avif => [8, 10, 12].contains(&encoding.bits),
-        Format::J2k => (1..=16).contains(&encoding.bits),
+        Format::J2k | Format::Jxl => (1..=16).contains(&encoding.bits),
         Format::Png | Format::Jpeg => false,
     };
     ensure!(
@@ -70,6 +81,17 @@ pub(super) fn encode(
             let warnings = encode_jp2(file.as_file_mut(), metadata, pixels, encoding)?;
             append_jp2_exif(file.as_file_mut(), exif)?;
             warnings
+        }
+        Format::Jxl => {
+            encode_jxl(
+                file.as_file_mut(),
+                metadata,
+                pixels,
+                transfer,
+                exif,
+                encoding,
+            )?;
+            Vec::new()
         }
         Format::Png | Format::Jpeg => unreachable!(),
     };
@@ -634,6 +656,178 @@ fn encode_jp2(
         .into_inner()
         .map_err(|_| anyhow::anyhow!("JPEG2000 diagnostic callback panicked"))?
         .warnings)
+}
+
+fn encode_jxl(
+    file: &mut File,
+    metadata: &SensorMetadata,
+    pixels: &[u16],
+    transfer: Transfer,
+    exif: &[u8],
+    encoding: &Encoding,
+) -> Result<()> {
+    let width = u32::try_from(metadata.width).context("JPEG XL width exceeds its codec limit")?;
+    let height =
+        u32::try_from(metadata.height).context("JPEG XL height exceeds its codec limit")?;
+    // FROM_CODESTREAM requires byte storage for 1-8-bit input, not u16 storage.
+    let samples8: Vec<u8> = if encoding.bits <= 8 {
+        pixels
+            .par_iter()
+            .map(|&value| quantize(value, encoding.bits) as u8)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let samples16: Vec<u16> = if encoding.bits > 8 {
+        pixels
+            .par_iter()
+            .map(|&value| quantize(value, encoding.bits))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let (data_type, data, size) = if encoding.bits <= 8 {
+        (
+            jxl::JxlDataType::JXL_TYPE_UINT8,
+            samples8.as_ptr().cast(),
+            samples8.len(),
+        )
+    } else {
+        (
+            jxl::JxlDataType::JXL_TYPE_UINT16,
+            samples16.as_ptr().cast(),
+            std::mem::size_of_val(samples16.as_slice()),
+        )
+    };
+    let mut metadata_box = vec![0; 4];
+    metadata_box.extend_from_slice(exif);
+    unsafe {
+        let runner = Owned::new(
+            jxl::JxlThreadParallelRunnerCreate(
+                ptr::null(),
+                rayon::current_num_threads().saturating_sub(1),
+            ),
+            jxl::JxlThreadParallelRunnerDestroy,
+            "JPEG XL worker pool",
+        )?;
+        let encoder = Owned::new(
+            jxl::JxlEncoderCreate(ptr::null()),
+            jxl::JxlEncoderDestroy,
+            "JPEG XL encoder",
+        )?;
+        let check = |status, operation| -> Result<()> {
+            ensure!(
+                status == jxl::JxlEncoderStatus::JXL_ENC_SUCCESS,
+                "JPEG XL {operation}: {:?}",
+                jxl::JxlEncoderGetError(encoder.as_ptr())
+            );
+            Ok(())
+        };
+        check(
+            jxl::JxlEncoderSetParallelRunner(
+                encoder.as_ptr(),
+                Some(jxl::JxlThreadParallelRunner),
+                runner.as_ptr(),
+            ),
+            "configuring worker budget",
+        )?;
+        check(
+            jxl::JxlEncoderUseBoxes(encoder.as_ptr()),
+            "enabling metadata",
+        )?;
+        let mut info = MaybeUninit::uninit();
+        jxl::JxlEncoderInitBasicInfo(info.as_mut_ptr());
+        let mut info = info.assume_init();
+        info.xsize = width;
+        info.ysize = height;
+        info.bits_per_sample = u32::from(encoding.bits);
+        info.num_color_channels = 1;
+        info.uses_original_profile = i32::from(encoding.compression == Compression::Lossless);
+        check(
+            jxl::JxlEncoderSetBasicInfo(encoder.as_ptr(), &info),
+            "setting image layout",
+        )?;
+        let mut color = MaybeUninit::uninit();
+        match transfer {
+            Transfer::Linear => jxl::JxlColorEncodingSetToLinearSRGB(color.as_mut_ptr(), 1),
+            Transfer::Srgb => jxl::JxlColorEncodingSetToSRGB(color.as_mut_ptr(), 1),
+        }
+        check(
+            jxl::JxlEncoderSetColorEncoding(encoder.as_ptr(), color.as_ptr()),
+            "setting transfer",
+        )?;
+        let settings = NonNull::new(jxl::JxlEncoderFrameSettingsCreate(
+            encoder.as_ptr(),
+            ptr::null(),
+        ))
+        .context("allocating JPEG XL frame settings")?;
+        check(
+            jxl::JxlEncoderFrameSettingsSetOption(
+                settings.as_ptr(),
+                jxl::JxlEncoderFrameSettingId::JXL_ENC_FRAME_SETTING_EFFORT,
+                10,
+            ),
+            "setting compression effort",
+        )?;
+        check(
+            jxl::JxlEncoderSetFrameLossless(settings.as_ptr(), info.uses_original_profile),
+            "setting compression mode",
+        )?;
+        if let Some(quality) = encoding.quality {
+            // Keep quality 100 lossy; libjxl clamps tiny positive distances to its minimum.
+            let distance =
+                jxl::JxlEncoderDistanceFromQuality(f32::from(quality)).max(f32::MIN_POSITIVE);
+            check(
+                jxl::JxlEncoderSetFrameDistance(settings.as_ptr(), distance),
+                "setting lossy quality",
+            )?;
+        }
+        let depth = jxl::JxlBitDepth {
+            type_: jxl::JxlBitDepthType::JXL_BIT_DEPTH_FROM_CODESTREAM,
+            ..Default::default()
+        };
+        check(
+            jxl::JxlEncoderSetFrameBitDepth(settings.as_ptr(), &depth),
+            "preserving selected-depth sample codes",
+        )?;
+        check(
+            jxl::JxlEncoderAddBox(
+                encoder.as_ptr(),
+                b"Exif".as_ptr().cast(),
+                metadata_box.as_ptr(),
+                metadata_box.len(),
+                1,
+            ),
+            "adding photographic EXIF",
+        )?;
+        let format = jxl::JxlPixelFormat {
+            num_channels: 1,
+            data_type,
+            endianness: jxl::JxlEndianness::JXL_NATIVE_ENDIAN,
+            align: 0,
+        };
+        check(
+            jxl::JxlEncoderAddImageFrame(settings.as_ptr(), &format, data, size),
+            "encoding pixels",
+        )?;
+        jxl::JxlEncoderCloseInput(encoder.as_ptr());
+        let mut buffer = [0; 65536];
+        loop {
+            let mut next = buffer.as_mut_ptr();
+            let mut available = buffer.len();
+            let status = jxl::JxlEncoderProcessOutput(encoder.as_ptr(), &mut next, &mut available);
+            let written = buffer.len() - available;
+            file.write_all(&buffer[..written])?;
+            if status == jxl::JxlEncoderStatus::JXL_ENC_SUCCESS {
+                break;
+            }
+            if status != jxl::JxlEncoderStatus::JXL_ENC_NEED_MORE_OUTPUT {
+                check(status, "writing codestream")?;
+            }
+            ensure!(written > 0, "JPEG XL encoder made no output progress");
+        }
+    }
+    Ok(())
 }
 
 fn append_jp2_exif(file: &mut File, exif: &[u8]) -> Result<()> {

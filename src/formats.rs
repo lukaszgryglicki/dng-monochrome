@@ -12,6 +12,7 @@ pub enum Format {
     Heic,
     Avif,
     J2k,
+    Jxl,
 }
 
 impl Format {
@@ -22,6 +23,7 @@ impl Format {
             Self::Heic => "heic",
             Self::Avif => "avif",
             Self::J2k => "jp2",
+            Self::Jxl => "jxl",
         }
     }
 }
@@ -34,6 +36,7 @@ impl fmt::Display for Format {
             Self::Heic => "HEIC",
             Self::Avif => "AVIF",
             Self::J2k => "JPEG2000",
+            Self::Jxl => "JPEG XL",
         })
     }
 }
@@ -50,7 +53,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["all", "none"],
-        help = "Shortcut for --jpg --png --heic --avif --j2k; later format switches override"
+        help = "Shortcut for --jpg --png --heic --avif --j2k --jxl; later format switches override"
     )]
     pub all: bool,
     #[arg(
@@ -110,17 +113,30 @@ pub struct OutputOptions {
         help = "Allow automatic JPEG2000 precision below 8 bits (down to 1); default minimum is 8"
     )]
     pub j2k_allow_low_bits: bool,
+    #[arg(
+        long,
+        overrides_with_all = ["no_jxl", "jxl"],
+        help = "Save grayscale JPEG XL in a .jxl container"
+    )]
+    pub jxl: bool,
+    #[arg(long, overrides_with_all = ["jxl", "no_jxl"], help = "Do not save JPEG XL (default)")]
+    pub no_jxl: bool,
+    #[arg(
+        long,
+        help = "Allow automatic JPEG XL precision below 8 bits (down to 1); default minimum is 8"
+    )]
+    pub jxl_allow_low_bits: bool,
 
     #[arg(
         long,
         overrides_with = "lossy",
-        help = "Use lossless HEIC/AVIF/JPEG2000 compression (default); PNG/JPEG unchanged"
+        help = "Use lossless HEIC/AVIF/JPEG2000/JPEG XL compression (default); PNG/JPEG unchanged"
     )]
     pub lossless: bool,
     #[arg(
         long,
         overrides_with = "lossless",
-        help = "Use lossy HEIC/AVIF/JPEG2000 compression; per-format modes override"
+        help = "Use lossy HEIC/AVIF/JPEG2000/JPEG XL compression; per-format modes override"
     )]
     pub lossy: bool,
     #[arg(
@@ -141,6 +157,12 @@ pub struct OutputOptions {
         help = "JPEG2000 compression; overrides --lossless/--lossy"
     )]
     pub j2k_mode: Option<Compression>,
+    #[arg(
+        long,
+        value_enum,
+        help = "JPEG XL compression; overrides --lossless/--lossy"
+    )]
+    pub jxl_mode: Option<Compression>,
     #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
         help = "HEIC lossy quality, 1-100; ignored in lossless mode")]
     pub heic_quality: u8,
@@ -150,6 +172,9 @@ pub struct OutputOptions {
     #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
         help = "JPEG2000 lossy quality, 1-100; ignored in lossless mode")]
     pub j2k_quality: u8,
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100),
+        help = "JPEG XL lossy quality, 1-100; ignored in lossless mode")]
+    pub jxl_quality: u8,
 }
 
 impl OutputOptions {
@@ -160,6 +185,7 @@ impl OutputOptions {
             (Format::Heic, (self.all || self.heic) && !self.no_heic),
             (Format::Avif, (self.all || self.avif) && !self.no_avif),
             (Format::J2k, (self.all || self.j2k) && !self.no_j2k),
+            (Format::Jxl, (self.all || self.jxl) && !self.no_jxl),
         ]
         .into_iter()
         .filter_map(|(format, enabled)| enabled.then_some(format))
@@ -169,7 +195,7 @@ impl OutputOptions {
     pub fn validate(&self, analyze: bool) -> Result<()> {
         ensure!(
             analyze || !self.enabled().is_empty(),
-            "at least one output format must be enabled (--png, --jpg, --heic, --avif or --j2k)"
+            "at least one output format must be enabled (--png, --jpg, --heic, --avif, --j2k or --jxl)"
         );
         Ok(())
     }
@@ -188,11 +214,14 @@ impl OutputOptions {
                     Format::Heic => (self.heic_mode, self.heic_quality),
                     Format::Avif => (self.avif_mode, self.avif_quality),
                     Format::J2k => (self.j2k_mode, self.j2k_quality),
+                    Format::Jxl => (self.jxl_mode, self.jxl_quality),
                     Format::Png | Format::Jpeg => unreachable!(),
                 };
                 let mut encoding =
                     Encoding::new(format, measured_dr, mode.unwrap_or(default), quality)?;
-                if format == Format::J2k && !self.j2k_allow_low_bits {
+                if (format == Format::J2k && !self.j2k_allow_low_bits)
+                    || (format == Format::Jxl && !self.jxl_allow_low_bits)
+                {
                     encoding.bits = encoding.bits.max(8);
                 }
                 Ok(encoding)
@@ -246,7 +275,7 @@ impl Encoding {
         );
         let supported: &[u8] = match format {
             Format::Heic | Format::Avif => &[8, 10, 12],
-            Format::J2k => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            Format::J2k | Format::Jxl => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             Format::Png | Format::Jpeg => {
                 anyhow::bail!("PNG/JPEG retain their fixed legacy precision")
             }

@@ -129,6 +129,35 @@ struct Decoded {
 
 fn decode(path: &Path, format: Format) -> Decoded {
     let bytes = fs::read(path).unwrap();
+    if format == Format::Jxl {
+        let image = jxl_oxide::JxlImage::builder()
+            .pool(jxl_oxide::JxlThreadPool::none())
+            .read(bytes.as_slice())
+            .unwrap();
+        assert!(image.pixel_format().is_grayscale());
+        assert!(!image.pixel_format().has_alpha());
+        let bits = image.image_header().metadata.bit_depth.bits_per_sample() as u8;
+        let render = image.render_frame(0).unwrap();
+        let mut stream = render.stream();
+        let mut pixels = vec![0u16; (image.width() * image.height()) as usize];
+        assert_eq!(stream.write_to_buffer(&mut pixels), pixels.len());
+        let pixels = quantized(&pixels, bits);
+        let exif = image
+            .aux_boxes()
+            .first_exif()
+            .unwrap()
+            .unwrap()
+            .payload()
+            .to_vec();
+        return Decoded {
+            width: image.width(),
+            height: image.height(),
+            bits,
+            pixels,
+            exif,
+            transfer: image.rendered_cicp().map(|cicp| u16::from(cicp[1])),
+        };
+    }
     if format == Format::J2k {
         let image =
             jpeg2k::Image::from_bytes_with(&bytes, jpeg2k::DecodeParameters::new().strict(true))
@@ -264,10 +293,10 @@ fn flags_are_independent_support_both_dash_styles_and_last_switch_wins() {
         parse(&["-jpg"]).unwrap().formats.enabled(),
         [Format::Png, Format::Jpeg]
     );
-    let all = parse(&["-no-png", "-heic", "--avif", "-j2k"]).unwrap();
+    let all = parse(&["-no-png", "-heic", "--avif", "-j2k", "-jxl"]).unwrap();
     assert_eq!(
         all.formats.enabled(),
-        [Format::Heic, Format::Avif, Format::J2k]
+        [Format::Heic, Format::Avif, Format::J2k, Format::Jxl]
     );
     let encodings = all.formats.encodings(Some(9.25)).unwrap();
     assert!(
@@ -277,7 +306,7 @@ fn flags_are_independent_support_both_dash_styles_and_last_switch_wins() {
     );
     assert_eq!(
         encodings.iter().map(|e| e.bits).collect::<Vec<_>>(),
-        [10, 10, 10]
+        [10, 10, 10, 10]
     );
     for (enable, disable, format) in [
         ("-png", "--no-png", Format::Png),
@@ -285,6 +314,7 @@ fn flags_are_independent_support_both_dash_styles_and_last_switch_wins() {
         ("-heic", "--no-heic", Format::Heic),
         ("--avif", "-no-avif", Format::Avif),
         ("-j2k", "--no-j2k", Format::J2k),
+        ("--jxl", "-no-jxl", Format::Jxl),
     ] {
         let disabled = parse(&["--analyze", enable, disable]).unwrap();
         assert!(!disabled.formats.enabled().contains(&format));
@@ -303,6 +333,7 @@ fn all_formats_shortcut_preserves_switch_order_and_argument_boundaries() {
         Format::Heic,
         Format::Avif,
         Format::J2k,
+        Format::Jxl,
     ];
     for all in ["-all", "--all"] {
         assert_eq!(parse(&[all]).unwrap().formats.enabled(), formats);
@@ -312,6 +343,7 @@ fn all_formats_shortcut_preserves_switch_order_and_argument_boundaries() {
             ("--heic", "-no-heic", Format::Heic),
             ("-avif", "--no-avif", Format::Avif),
             ("--j2k", "-no-j2k", Format::J2k),
+            ("-jxl", "--no-jxl", Format::Jxl),
         ] {
             assert_eq!(parse(&[disable, all]).unwrap().formats.enabled(), formats);
             let disabled = parse(&[all, disable]).unwrap().formats.enabled();
@@ -347,6 +379,7 @@ fn none_shortcut_preserves_switch_order_and_argument_boundaries() {
         Format::Heic,
         Format::Avif,
         Format::J2k,
+        Format::Jxl,
     ];
     for none in ["-none", "--none"] {
         assert!(parse(&[none]).is_err());
@@ -373,6 +406,7 @@ fn none_shortcut_preserves_switch_order_and_argument_boundaries() {
             ("-heic", "--no-heic", Format::Heic),
             ("--avif", "-no-avif", Format::Avif),
             ("-j2k", "--no-j2k", Format::J2k),
+            ("--jxl", "-no-jxl", Format::Jxl),
         ] {
             assert_eq!(parse(&[none, enable]).unwrap().formats.enabled(), [format]);
             assert!(
@@ -413,7 +447,12 @@ fn none_then_one_format_writes_only_that_format_and_matches_explicit_switches() 
     let input = tmp.path().join("single.dng");
     common::Dng::ramp(16, 8).write(&input);
     let before = fs::read(&input).unwrap();
-    for (flag, extension) in [("-j2k", "jp2"), ("--jpg", "jpg"), ("-png", "png")] {
+    for (flag, extension) in [
+        ("-j2k", "jp2"),
+        ("--jxl", "jxl"),
+        ("--jpg", "jpg"),
+        ("-png", "png"),
+    ] {
         let explicit = tmp.path().join(format!("explicit-{extension}"));
         let shortcut = tmp.path().join(format!("shortcut-{extension}"));
         let options = if extension == "png" {
@@ -437,37 +476,40 @@ fn none_then_one_format_writes_only_that_format_and_matches_explicit_switches() 
 }
 
 #[test]
-fn jpeg2000_sub_eight_bit_precision_requires_explicit_opt_in() {
-    for flag in ["-j2k-allow-low-bits", "--j2k-allow-low-bits"] {
-        for mode in ["-lossless", "-lossy"] {
-            let normal = parse(&["-j2k", mode]).unwrap();
-            let allowed = parse(&["-j2k", mode, flag]).unwrap();
-            for dr in [0.0, 0.99, 1.0, 1.01, 6.2, 7.0, 7.01, 8.0, 8.01, 15.9, 17.0] {
-                let normal = normal.formats.encodings(Some(dr)).unwrap();
-                let allowed = allowed.formats.encodings(Some(dr)).unwrap();
-                assert_eq!(normal[0].bits, (dr.ceil() as u8).clamp(8, 16));
-                assert_eq!(allowed[0].bits, (dr.ceil() as u8).clamp(1, 16));
-                assert_eq!(normal[0].measured_dr, Some(dr));
-                assert_eq!(allowed[0].measured_dr, Some(dr));
-                assert_eq!(normal[0].depth_capped, allowed[0].depth_capped);
+fn jpeg2000_and_jpegxl_sub_eight_bit_precision_requires_explicit_opt_in() {
+    for (enable, other) in [("-j2k", "-jxl"), ("-jxl", "-j2k")] {
+        for prefix in ["", "-"] {
+            let flag = format!("{prefix}{enable}-allow-low-bits");
+            for mode in ["-lossless", "-lossy"] {
+                let normal = parse(&[enable, mode]).unwrap();
+                let allowed = parse(&[enable, mode, &flag]).unwrap();
+                for dr in [0.0, 0.99, 1.0, 1.01, 6.2, 7.0, 7.01, 8.0, 8.01, 15.9, 17.0] {
+                    let normal = normal.formats.encodings(Some(dr)).unwrap();
+                    let allowed = allowed.formats.encodings(Some(dr)).unwrap();
+                    assert_eq!(normal[0].bits, (dr.ceil() as u8).clamp(8, 16));
+                    assert_eq!(allowed[0].bits, (dr.ceil() as u8).clamp(1, 16));
+                    assert_eq!(normal[0].measured_dr, Some(dr));
+                    assert_eq!(allowed[0].measured_dr, Some(dr));
+                    assert_eq!(normal[0].depth_capped, allowed[0].depth_capped);
+                }
+                assert_eq!(normal.formats.encodings(None).unwrap()[0].bits, 16);
+                assert_eq!(allowed.formats.encodings(None).unwrap()[0].bits, 16);
             }
-            assert_eq!(normal.formats.encodings(None).unwrap()[0].bits, 16);
-            assert_eq!(allowed.formats.encodings(None).unwrap()[0].bits, 16);
+            let other_formats = parse(&["-heic", "-avif", other, &flag]).unwrap();
+            assert_eq!(
+                other_formats
+                    .formats
+                    .encodings(Some(2.0))
+                    .unwrap()
+                    .iter()
+                    .map(|encoding| encoding.bits)
+                    .collect::<Vec<_>>(),
+                [8, 8, 8]
+            );
+            assert_eq!(parse(&[&flag]).unwrap().formats.enabled(), [Format::Png]);
+            assert!(parse(&[&format!("{flag}=true")]).is_err());
         }
-        let other_formats = parse(&["-heic", "-avif", flag]).unwrap();
-        assert_eq!(
-            other_formats
-                .formats
-                .encodings(Some(2.0))
-                .unwrap()
-                .iter()
-                .map(|encoding| encoding.bits)
-                .collect::<Vec<_>>(),
-            [8, 8]
-        );
-        assert_eq!(parse(&[flag]).unwrap().formats.enabled(), [Format::Png]);
     }
-    assert!(parse(&["--j2k-allow-low-bits=true"]).is_err());
 }
 
 #[test]
@@ -484,11 +526,11 @@ fn all_formats_shortcut_matches_explicit_outputs_and_low_bits_reach_the_codec() 
         &input,
         &explicit,
         &[
-            "-jpg", "-png", "-heic", "-avif", "-j2k", "-report", "-silent",
+            "-jpg", "-png", "-heic", "-avif", "-j2k", "-jxl", "-report", "-silent",
         ],
     ));
     success(run(&input, &shortcut, &["-all", "-report", "-silent"]));
-    for extension in ["png", "jpg", "heic", "avif", "jp2", "json"] {
+    for extension in ["png", "jpg", "heic", "avif", "jp2", "jxl", "json"] {
         assert_eq!(
             fs::read(explicit.join(format!("profile.{extension}"))).unwrap(),
             fs::read(shortcut.join(format!("profile.{extension}"))).unwrap(),
@@ -503,6 +545,8 @@ fn all_formats_shortcut_matches_explicit_outputs_and_low_bits_reach_the_codec() 
     assert!(dr > 1.0 && dr <= 7.0, "{dr}");
     assert_eq!(decode(&shortcut.join("profile.jp2"), Format::J2k).bits, 8);
     assert_eq!(report["additional_formats"][2]["bits"], 8);
+    assert_eq!(decode(&shortcut.join("profile.jxl"), Format::Jxl).bits, 8);
+    assert_eq!(report["additional_formats"][3]["bits"], 8);
     let low = tmp.path().join("low");
     success(run(
         &input,
@@ -511,15 +555,19 @@ fn all_formats_shortcut_matches_explicit_outputs_and_low_bits_reach_the_codec() 
             "-no-png",
             "-j2k",
             "-j2k-allow-low-bits",
+            "-jxl",
+            "-jxl-allow-low-bits",
             "-report",
             "-silent",
         ],
     ));
     let bits = dr.ceil() as u8;
     assert_eq!(decode(&low.join("profile.jp2"), Format::J2k).bits, bits);
+    assert_eq!(decode(&low.join("profile.jxl"), Format::Jxl).bits, bits);
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(low.join("profile.json")).unwrap()).unwrap();
     assert_eq!(report["additional_formats"][0]["bits"], bits);
+    assert_eq!(report["additional_formats"][1]["bits"], bits);
     assert_eq!(fs::read(input).unwrap(), original);
 }
 
@@ -529,12 +577,15 @@ fn codec_modes_and_qualities_override_only_the_requested_format() {
         "-heic",
         "-avif",
         "-j2k",
+        "-jxl",
         "-lossy",
         "-avif-mode",
         "lossless",
         "-heic-quality=97",
         "--j2k-quality",
         "42",
+        "--jxl-quality",
+        "73",
     ])
     .unwrap();
     let encodings = cli.formats.encodings(Some(11.1)).unwrap();
@@ -542,6 +593,21 @@ fn codec_modes_and_qualities_override_only_the_requested_format() {
     assert_eq!(encodings[1].compression, Compression::Lossless);
     assert_eq!(encodings[1].quality, None);
     assert_eq!(encodings[2].quality, Some(42));
+    assert_eq!(encodings[3].quality, Some(73));
+    for flag in ["-jxl-mode", "--jxl-mode"] {
+        let cli = parse(&["-all", "-lossy", flag, "lossless"]).unwrap();
+        let encodings = cli.formats.encodings(None).unwrap();
+        assert!(
+            encodings[..3]
+                .iter()
+                .all(|e| e.compression == Compression::Lossy)
+        );
+        assert_eq!(encodings[3].compression, Compression::Lossless);
+        assert_eq!(encodings[3].quality, None);
+        let cli = parse(&["-jxl", "-lossless", flag, "lossy"]).unwrap();
+        assert_eq!(cli.formats.encodings(None).unwrap()[0].quality, Some(90));
+        assert!(parse(&[flag, "invalid"]).is_err());
+    }
     for (first, last, expected) in [
         ("-lossy", "--lossless", Compression::Lossless),
         ("-lossless", "--lossy", Compression::Lossy),
@@ -557,6 +623,8 @@ fn codec_modes_and_qualities_override_only_the_requested_format() {
         "-heic-quality",
         "--avif-quality",
         "-j2k-quality",
+        "--jxl-quality",
+        "-jxl-quality",
         "-jpg-quality",
     ] {
         for invalid in ["0", "101", "-1", "invalid"] {
@@ -572,7 +640,11 @@ fn lossless_codecs_preserve_every_selected_depth_sample_and_metadata() {
     let cases = [Format::Heic, Format::Avif]
         .into_iter()
         .flat_map(|format| [8, 10, 12].map(|bits| (format, bits)))
-        .chain((1..=16).map(|bits| (Format::J2k, bits)));
+        .chain(
+            [Format::J2k, Format::Jxl]
+                .into_iter()
+                .flat_map(|format| (1..=16).map(move |bits| (format, bits))),
+        );
     for (format, bits) in cases {
         let encoding =
             Encoding::new(format, Some(f64::from(bits)), Compression::Lossless, 90).unwrap();
@@ -623,7 +695,7 @@ fn odd_and_tiny_geometry_and_srgb_transfer_round_trip() {
         (129, 1),
     ] {
         let (image, rendered) = fixture(tmp.path(), width, height);
-        for format in [Format::Heic, Format::Avif, Format::J2k] {
+        for format in [Format::Heic, Format::Avif, Format::J2k, Format::Jxl] {
             let encoding = Encoding::new(format, Some(11.5), Compression::Lossless, 90).unwrap();
             let path = save(
                 &tmp.path().join(format!("{format}-{width}x{height}")),
@@ -706,6 +778,7 @@ fn lossy_quality_changes_compression_and_reconstruction_error() {
         (Format::Heic, 64, 64),
         (Format::Avif, 64, 64),
         (Format::J2k, 64, 64),
+        (Format::Jxl, 64, 64),
         (Format::Heic, 2049, 17),
     ] {
         let (image, mut rendered) = fixture(tmp.path(), width, height);
@@ -751,6 +824,48 @@ fn lossy_quality_changes_compression_and_reconstruction_error() {
 }
 
 #[test]
+fn jpegxl_lossy_encoding_accepts_low_and_full_precision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image, rendered) = fixture(tmp.path(), 32, 16);
+    for (bits, quality) in [
+        (1, 85),
+        (7, 85),
+        (8, 85),
+        (16, 85),
+        (8, 1),
+        (8, 100),
+        (16, 100),
+    ] {
+        let encoding = Encoding::new(
+            Format::Jxl,
+            Some(f64::from(bits)),
+            Compression::Lossy,
+            quality,
+        )
+        .unwrap();
+        let path = save(
+            &tmp.path().join(format!("lossy-{bits}-q{quality}")),
+            &image,
+            &rendered,
+            &encoding,
+            Transfer::Linear,
+        );
+        let decoded = decode(&path, Format::Jxl);
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.bits),
+            (32, 16, bits)
+        );
+        assert_eq!(decoded.pixels.len(), rendered.png.len());
+        assert!(
+            decoded
+                .pixels
+                .iter()
+                .all(|&sample| u32::from(sample) < 1u32 << bits)
+        );
+    }
+}
+
+#[test]
 fn cli_can_save_all_new_formats_without_png_and_reports_unknown_dr() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("photo.DNG");
@@ -759,7 +874,7 @@ fn cli_can_save_all_new_formats_without_png_and_reports_unknown_dr() {
     let result = success(run(
         &input,
         &out,
-        &["-no-png", "-heic", "-avif", "-j2k", "-report"],
+        &["-no-png", "-heic", "-avif", "-j2k", "-jxl", "-report"],
     ));
     assert!(!out.join("photo.png").exists());
     assert!(!out.join("photo.jpg").exists());
@@ -771,6 +886,7 @@ fn cli_can_save_all_new_formats_without_png_and_reports_unknown_dr() {
         (0, Format::Heic, 12),
         (1, Format::Avif, 12),
         (2, Format::J2k, 16),
+        (3, Format::Jxl, 16),
     ] {
         assert_eq!(
             decode(&out.join(format!("photo.{}", format.extension())), format).bits,
@@ -819,7 +935,7 @@ fn disabled_files_do_not_block_conversion_and_are_never_touched() {
     common::Dng::ramp(32, 16).write(&input);
     let out = tmp.path().join("out");
     fs::create_dir(&out).unwrap();
-    for extension in ["jpg", "heic", "avif", "jp2"] {
+    for extension in ["jpg", "heic", "avif", "jp2", "jxl"] {
         fs::write(
             out.join(format!("photo.{extension}")),
             b"keep disabled output",
@@ -829,9 +945,11 @@ fn disabled_files_do_not_block_conversion_and_are_never_touched() {
     success(run(
         &input,
         &out,
-        &["-no-jpg", "-no-heic", "-no-avif", "-no-j2k", "-silent"],
+        &[
+            "-no-jpg", "-no-heic", "-no-avif", "-no-j2k", "-no-jxl", "-silent",
+        ],
     ));
-    for extension in ["jpg", "heic", "avif", "jp2"] {
+    for extension in ["jpg", "heic", "avif", "jp2", "jxl"] {
         assert_eq!(
             fs::read(out.join(format!("photo.{extension}"))).unwrap(),
             b"keep disabled output"
@@ -847,7 +965,7 @@ fn new_format_collisions_are_preflighted_before_any_companion_is_written() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("photo.DNG");
     common::Dng::ramp(32, 16).write(&input);
-    for format in [Format::Heic, Format::Avif, Format::J2k] {
+    for format in [Format::Heic, Format::Avif, Format::J2k, Format::Jxl] {
         let out = tmp.path().join(format.extension());
         fs::create_dir(&out).unwrap();
         let existing = out.join(format!("photo.{}", format.extension()));
@@ -874,8 +992,9 @@ fn jpeg_limits_do_not_reject_png_or_jpeg2000_only_output() {
     let input = tmp.path().join("wide.DNG");
     common::Dng::ramp(65536, 1).write(&input);
     let out = tmp.path().join("wide");
-    success(run(&input, &out, &["-j2k", "-silent"]));
+    success(run(&input, &out, &["-j2k", "-jxl", "-silent"]));
     assert_eq!(decode(&out.join("wide.jp2"), Format::J2k).width, 65536);
+    assert_eq!(decode(&out.join("wide.jxl"), Format::Jxl).width, 65536);
     assert!(out.join("wide.png").exists());
     let rejected = tmp.path().join("jpeg");
     let result = run(&input, &rejected, &["-jpg"]);
@@ -887,9 +1006,13 @@ fn jpeg_limits_do_not_reject_png_or_jpeg2000_only_output() {
     dng.lens_model = "x".repeat(70000);
     dng.write(&input);
     let out = tmp.path().join("metadata");
-    success(run(&input, &out, &["-heic", "-avif", "-j2k", "-silent"]));
+    success(run(
+        &input,
+        &out,
+        &["-heic", "-avif", "-j2k", "-jxl", "-silent"],
+    ));
     assert!(out.join("large.png").exists());
-    for format in [Format::Heic, Format::Avif, Format::J2k] {
+    for format in [Format::Heic, Format::Avif, Format::J2k, Format::Jxl] {
         assert!(
             decode(&out.join(format!("large.{}", format.extension())), format)
                 .exif

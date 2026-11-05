@@ -26,14 +26,14 @@ use walkdir::WalkDir;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Develop monochrome DNGs into 16-bit PNG, with optional JPEG, HEIC, AVIF and JPEG2000.",
+    about = "Develop monochrome DNGs into 16-bit PNG, with optional JPEG, HEIC, AVIF, JPEG2000 and JPEG XL.",
     long_about = "Develop integer monochrome DNGs without demosaicing. Directories are searched recursively. \
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
         true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
         maximum lossless compression; only PNG is saved by default. --jpg restores the original \
-        8-bit JPEG companion. --all enables all five formats; --none disables them before \
+        8-bit JPEG companion. --all enables all six formats; --none disables them before \
         selecting individual formats. HEIC/AVIF use 8/10/12 bits; \
-        JPEG2000 uses 8-16 bits (1-16 with --j2k-allow-low-bits), automatically selected \
+        JPEG2000/JPEG XL use 8-16 bits (1-16 with --j2k-allow-low-bits/--jxl-allow-low-bits), automatically selected \
         from the existing noise-measured DR, capped at the codec maximum. \
         New formats default to lossless compression of the selected-depth samples and share the \
         developed PNG transfer. All formats carry photographic EXIF. Optimization is on by default, \
@@ -49,7 +49,7 @@ use walkdir::WalkDir;
         dng-monochrome shot.DNG --no-optimize --dark 0 --light 0\n  \
         dng-monochrome shot.DNG -tone-band 0:0.3:0.4\n  \
         dng-monochrome shot.DNG -jpg --png-transfer linear --jpeg-transfer srgb\n  \
-        dng-monochrome shot.DNG -no-png -heic -avif -j2k\n  \
+        dng-monochrome shot.DNG -no-png -heic -avif -j2k -jxl\n  \
         dng-monochrome shot.DNG -heic -heic-mode lossy -heic-quality 95\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
@@ -154,7 +154,7 @@ pub struct Cli {
     #[arg(
         long,
         value_enum,
-        help = "PNG/master transfer, also used by HEIC/AVIF/JPEG2000; default linear, overrides --transfer"
+        help = "PNG/master transfer, also used by HEIC/AVIF/JPEG2000/JPEG XL; default linear, overrides --transfer"
     )]
     pub png_transfer: Option<Transfer>,
 
@@ -309,9 +309,11 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "heic-mode",
         "avif-mode",
         "j2k-mode",
+        "jxl-mode",
         "heic-quality",
         "avif-quality",
         "j2k-quality",
+        "jxl-quality",
         "threads",
         "jobs",
     ];
@@ -347,6 +349,9 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "j2k",
         "no-j2k",
         "j2k-allow-low-bits",
+        "jxl",
+        "no-jxl",
+        "jxl-allow-low-bits",
         "lossless",
         "lossy",
     ];
@@ -370,10 +375,12 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                 return vec![arg];
             }
             if matches!(text, "-all" | "--all") {
-                return ["--all", "--jpg", "--png", "--heic", "--avif", "--j2k"]
-                    .into_iter()
-                    .map(OsString::from)
-                    .collect();
+                return [
+                    "--all", "--jpg", "--png", "--heic", "--avif", "--j2k", "--jxl",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
             }
             if matches!(text, "-none" | "--none") {
                 return [
@@ -383,6 +390,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
                     "--no-heic",
                     "--no-avif",
                     "--no-j2k",
+                    "--no-jxl",
                 ]
                 .into_iter()
                 .map(OsString::from)

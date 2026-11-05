@@ -30,6 +30,7 @@ pub struct OutputPaths {
     pub heic: PathBuf,
     pub avif: PathBuf,
     pub j2k: PathBuf,
+    pub jxl: PathBuf,
     pub report: Option<PathBuf>,
     formats: Vec<Format>,
 }
@@ -46,6 +47,7 @@ impl OutputPaths {
             heic: stem.with_extension("heic"),
             avif: stem.with_extension("avif"),
             j2k: stem.with_extension("jp2"),
+            jxl: stem.with_extension("jxl"),
             report: report.then(|| stem.with_extension("json")),
             formats: formats.to_vec(),
         }
@@ -58,6 +60,7 @@ impl OutputPaths {
             Format::Heic => &self.heic,
             Format::Avif => &self.avif,
             Format::J2k => &self.j2k,
+            Format::Jxl => &self.jxl,
         }
     }
 

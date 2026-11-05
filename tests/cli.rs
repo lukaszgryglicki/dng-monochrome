@@ -156,14 +156,19 @@ fn help_version_and_missing_arguments() {
             "--no-avif",
             "--j2k",
             "--no-j2k",
+            "--jxl",
+            "--no-jxl",
+            "--jxl-allow-low-bits",
             "--lossless",
             "--lossy",
             "--heic-mode",
             "--avif-mode",
             "--j2k-mode",
+            "--jxl-mode",
             "--heic-quality",
             "--avif-quality",
             "--j2k-quality",
+            "--jxl-quality",
         ] {
             assert!(text.contains(name), "missing {name} in {flag}");
         }

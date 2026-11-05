@@ -95,6 +95,7 @@ fn make_fixture() -> TempDir {
                fi\n\
              done\n",
         ),
+        ("clang", "exit 0\n"),
         ("ninja", "exit 0\n"),
         ("nasm", "exit 0\n"),
         (
@@ -263,6 +264,12 @@ fn requirements_installs_platform_packages_and_prepares_only_gnu_linux_musl_sdk(
         if host.ends_with("-linux-gnu") {
             assert!(packages.contains("aom-tools"));
             assert!(packages.contains("libnuma-dev"));
+            assert!(
+                packages
+                    .split_whitespace()
+                    .any(|package| package == "clang")
+            );
+            assert!(packages.contains("libclang-dev"));
             assert_eq!(
                 fs::read_to_string(dir.path().join("sdk-calls")).unwrap(),
                 "prepare x86_64-unknown-linux-musl 2\n"

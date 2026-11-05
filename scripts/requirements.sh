@@ -61,11 +61,11 @@ install_packages() {
                 as_root apt-get update
                 as_root apt-get install -y --no-install-recommends --no-upgrade \
                     build-essential cmake pkg-config ninja-build nasm curl ca-certificates \
-                    file python3 perl util-linux libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev
+                    file python3 perl util-linux libx265-dev libaom-dev libde265-dev aom-tools libnuma-dev clang libclang-dev
             elif command -v apk >/dev/null 2>&1; then
                 as_root apk add build-base cmake pkgconf ninja nasm curl ca-certificates \
                     file python3 perl linux-headers x265-dev aom-dev aom-static \
-                    libde265-dev numactl-dev
+                    libde265-dev numactl-dev clang clang-dev
             else
                 fail "Automatic Linux packages require apt-get (Debian/Ubuntu) or apk (Alpine). See README.md."
             fi
@@ -113,7 +113,7 @@ have_target() {
 }
 
 check_native() {
-    for tool in "${CARGO:-cargo}" rustc cc c++ cmake pkg-config make; do need "$tool"; done
+    for tool in "${CARGO:-cargo}" rustc cc c++ clang cmake pkg-config make ninja; do need "$tool"; done
     have_rust || fail "Rust 1.89+ is required."
     cmake --version | awk 'NR == 1 { split($3, v, "."); ok = v[1] > 3 || (v[1] == 3 && v[2] >= 22) } END { exit !ok }' ||
         fail "CMake 3.22+ is required."
