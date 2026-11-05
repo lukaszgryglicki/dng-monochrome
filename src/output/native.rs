@@ -781,6 +781,14 @@ fn encode_jxl(
                 jxl::JxlEncoderSetFrameDistance(settings.as_ptr(), distance),
                 "setting lossy quality",
             )?;
+            check(
+                jxl::JxlEncoderFrameSettingsSetOption(
+                    settings.as_ptr(),
+                    jxl::JxlEncoderFrameSettingId::JXL_ENC_FRAME_SETTING_BUFFERING,
+                    1,
+                ),
+                "bounding lossy working buffers",
+            )?;
         }
         let depth = jxl::JxlBitDepth {
             type_: jxl::JxlBitDepthType::JXL_BIT_DEPTH_FROM_CODESTREAM,

@@ -866,6 +866,58 @@ fn jpegxl_lossy_encoding_accepts_low_and_full_precision() {
 }
 
 #[test]
+fn jpegxl_lossy_large_groups_preserve_dimensions_precision_and_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image, rendered) = fixture(tmp.path(), 2051, 289);
+    for (bits, quality, transfer) in [(8, 85, Transfer::Linear), (16, 100, Transfer::Srgb)] {
+        let encoding = Encoding::new(
+            Format::Jxl,
+            Some(f64::from(bits)),
+            Compression::Lossy,
+            quality,
+        )
+        .unwrap();
+        let path = save(
+            &tmp.path().join(bits.to_string()),
+            &image,
+            &rendered,
+            &encoding,
+            transfer,
+        );
+        let decoded = decode(&path, Format::Jxl);
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.bits),
+            (2051, 289, bits)
+        );
+        assert_eq!(decoded.pixels.len(), rendered.png.len());
+        assert_eq!(
+            decoded.transfer,
+            Some(if transfer == Transfer::Linear { 8 } else { 13 })
+        );
+        assert!(
+            decoded
+                .exif
+                .windows(b"Recorded manual M lens".len())
+                .any(|v| v == b"Recorded manual M lens")
+        );
+        assert!(
+            decoded
+                .pixels
+                .iter()
+                .all(|&sample| u32::from(sample) < 1u32 << bits)
+        );
+        assert!(
+            decoded
+                .pixels
+                .iter()
+                .zip(quantized(&rendered.png, bits))
+                .all(|(&actual, expected)| u32::from(actual.abs_diff(expected))
+                    < (1u32 << bits) / 16)
+        );
+    }
+}
+
+#[test]
 fn cli_can_save_all_new_formats_without_png_and_reports_unknown_dr() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("photo.DNG");

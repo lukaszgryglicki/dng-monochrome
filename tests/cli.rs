@@ -930,6 +930,41 @@ fn thread_counts_do_not_change_encoded_pixels_or_bytes() {
 }
 
 #[test]
+fn automatic_jobs_use_all_threads_for_small_input_batches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let threads = std::thread::available_parallelism().unwrap().get();
+    for count in 1..=4 {
+        let input = tmp.path().join(count.to_string());
+        fs::create_dir(&input).unwrap();
+        for index in 0..count {
+            Dng::ramp(32, 16).write(&input.join(format!("{index}.DNG")));
+        }
+        let result = success(
+            Command::new(BIN)
+                .arg("--analyze")
+                .arg(&input)
+                .output()
+                .unwrap(),
+        );
+        let reports: Vec<serde_json::Value> = String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(reports.len(), count);
+        let jobs = count.min(threads);
+        for (index, report) in reports.iter().enumerate() {
+            assert_eq!(report["threads"], threads);
+            assert_eq!(report["jobs"], jobs);
+            assert_eq!(
+                report["file_threads"],
+                threads / jobs + usize::from(index < threads % jobs)
+            );
+        }
+    }
+}
+
+#[test]
 fn batch_reports_share_the_total_thread_budget_between_files() {
     let tmp = tempfile::tempdir().unwrap();
     for (case, (threads, jobs, allocations)) in [

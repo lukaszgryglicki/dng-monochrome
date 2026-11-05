@@ -298,6 +298,8 @@ the DNG container depth.
 
 JPEG XL quality 100 uses libjxl's smallest nonzero distance in lossy mode;
 select lossless mode for exact selected-depth samples.
+Large lossy JPEG XL images use bounded group buffers to avoid full-frame
+scratch-memory growth, retaining the selected quality and effort 10.
 
 HEIC images larger than 2048 pixels on either axis use a standard image grid
 with tiles no larger than 2048x2048. This keeps high-resolution, noisy images
