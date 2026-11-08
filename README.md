@@ -1,12 +1,17 @@
 # dng-monochrome
 
-Develop monochrome Leica DNG photographs into **16-bit grayscale PNG**, with
+Develop DNG and Sony ARW photographs as **16-bit grayscale PNG** by default, with
 optional **JPEG, HEIC, AVIF, JPEG2000 and JPEG XL**, without demosaicing or reducing the
-raw image to an embedded preview.
+raw image to an embedded preview. Opt-in `--color` / `-c` instead produces
+half-width, half-height RGB images by splitting 2x2 raw cells.
+Mode is never autodetected: either file type can be processed in either mode,
+including deliberately treating a color mosaic as monochrome or a monochrome
+sensor as color.
 
-PNG is always lossless, grayscale, 16 bits per pixel, and encoded at the
+PNG is always lossless, 16 bits per channel, and encoded at the
 encoder's **maximum compression setting: DEFLATE level 9 with adaptive row
-filtering**. It is never reduced to 8-bit, RGB, or an indexed palette.
+filtering**. Monochrome mode remains grayscale; `--color` produces RGB.
+Neither mode reduces PNG to 8-bit or an indexed palette.
 JPEG uses the same developed image, quantized according to its selected
 transfer: linear by default, or sRGB when requested.
 
@@ -222,7 +227,62 @@ pass their parent directories instead.
 
 Directory traversal does not follow symlinks. Explicit file arguments can
 resolve through symlinks. Use `--` before a filename beginning with a dash.
-Original DNG files are opened read-only and never modified.
+Original raw files are opened read-only and never modified.
+
+### Bayer color mode
+
+```sh
+dng-monochrome --color --none --jxl --j2k --avif shot.ARW
+dng-monochrome -c -4 -ga -kc --both --report /path/to/ARW -o color-output
+```
+
+Both modes discover ARW and DNG files. With `--color`, each complete 2x2 cell supplies
+one R, G1, G2 and B sample, without interpolation. The recommended raw crop is
+applied first; odd trailing rows/columns are discarded. G1/G2 are the first/second
+green in row-major order within a cropped cell, before EXIF orientation. For
+example, a cropped 7008x4672 Sony A7CII raw becomes 3504x2336 RGB.
+Declared Bayer layouts are honored; without a CFA declaration, RGGB at the
+full-raster origin is assumed and reported. Without `--color`, all raw positions
+remain grayscale pixels, without demosaicing even when CFA metadata is present.
+Varying black levels are averaged for monochrome analysis; multi-plane noise
+profiles are ignored in that mode in favor of spatial estimation.
+
+Each needed plane independently runs the existing monochrome histogram, noise,
+clipping, optimization, function and transfer pipeline. `--g1` is the default;
+`--g2` selects the other green. `--ga` averages the **processed** greens, rounded
+to the nearest integer, not their raw values. The last green switch wins.
+`--channels` / `-4` additionally saves `shotR`, `shotG1`, `shotG2` and `shotB`
+in every selected format. Without it, an unused green is not processed.
+All these switches require `--color`; ordinary monochrome behavior is unchanged.
+
+`--keep-color-ratios` (`-kc`, `-kcr`) optionally scales **only final RGB samples**.
+It measures `max(raw - black, 0)` before clipping or tone processing, over the
+complete cropped cells. The reference green is always the average of both RAW
+green means, even with `--g1` or `--g2`; an unused green is read for its mean but
+not developed. Divide the R/G/B reference means by the largest: means 80/120/160
+give factors 0.5/0.75/1.0. Apply these after output transfers, depth alignment and
+processed-green averaging, before encoding, with nearest-integer rounding.
+The dominant channel is unchanged, and R/G1/G2/B companion files remain identical
+to the uncorrected mode. All-zero reference signals leave RGB unchanged with a
+warning. Analysis/reports record the reference means and factors. This global
+correction does not undo independent tone curves or recover per-pixel color ratios.
+
+PNG remains 16-bit RGB and JPEG is 8-bit RGB with 4:4:4 encoding. Native codecs
+quantize each plane at its own normally selected depth, then **left shift**
+lower-depth codes to the maximum participating-channel depth: R9/G11/B10 uses
+`R << 2`, `G`, `B << 1` at 11 bits. For `--ga`, align and average the two greens
+at their maximum depth first. An unused saved green does not increase RGB depth;
+separate channel files retain their own depths. HEIC/AVIF use full-range identity
+GBR 4:4:4 so lossless encoding preserves these codes without a lossy color transform.
+Channel work shares the existing per-file thread budget; native encoders run
+sequentially within each file.
+
+There is deliberately no white balance or camera color matrix, so this independent
+channel development is not intended to match a camera's SOOC JPEG colors.
+Both modes require integer, single-component raw rasters, not already-developed
+RGB DNGs. Color mode supports declared 2x2 RGB Bayer layouts or the RGGB fallback,
+not interpolating demosaicing of other declared CFA layouts.
+Color reports and analysis JSON contain separate channel metadata/DR results.
 
 ### All command-line options
 
@@ -231,7 +291,11 @@ The documented `--long` options also accept `-long`, including `-help`,
 
 | Option | Meaning / default |
 | --- | --- |
-| `DNG_OR_DIRECTORY ...` | One or more monochrome DNG files or recursively searched directories |
+| `RAW_OR_DIRECTORY ...` | DNG/ARW files in either mode; directories are searched recursively |
+| `-c, --color` | Force independent 2x2-channel development into half-size RGB; default mode is always monochrome |
+| `-4, --channels` | Also save R/G1/G2/B monochrome companions; requires `--color` |
+| `--g1`, `--g2`, `--ga` | First green (default), second green, or average of processed greens; requires `--color` |
+| `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |
@@ -241,7 +305,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--avif`, `--no-avif` | Enable/disable AVIF; default off |
 | `--j2k`, `--no-j2k` | Enable/disable JPEG2000 in a `.jp2` container; default off |
 | `--j2k-allow-low-bits` | Permit automatic JPEG2000 depth below 8 bits; default minimum **8** |
-| `--jxl`, `--no-jxl` | Enable/disable grayscale JPEG XL in a `.jxl` container; default off |
+| `--jxl`, `--no-jxl` | Enable/disable JPEG XL in a `.jxl` container; default off |
 | `--jxl-allow-low-bits` | Permit automatic JPEG XL depth below 8 bits; default minimum **8** |
 | `--lossless`, `--lossy` | Compression for HEIC/AVIF/JPEG2000/JPEG XL; default **lossless**; no effect on PNG/JPEG |
 | `--heic-mode`, `--avif-mode`, `--j2k-mode`, `--jxl-mode` | `lossless` or `lossy`; per-format override of the shared mode |
@@ -301,8 +365,8 @@ select lossless mode for exact selected-depth samples.
 Large lossy JPEG XL images use bounded group buffers to avoid full-frame
 scratch-memory growth, retaining the selected quality and effort 10.
 
-HEIC images larger than 2048 pixels on either axis use a standard image grid
-with tiles no larger than 2048x2048. This keeps high-resolution, noisy images
+HEIC images larger than 2048 pixels on either axis (1024 for RGB) use a standard image grid
+with tiles no larger than 2048x2048 (1024x1024 for RGB). This keeps high-resolution, noisy images
 within HEVC decoders' compressed-unit limits without disabling decoder safety
 limits. The image keeps its full dimensions, precision and metadata; each tile
 uses the same maximum compression effort.
@@ -353,7 +417,7 @@ Mathematical/format definitions are deliberately fixed: normalized endpoints,
 16-/8-bit ranges, the exact 65,536-bin raw histogram, standard sRGB/APEX
 equations, Gaussian/MAD and quantization conversion factors, median/regression
 definitions, SNR1/SNR3 report meanings, parser precedence, TIFF/EXIF tags and
-size limits, and the mandatory maximum-compression grayscale16 PNG format.
+size limits, and the mandatory maximum-compression 16-bit PNG format.
 Dependency internals and hard resource/numerical safety guards are not tuning
 options. Changing a binomial smoothing radius or noise patch size derives its
 kernel, buffer sizes and degrees of freedom consistently.
@@ -974,6 +1038,17 @@ Private photographs are not bundled. Set `DNG_MONO_SAMPLE` for the optional
 original-Leica tests; they require a representative M11 Monochrom 14-bit file
 with more than 4,096 distinct codes. Optional local fixtures can live under
 the ignored `tests/fixtures/local/` directory.
+
+For full-resolution color round trips through all six formats, compared against
+independently developed PNG channels:
+
+```sh
+DNG_COLOR_SAMPLE=/path/shot.ARW \
+  cargo test --release --test color original_color_sample -- --ignored --nocapture
+```
+
+Set `DNG_COLOR_BINARY` to test another executable, such as a static build.
+This opt-in test uses temporary output directories and can take several minutes.
 
 ## License
 

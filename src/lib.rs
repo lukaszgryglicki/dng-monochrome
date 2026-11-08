@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod color;
 pub mod expression;
 pub mod formats;
 pub mod noise;

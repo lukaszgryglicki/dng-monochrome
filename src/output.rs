@@ -15,6 +15,7 @@ use rawler::{
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
+    borrow::Cow,
     fs,
     io::{BufWriter, Cursor, Write},
     path::{Path, PathBuf},
@@ -183,7 +184,49 @@ pub fn save_with_encodings(
     parameters: &Parameters,
     encodings: &[Encoding],
 ) -> Result<Vec<String>> {
+    save_components_with_encodings(
+        paths,
+        image,
+        &rendered.png,
+        &rendered.jpeg,
+        1,
+        report,
+        transfers,
+        quality,
+        overwrite,
+        parameters,
+        encodings,
+        |_| Ok(Cow::Borrowed(&rendered.png)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_components_with_encodings<'a>(
+    paths: &OutputPaths,
+    image: &MonoImage,
+    png_pixels: &[u16],
+    jpeg_pixels: &[u8],
+    components: usize,
+    report: &impl Serialize,
+    transfers: Transfers,
+    quality: u8,
+    overwrite: bool,
+    parameters: &Parameters,
+    encodings: &[Encoding],
+    native_pixels: impl Fn(&Encoding) -> Result<Cow<'a, [u16]>>,
+) -> Result<Vec<String>> {
     parameters.validate()?;
+    let samples = image
+        .metadata
+        .width
+        .checked_mul(image.metadata.height)
+        .and_then(|count| count.checked_mul(components));
+    ensure!(
+        matches!(components, 1 | 3)
+            && (!paths.formats.contains(&Format::Png) || samples == Some(png_pixels.len()))
+            && (!paths.formats.contains(&Format::Jpeg) || samples == Some(jpeg_pixels.len())),
+        "output dimensions do not match the developed image"
+    );
     for &format in &paths.formats {
         if !matches!(format, Format::Png | Format::Jpeg) {
             ensure!(
@@ -214,13 +257,14 @@ pub fn save_with_encodings(
             if !paths.formats.contains(&Format::Png) {
                 return Ok(None);
             }
-            let png_exif = photographic_exif(image, transfers.png, 16, Format::Png)?;
+            let png_exif = photographic_exif(image, transfers.png, 16, Format::Png, components)?;
             encode_png(
                 parent,
                 &image.metadata,
-                &rendered.png,
+                png_pixels,
                 transfers.png,
                 &png_exif,
+                components,
             )
             .map(Some)
         },
@@ -228,7 +272,7 @@ pub fn save_with_encodings(
             if !paths.formats.contains(&Format::Jpeg) {
                 return Ok(None);
             }
-            let jpeg_exif = photographic_exif(image, transfers.jpeg, 8, Format::Jpeg)?;
+            let jpeg_exif = photographic_exif(image, transfers.jpeg, 8, Format::Jpeg, components)?;
             ensure!(
                 jpeg_exif.len() <= 65527,
                 "photographic EXIF exceeds JPEG's 65527-byte metadata limit; no metadata was silently discarded"
@@ -236,16 +280,21 @@ pub fn save_with_encodings(
             encode_jpeg(
                 parent,
                 &image.metadata,
-                &rendered.jpeg,
+                jpeg_pixels,
                 quality,
                 &jpeg_exif,
                 parameters.jpeg_optimize_huffman,
+                components,
             )
             .map(Some)
         },
     );
     let png = png.context("encoding 16-bit PNG")?;
-    let jpeg = jpeg.context("encoding grayscale JPEG")?;
+    let jpeg = jpeg.context(if components == 1 {
+        "encoding grayscale JPEG"
+    } else {
+        "encoding RGB JPEG"
+    })?;
     let mut additional = Vec::new();
     let mut warnings = Vec::new();
     for encoding in encodings {
@@ -254,14 +303,17 @@ pub fn save_with_encodings(
             transfers.png,
             u16::from(encoding.bits),
             encoding.format,
+            components,
         )?;
+        let pixels = native_pixels(encoding)?;
         let (file, notes) = native::encode(
             parent,
             &image.metadata,
-            &rendered.png,
+            &pixels,
             transfers.png,
             &exif,
             encoding,
+            components,
         )
         .with_context(|| format!("encoding {} at {} bits", encoding.format, encoding.bits))?;
         additional.push((encoding.format, file));
@@ -308,6 +360,7 @@ fn encode_png(
     pixels: &[u16],
     transfer: Transfer,
     exif: &[u8],
+    components: usize,
 ) -> Result<NamedTempFile> {
     let mut file = temporary(parent)?;
     let mut bytes = vec![0u8; pixels.len() * 2];
@@ -322,7 +375,11 @@ fn encode_png(
         let mut info = png::Info::with_size(metadata.width as u32, metadata.height as u32);
         info.exif_metadata = Some(exif.into());
         let mut encoder = png::Encoder::with_info(&mut buffer, info)?;
-        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_color(if components == 1 {
+            png::ColorType::Grayscale
+        } else {
+            png::ColorType::Rgb
+        });
         encoder.set_depth(png::BitDepth::Sixteen);
         encoder.set_compression(png::Compression::High);
         match transfer {
@@ -345,6 +402,7 @@ fn encode_jpeg(
     quality: u8,
     exif: &[u8],
     optimize_huffman: bool,
+    components: usize,
 ) -> Result<NamedTempFile> {
     ensure!(
         metadata.width <= usize::from(u16::MAX) && metadata.height <= usize::from(u16::MAX),
@@ -356,11 +414,18 @@ fn encode_jpeg(
         let mut encoder = jpeg_encoder::Encoder::new(&mut buffer, quality);
         encoder.add_exif_metadata(exif)?;
         encoder.set_optimized_huffman_tables(optimize_huffman);
+        if components == 3 {
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+        }
         encoder.encode(
             pixels,
             metadata.width as u16,
             metadata.height as u16,
-            jpeg_encoder::ColorType::Luma,
+            if components == 1 {
+                jpeg_encoder::ColorType::Luma
+            } else {
+                jpeg_encoder::ColorType::Rgb
+            },
         )?;
         buffer.flush()?;
     }
@@ -373,6 +438,7 @@ fn photographic_exif(
     transfer: Transfer,
     bits: u16,
     format: Format,
+    components: usize,
 ) -> Result<Vec<u8>> {
     let metadata = &image.metadata;
     let mut bytes = Cursor::new(Vec::new());
@@ -391,11 +457,30 @@ fn photographic_exif(
     root.add_tag(ExifTag::Orientation, 1u16);
     root.add_tag(TiffCommonTag::ImageWidth, metadata.width as u32);
     root.add_tag(TiffCommonTag::ImageLength, metadata.height as u32);
-    root.add_tag(TiffCommonTag::BitsPerSample, bits);
-    root.add_tag(TiffCommonTag::SamplesPerPixel, 1u16);
-    root.add_tag(TiffCommonTag::PhotometricInt, 1u16);
+    if components == 1 {
+        root.add_tag(TiffCommonTag::BitsPerSample, bits);
+    } else {
+        root.add_tag(
+            TiffCommonTag::BitsPerSample,
+            Value::Short(vec![bits; components]),
+        );
+    }
+    root.add_tag(TiffCommonTag::SamplesPerPixel, components as u16);
+    root.add_tag(
+        TiffCommonTag::PhotometricInt,
+        if components == 1 { 1u16 } else { 2u16 },
+    );
     exif.add_tag_undefined(ExifTag::ExifVersion, b"0232".to_vec());
-    exif.add_untyped_tag(0x9101, Value::Undefined(vec![1, 0, 0, 0]));
+    exif.add_untyped_tag(
+        0x9101,
+        Value::Undefined(if components == 1 {
+            vec![1, 0, 0, 0]
+        } else if format == Format::Jpeg {
+            vec![1, 2, 3, 0]
+        } else {
+            vec![4, 5, 6, 0]
+        }),
+    );
     exif.add_tag(ExifTag::ExifImageWidth, metadata.width as u32);
     exif.add_tag(ExifTag::ExifImageHeight, metadata.height as u32);
     exif.add_tag(

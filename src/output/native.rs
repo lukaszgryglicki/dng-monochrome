@@ -37,11 +37,17 @@ pub(super) fn encode(
     transfer: Transfer,
     exif: &[u8],
     encoding: &Encoding,
+    components: usize,
 ) -> Result<(NamedTempFile, Vec<String>)> {
     ensure!(
-        metadata.width > 0
+        matches!(components, 1 | 3)
+            && metadata.width > 0
             && metadata.height > 0
-            && metadata.width.checked_mul(metadata.height) == Some(pixels.len()),
+            && metadata
+                .width
+                .checked_mul(metadata.height)
+                .and_then(|count| count.checked_mul(components))
+                == Some(pixels.len()),
         "native encoder dimensions do not match the developed image"
     );
     let valid_depth = match encoding.format {
@@ -55,6 +61,14 @@ pub(super) fn encode(
         encoding.format,
         encoding.bits
     );
+    if components == 3 {
+        ensure!(
+            pixels
+                .par_iter()
+                .all(|&value| u32::from(value) < (1u32 << encoding.bits)),
+            "RGB sample exceeds the selected precision"
+        );
+    }
     ensure!(
         match encoding.compression {
             Compression::Lossless => encoding.quality.is_none(),
@@ -74,11 +88,12 @@ pub(super) fn encode(
                 transfer,
                 exif,
                 encoding,
+                components,
             )?;
             Vec::new()
         }
         Format::J2k => {
-            let warnings = encode_jp2(file.as_file_mut(), metadata, pixels, encoding)?;
+            let warnings = encode_jp2(file.as_file_mut(), metadata, pixels, encoding, components)?;
             append_jp2_exif(file.as_file_mut(), exif)?;
             warnings
         }
@@ -90,6 +105,7 @@ pub(super) fn encode(
                 transfer,
                 exif,
                 encoding,
+                components,
             )?;
             Vec::new()
         }
@@ -174,6 +190,7 @@ fn encode_heif(
     transfer: Transfer,
     exif: &[u8],
     encoding: &Encoding,
+    components: usize,
 ) -> Result<()> {
     let _initialization = HeifInitialization::new()?;
     let width = i32::try_from(metadata.width).context("HEIF width exceeds its codec limit")?;
@@ -215,6 +232,13 @@ fn encode_heif(
             encoder.as_ptr(),
             i32::from(encoding.compression == Compression::Lossless),
         ))?;
+        if components == 3 {
+            heif_result(heif::heif_encoder_set_parameter_string(
+                encoder.as_ptr(),
+                c"chroma".as_ptr(),
+                c"444".as_ptr(),
+            ))?;
+        }
         let threads = rayon::current_num_threads();
         if encoding.format == Format::Heic {
             for (key, value) in [(c"preset", c"placebo"), (c"x265:frame-threads", c"1")] {
@@ -273,7 +297,8 @@ fn encode_heif(
         }
         // Large single HEVC NAL units exceed libde265's 16 MiB input limit.
         let (tile_width, tile_height) = if encoding.format == Format::Heic {
-            (metadata.width.min(2048), metadata.height.min(2048))
+            let edge = if components == 1 { 2048 } else { 1024 };
+            (metadata.width.min(edge), metadata.height.min(edge))
         } else {
             (metadata.width, metadata.height)
         };
@@ -283,31 +308,47 @@ fn encode_heif(
         heif_result(heif::heif_image_create(
             tile_width as i32,
             tile_height as i32,
-            heif::heif_colorspace_heif_colorspace_monochrome,
-            heif::heif_chroma_heif_chroma_monochrome,
+            if components == 1 {
+                heif::heif_colorspace_heif_colorspace_monochrome
+            } else {
+                heif::heif_colorspace_heif_colorspace_YCbCr
+            },
+            if components == 1 {
+                heif::heif_chroma_heif_chroma_monochrome
+            } else {
+                heif::heif_chroma_heif_chroma_444
+            },
             &mut image,
         ))?;
         let image = Owned::new(image, release_heif_image, "HEIF image")?;
-        let channel = heif::heif_channel_heif_channel_Y;
-        heif_result(heif::heif_image_add_plane(
-            image.as_ptr(),
-            channel,
-            tile_width as i32,
-            tile_height as i32,
-            i32::from(encoding.bits),
-        ))?;
-        let mut stride = 0;
-        let plane = heif::heif_image_get_plane(image.as_ptr(), channel, &mut stride);
-        let stride = usize::try_from(stride).context("invalid HEIF plane stride")?;
         let sample_bytes = if encoding.bits > 8 { 2 } else { 1 };
-        ensure!(
-            !plane.is_null() && stride >= tile_width * sample_bytes,
-            "invalid HEIF output plane"
-        );
-        let length = stride
-            .checked_mul(tile_height)
-            .context("HEIF plane size overflow")?;
-        let plane = slice::from_raw_parts_mut(plane, length);
+        let mut planes = Vec::new();
+        let channels = [
+            heif::heif_channel_heif_channel_Y,
+            heif::heif_channel_heif_channel_Cb,
+            heif::heif_channel_heif_channel_Cr,
+        ];
+        for (index, &channel) in channels[..components].iter().enumerate() {
+            heif_result(heif::heif_image_add_plane(
+                image.as_ptr(),
+                channel,
+                tile_width as i32,
+                tile_height as i32,
+                i32::from(encoding.bits),
+            ))?;
+            let mut stride = 0;
+            let plane = heif::heif_image_get_plane(image.as_ptr(), channel, &mut stride);
+            let stride = usize::try_from(stride).context("invalid HEIF plane stride")?;
+            ensure!(
+                !plane.is_null() && stride >= tile_width * sample_bytes,
+                "invalid HEIF output plane"
+            );
+            let length = stride
+                .checked_mul(tile_height)
+                .context("HEIF plane size overflow")?;
+            let component = if components == 1 { 0 } else { [1, 2, 0][index] };
+            planes.push((component, slice::from_raw_parts_mut(plane, length), stride));
+        }
         let profile = Owned::new(
             heif::heif_nclx_color_profile_alloc(),
             heif::heif_nclx_color_profile_free,
@@ -323,8 +364,11 @@ fn encode_heif(
                 heif::heif_transfer_characteristics_heif_transfer_characteristic_IEC_61966_2_1
             }
         };
-        nclx.matrix_coefficients =
-            heif::heif_matrix_coefficients_heif_matrix_coefficients_ITU_R_BT_709_5;
+        nclx.matrix_coefficients = if components == 1 {
+            heif::heif_matrix_coefficients_heif_matrix_coefficients_ITU_R_BT_709_5
+        } else {
+            heif::heif_matrix_coefficients_heif_matrix_coefficients_RGB_GBR
+        };
         nclx.full_range_flag = 1;
         heif_result(heif::heif_image_set_nclx_color_profile(
             image.as_ptr(),
@@ -355,27 +399,35 @@ fn encode_heif(
         let mut single_image = None;
         for tile_y in 0..rows {
             for tile_x in 0..columns {
-                plane
-                    .par_chunks_exact_mut(stride)
-                    .enumerate()
-                    .for_each(|(y, row)| {
-                        row.fill(0);
-                        let source_y = (tile_y * tile_height + y).min(metadata.height - 1);
-                        let source = &pixels[source_y * metadata.width..][..metadata.width];
-                        for (x, target) in row
-                            .chunks_exact_mut(sample_bytes)
-                            .take(tile_width)
-                            .enumerate()
-                        {
-                            let source_x = (tile_x * tile_width + x).min(metadata.width - 1);
-                            let sample = quantize(source[source_x], encoding.bits);
-                            if sample_bytes == 1 {
-                                target[0] = sample as u8;
-                            } else {
-                                target.copy_from_slice(&sample.to_ne_bytes());
+                for (component, plane, stride) in &mut planes {
+                    plane
+                        .par_chunks_exact_mut(*stride)
+                        .enumerate()
+                        .for_each(|(y, row)| {
+                            row.fill(0);
+                            let source_y = (tile_y * tile_height + y).min(metadata.height - 1);
+                            let source = &pixels[source_y * metadata.width * components..]
+                                [..metadata.width * components];
+                            for (x, target) in row
+                                .chunks_exact_mut(sample_bytes)
+                                .take(tile_width)
+                                .enumerate()
+                            {
+                                let source_x = (tile_x * tile_width + x).min(metadata.width - 1);
+                                let sample = source[source_x * components + *component];
+                                let sample = if components == 1 {
+                                    quantize(sample, encoding.bits)
+                                } else {
+                                    sample
+                                };
+                                if sample_bytes == 1 {
+                                    target[0] = sample as u8;
+                                } else {
+                                    target.copy_from_slice(&sample.to_ne_bytes());
+                                }
                             }
-                        }
-                    });
+                        });
+                }
                 if let Some(grid) = &grid {
                     heif_result(heif::heif_context_add_image_tile(
                         context.as_ptr(),
@@ -556,6 +608,7 @@ fn encode_jp2(
     metadata: &SensorMetadata,
     pixels: &[u16],
     encoding: &Encoding,
+    components: usize,
 ) -> Result<Vec<String>> {
     let width = u32::try_from(metadata.width).context("JPEG2000 width exceeds its codec limit")?;
     let height =
@@ -563,7 +616,7 @@ fn encode_jp2(
     let messages = Mutex::new(Jp2Messages::default());
     let mut output = OutputStream { file, error: None };
     unsafe {
-        let mut component = jp2::opj_image_cmptparm_t {
+        let component = jp2::opj_image_cmptparm_t {
             dx: 1,
             dy: 1,
             w: width,
@@ -574,22 +627,41 @@ fn encode_jp2(
             bpp: u32::from(encoding.bits),
             sgnd: 0,
         };
+        let mut layout = vec![component; components];
         let image = Owned::new(
-            jp2::opj_image_create(1, &mut component, jp2::COLOR_SPACE::OPJ_CLRSPC_GRAY),
+            jp2::opj_image_create(
+                components as u32,
+                layout.as_mut_ptr(),
+                if components == 1 {
+                    jp2::COLOR_SPACE::OPJ_CLRSPC_GRAY
+                } else {
+                    jp2::COLOR_SPACE::OPJ_CLRSPC_SRGB
+                },
+            ),
             jp2::opj_image_destroy,
             "JPEG2000 image",
         )?;
         (*image.as_ptr()).x1 = width;
         (*image.as_ptr()).y1 = height;
-        let components = (*image.as_ptr()).comps;
-        ensure!(
-            !components.is_null() && !(*components).data.is_null(),
-            "missing JPEG2000 image plane"
-        );
-        slice::from_raw_parts_mut((*components).data, pixels.len())
-            .par_iter_mut()
-            .zip(pixels.par_iter())
-            .for_each(|(target, &value)| *target = i32::from(quantize(value, encoding.bits)));
+        let image_components = (*image.as_ptr()).comps;
+        ensure!(!image_components.is_null(), "missing JPEG2000 image plane");
+        for (component, plane) in slice::from_raw_parts_mut(image_components, components)
+            .iter_mut()
+            .enumerate()
+        {
+            ensure!(!plane.data.is_null(), "missing JPEG2000 image plane");
+            slice::from_raw_parts_mut(plane.data, metadata.width * metadata.height)
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, target)| {
+                    let value = pixels[index * components + component];
+                    *target = i32::from(if components == 1 {
+                        quantize(value, encoding.bits)
+                    } else {
+                        value
+                    });
+                });
+        }
 
         let codec = Owned::new(
             jp2::opj_create_compress(jp2::CODEC_FORMAT::OPJ_CODEC_JP2),
@@ -665,6 +737,7 @@ fn encode_jxl(
     transfer: Transfer,
     exif: &[u8],
     encoding: &Encoding,
+    components: usize,
 ) -> Result<()> {
     let width = u32::try_from(metadata.width).context("JPEG XL width exceeds its codec limit")?;
     let height =
@@ -673,7 +746,13 @@ fn encode_jxl(
     let samples8: Vec<u8> = if encoding.bits <= 8 {
         pixels
             .par_iter()
-            .map(|&value| quantize(value, encoding.bits) as u8)
+            .map(|&value| {
+                if components == 1 {
+                    quantize(value, encoding.bits) as u8
+                } else {
+                    value as u8
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -681,7 +760,13 @@ fn encode_jxl(
     let samples16: Vec<u16> = if encoding.bits > 8 {
         pixels
             .par_iter()
-            .map(|&value| quantize(value, encoding.bits))
+            .map(|&value| {
+                if components == 1 {
+                    quantize(value, encoding.bits)
+                } else {
+                    value
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -741,7 +826,7 @@ fn encode_jxl(
         info.xsize = width;
         info.ysize = height;
         info.bits_per_sample = u32::from(encoding.bits);
-        info.num_color_channels = 1;
+        info.num_color_channels = components as u32;
         info.uses_original_profile = i32::from(encoding.compression == Compression::Lossless);
         check(
             jxl::JxlEncoderSetBasicInfo(encoder.as_ptr(), &info),
@@ -749,8 +834,12 @@ fn encode_jxl(
         )?;
         let mut color = MaybeUninit::uninit();
         match transfer {
-            Transfer::Linear => jxl::JxlColorEncodingSetToLinearSRGB(color.as_mut_ptr(), 1),
-            Transfer::Srgb => jxl::JxlColorEncodingSetToSRGB(color.as_mut_ptr(), 1),
+            Transfer::Linear => {
+                jxl::JxlColorEncodingSetToLinearSRGB(color.as_mut_ptr(), i32::from(components == 1))
+            }
+            Transfer::Srgb => {
+                jxl::JxlColorEncodingSetToSRGB(color.as_mut_ptr(), i32::from(components == 1))
+            }
         }
         check(
             jxl::JxlEncoderSetColorEncoding(encoder.as_ptr(), color.as_ptr()),
@@ -809,7 +898,7 @@ fn encode_jxl(
             "adding photographic EXIF",
         )?;
         let format = jxl::JxlPixelFormat {
-            num_channels: 1,
+            num_channels: components as u32,
             data_type,
             endianness: jxl::JxlEndianness::JXL_NATIVE_ENDIAN,
             align: 0,

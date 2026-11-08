@@ -23,13 +23,17 @@ use std::{
 };
 use walkdir::WalkDir;
 
+mod color;
+
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Develop monochrome DNGs into 16-bit PNG, with optional JPEG, HEIC, AVIF, JPEG2000 and JPEG XL.",
-    long_about = "Develop integer monochrome DNGs without demosaicing. Directories are searched recursively. \
+    about = "Develop DNG/ARW raw images as monochrome or explicit --color RGB into selectable image formats.",
+    long_about = "Develop integer DNG/ARW raw rasters as monochrome by default, or use --color for independent \
+        half-resolution R/G1/G2/B extraction from 2x2 cells. Mode is never autodetected; \
+        --color assumes RGGB when no CFA layout is declared. Directories are searched recursively. \
         Automatic range detection estimates sparse histogram tails and spatial noise; it cannot measure \
-        true sensor dynamic range or recover clipped detail. PNGs are always 16-bit grayscale with \
+        true sensor dynamic range or recover clipped detail. PNGs are always 16-bit (RGB with --color) with \
         maximum lossless compression; only PNG is saved by default. --jpg restores the original \
         8-bit JPEG companion. --all enables all six formats; --none disables them before \
         selecting individual formats. HEIC/AVIF use 8/10/12 bits; \
@@ -51,6 +55,8 @@ use walkdir::WalkDir;
         dng-monochrome shot.DNG -jpg --png-transfer linear --jpeg-transfer srgb\n  \
         dng-monochrome shot.DNG -no-png -heic -avif -j2k -jxl\n  \
         dng-monochrome shot.DNG -heic -heic-mode lossy -heic-quality 95\n\
+        dng-monochrome --color --none --jxl --j2k --avif shot.ARW\n  \
+        dng-monochrome -c -4 -ga -kc --both --report photos/\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
         asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp,\n\
@@ -62,8 +68,39 @@ use walkdir::WalkDir;
     group(ArgGroup::new("curve").args(["function", "tone_bands"]))
 )]
 pub struct Cli {
-    #[arg(required = true, num_args = 1.., value_name = "DNG_OR_DIRECTORY")]
+    #[arg(required = true, num_args = 1.., value_name = "RAW_OR_DIRECTORY")]
     pub inputs: Vec<PathBuf>,
+
+    #[arg(
+        short = 'c',
+        long,
+        help = "Force 2x2 Bayer splitting into half-size RGB; assume RGGB if CFA metadata is absent"
+    )]
+    pub color: bool,
+
+    #[arg(
+        short = '4',
+        long,
+        requires = "color",
+        help = "Also save independently processed R/G1/G2/B files, e.g. photoG1.png"
+    )]
+    pub channels: bool,
+
+    #[arg(long, requires = "color", overrides_with_all = ["g1", "g2", "ga"],
+        help = "Use the first green in each cropped Bayer cell (default in --color mode)")]
+    pub g1: bool,
+
+    #[arg(long, requires = "color", overrides_with_all = ["g1", "g2", "ga"],
+        help = "Use the second green in each cropped Bayer cell")]
+    pub g2: bool,
+
+    #[arg(long, requires = "color", overrides_with_all = ["g1", "g2", "ga"],
+        help = "Average independently developed G1/G2 after aligning their precision")]
+    pub ga: bool,
+
+    #[arg(long, visible_aliases = ["kc", "kcr"], requires = "color",
+        help = "Scale final RGB by black-subtracted RAW mean ratios; keep the strongest channel and separate channel files unchanged")]
+    pub keep_color_ratios: bool,
 
     #[arg(
         short = 'o',
@@ -140,7 +177,7 @@ pub struct Cli {
 
     #[arg(
         long,
-        help = "Write auto/ and best/ versions, decoding each DNG only once"
+        help = "Write auto/ and best/ versions, decoding each raw image only once"
     )]
     pub both: bool,
 
@@ -224,6 +261,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn green(&self) -> crate::color::Green {
+        if self.ga {
+            crate::color::Green::Average
+        } else if self.g2 {
+            crate::color::Green::G2
+        } else {
+            crate::color::Green::G1
+        }
+    }
+
     pub fn try_parse_compat(args: impl IntoIterator<Item = OsString>) -> Result<Self, clap::Error> {
         let cli = Self::try_parse_from(normalize_arguments(args))?;
         cli.parameters.validate().map_err(|error| {
@@ -318,6 +365,14 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jobs",
     ];
     const FLAGS: &[&str] = &[
+        "color",
+        "channels",
+        "g1",
+        "g2",
+        "ga",
+        "keep-color-ratios",
+        "kc",
+        "kcr",
         "func-clip",
         "func-scale",
         "func-wrap",
@@ -424,6 +479,7 @@ pub struct Input {
 pub fn discover(paths: &[PathBuf]) -> Result<Vec<Input>> {
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
+    let kind = "DNG/ARW";
     for path in paths {
         let root = path
             .canonicalize()
@@ -437,7 +493,7 @@ pub fn discover(paths: &[PathBuf]) -> Result<Vec<Input>> {
             let mut found = false;
             for entry in WalkDir::new(&root).follow_links(false).sort_by_file_name() {
                 let entry = entry.with_context(|| format!("walking {}", root.display()))?;
-                if entry.file_type().is_file() && is_dng(entry.path()) {
+                if entry.file_type().is_file() && is_raw(entry.path()) {
                     found = true;
                     if seen.insert(entry.path().to_path_buf()) {
                         inputs.push(Input {
@@ -447,11 +503,11 @@ pub fn discover(paths: &[PathBuf]) -> Result<Vec<Input>> {
                     }
                 }
             }
-            ensure!(found, "no DNG files in {}", path.display());
+            ensure!(found, "no {kind} files in {}", path.display());
         } else {
             ensure!(
-                root.is_file() && is_dng(&root),
-                "not a DNG file: {}",
+                root.is_file() && is_raw(&root),
+                "not a {kind} file: {}",
                 path.display()
             );
             if seen.insert(root.clone()) {
@@ -462,15 +518,15 @@ pub fn discover(paths: &[PathBuf]) -> Result<Vec<Input>> {
             }
         }
     }
-    ensure!(!inputs.is_empty(), "no DNG files found");
+    ensure!(!inputs.is_empty(), "no {kind} files found");
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(inputs)
 }
 
-fn is_dng(path: &Path) -> bool {
+fn is_raw(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("dng"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dng") || ext.eq_ignore_ascii_case("arw"))
 }
 
 fn process_files<T: Send>(
@@ -554,15 +610,16 @@ pub fn run(cli: Cli) -> Result<()> {
         let mut destinations = HashSet::new();
         for input in &inputs {
             for &optimized in &modes {
-                let paths = output_paths(&cli, input, optimized);
-                for path in paths.all() {
-                    ensure!(
-                        destinations.insert(path.to_owned()),
-                        "multiple inputs would overwrite the same output: {}",
-                        path.display()
-                    );
+                for paths in color::output_sets(&cli, input, optimized)? {
+                    for path in paths.all() {
+                        ensure!(
+                            destinations.insert(path.to_owned()),
+                            "multiple inputs would overwrite the same output: {}",
+                            path.display()
+                        );
+                    }
+                    paths.check(cli.overwrite)?;
                 }
-                paths.check(cli.overwrite)?;
             }
         }
     }
@@ -580,6 +637,28 @@ pub fn run(cli: Cli) -> Result<()> {
         jobs,
         |index| -> Result<FileOutcome> {
             let input = &inputs[index];
+            if cli.color {
+                return match color::process(
+                    &cli,
+                    input,
+                    index,
+                    inputs.len(),
+                    threads,
+                    jobs,
+                    &modes,
+                    range_options,
+                    expression.as_ref(),
+                ) {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) => {
+                        eprintln!("ERROR {}: {error:#}", input.path.display());
+                        Ok(FileOutcome {
+                            failures: 1,
+                            ..FileOutcome::default()
+                        })
+                    }
+                };
+            }
             let file_threads = rayon::current_num_threads();
             let mut outcome = FileOutcome::default();
             let start = Instant::now();
@@ -787,9 +866,10 @@ pub fn run(cli: Cli) -> Result<()> {
     if !cli.analyze && !cli.silent {
         writeln!(
             io::stdout().lock(),
-            "Saved {successes} {} from {} DNG(s) using {threads} threads ({jobs} files at once) to {}",
+            "Saved {successes} {} from {} {} using {threads} threads ({jobs} files at once) to {}",
             cli.formats.summary(),
             inputs.len(),
+            if cli.color { "color raw(s)" } else { "raw(s)" },
             cli.output.display()
         )?;
     }

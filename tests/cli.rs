@@ -740,7 +740,7 @@ fn duplicate_inputs_are_deduplicated_and_colliding_names_fail_before_writing() {
     assert!(
         String::from_utf8(result.stdout)
             .unwrap()
-            .contains("from 1 DNG(s)")
+            .contains("from 1 raw(s)")
     );
     let second = tmp.path().join("second");
     fs::create_dir(&second).unwrap();

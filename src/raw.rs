@@ -1,10 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use rawler::{
     RawImageData,
-    decoders::{RawDecodeParams, WellKnownIFD},
+    decoders::{Orientation, RawDecodeParams, WellKnownIFD},
     formats::tiff::Value,
     imgop::{Dim2, Point, Rect},
-    rawimage::RawPhotometricInterpretation,
     rawsource::RawSource,
     tags::{DngTag, ExifTag},
 };
@@ -47,22 +46,24 @@ pub fn decode(path: &Path, no_crop: bool) -> Result<MonoImage> {
     File::open(path)
         .with_context(|| format!("opening {}", path.display()))?
         .read_exact(&mut header)
-        .context("reading DNG TIFF header")?;
+        .context("reading raw TIFF header")?;
     ensure!(
         header[..4] == *b"II\x2a\0" || header[..4] == *b"MM\0\x2a",
-        "expected a classic TIFF-based DNG, not an embedded JPEG or another file type"
+        "expected a classic TIFF-based DNG/ARW, not an embedded JPEG or another file type"
     );
     let source = RawSource::new(path).context("opening raw data source")?;
     let params = RawDecodeParams::default();
-    let raw = rawler::decode(&source, &params)
+    let mut raw = rawler::decode(&source, &params)
         .with_context(|| format!("decoding raw samples from {}", path.display()))?;
-    ensure!(raw.camera.mode == "dng", "input is not a DNG");
-    let mut image = from_raw(raw, no_crop)?;
     // Keep the third-party metadata parser behind the same explicit panic boundary as raw decoding.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<MonoImage> {
         let decoder = rawler::get_decoder(&source)?;
         let source_metadata = decoder.raw_metadata(&source, &params)?;
-        let exif = &source_metadata.exif;
+        raw.orientation = source_metadata
+            .exif
+            .orientation
+            .map_or(raw.orientation, Orientation::from_u16);
+        let mut image = from_raw(raw, no_crop)?;
         let exif_ifd = decoder.ifd(WellKnownIFD::Exif)?;
         let standard_iso = exif_ifd
             .as_ref()
@@ -71,75 +72,83 @@ pub fn decode(path: &Path, no_crop: bool) -> Result<MonoImage> {
             .transpose()
             .map_err(|_| anyhow::anyhow!("StandardOutputSensitivity must be an unsigned integer"))?
             .flatten();
-        image.metadata.iso = exif
-            .iso_speed
-            .filter(|v| *v > 0)
-            .or(standard_iso.filter(|v| *v > 0))
-            .or(exif.recommended_exposure_index.filter(|v| *v > 0))
-            .or(exif
-                .iso_speed_ratings
-                .filter(|v| *v > 0 && *v < u16::MAX)
-                .map(u32::from));
-        if let Some(time) = exif.exposure_time {
-            ensure!(time.d != 0, "invalid EXIF exposure-time denominator");
-            image.metadata.exposure_seconds = Some(f64::from(time.n) / f64::from(time.d));
-        }
-        image.metadata.standard_output_sensitivity = standard_iso;
-        if let Some(aperture) = exif.fnumber {
-            ensure!(aperture.d != 0, "invalid EXIF aperture denominator");
-            image.metadata.aperture_f_number = Some(f64::from(aperture.n) / f64::from(aperture.d));
-        }
-        if let Some(aperture) = exif.aperture_value {
-            ensure!(aperture.d != 0, "invalid EXIF APEX aperture denominator");
-            let apex = f64::from(aperture.n) / f64::from(aperture.d);
-            ensure!(
-                (apex * 0.5).exp2().is_finite(),
-                "EXIF APEX aperture is out of range"
-            );
-            image.metadata.aperture_value_apex = Some(apex);
-        }
-        if let Some(focal) = exif.focal_length {
-            ensure!(focal.d != 0, "invalid EXIF focal-length denominator");
-            image.metadata.focal_length_mm = Some(f64::from(focal.n) / f64::from(focal.d));
-        }
-        image.metadata.lens_model = exif.lens_model.clone();
+        apply_exif_metadata(&mut image.metadata, &source_metadata, standard_iso)?;
         if let Some(ifd) = decoder.ifd(WellKnownIFD::Raw)?
             && let Some(entry) = ifd.get_entry(DngTag::NoiseProfile)
         {
             let Value::Double(values) = &entry.value else {
-                anyhow::bail!("monochrome NoiseProfile must contain two DOUBLE coefficients");
+                anyhow::bail!("NoiseProfile must contain DOUBLE coefficient pairs");
             };
             ensure!(
-                values.len() == 2 && values.iter().all(|v| v.is_finite() && *v >= 0.0),
-                "monochrome NoiseProfile must contain two finite, nonnegative coefficients"
+                values.len() >= 2
+                    && values.len().is_multiple_of(2)
+                    && values.iter().all(|v| v.is_finite() && *v >= 0.0),
+                "NoiseProfile must contain finite, nonnegative coefficient pairs"
             );
             ensure!(
                 values.iter().any(|v| *v > 0.0),
                 "NoiseProfile cannot have zero total noise"
             );
-            let span = f64::from(image.metadata.white_level) - image.metadata.black_level;
-            ensure!(
-                (values[0] * span * 65535.0 + values[1] * span * span).is_finite(),
-                "NoiseProfile coefficients overflow the raw-code noise model"
-            );
-            image.metadata.noise_profile = Some([values[0], values[1]]);
+            if values.len() == 2 {
+                let span = f64::from(image.metadata.white_level) - image.metadata.black_level;
+                ensure!(
+                    (values[0] * span * 65535.0 + values[1] * span * span).is_finite(),
+                    "NoiseProfile coefficients overflow the raw-code noise model"
+                );
+                image.metadata.noise_profile = Some([values[0], values[1]]);
+            }
         }
         image.source_metadata = source_metadata;
-        Ok(())
+        Ok(image)
     }))
-    .map_err(|_| anyhow::anyhow!("DNG metadata decoder panicked on malformed metadata"))?
-    .context("reading DNG sensitivity and noise metadata")?;
-    Ok(image)
+    .map_err(|_| anyhow::anyhow!("raw metadata decoder panicked on malformed metadata"))?
+}
+
+pub(crate) fn apply_exif_metadata(
+    metadata: &mut SensorMetadata,
+    source: &rawler::decoders::RawMetadata,
+    standard_iso: Option<u32>,
+) -> Result<()> {
+    let exif = &source.exif;
+    metadata.iso = exif
+        .iso_speed
+        .filter(|v| *v > 0)
+        .or(standard_iso.filter(|v| *v > 0))
+        .or(exif.recommended_exposure_index.filter(|v| *v > 0))
+        .or(exif
+            .iso_speed_ratings
+            .filter(|v| *v > 0 && *v < u16::MAX)
+            .map(u32::from));
+    if let Some(time) = exif.exposure_time {
+        ensure!(time.d != 0, "invalid EXIF exposure-time denominator");
+        metadata.exposure_seconds = Some(f64::from(time.n) / f64::from(time.d));
+    }
+    metadata.standard_output_sensitivity = standard_iso;
+    if let Some(aperture) = exif.fnumber {
+        ensure!(aperture.d != 0, "invalid EXIF aperture denominator");
+        metadata.aperture_f_number = Some(f64::from(aperture.n) / f64::from(aperture.d));
+    }
+    if let Some(aperture) = exif.aperture_value {
+        ensure!(aperture.d != 0, "invalid EXIF APEX aperture denominator");
+        let apex = f64::from(aperture.n) / f64::from(aperture.d);
+        ensure!(
+            (apex * 0.5).exp2().is_finite(),
+            "EXIF APEX aperture is out of range"
+        );
+        metadata.aperture_value_apex = Some(apex);
+    }
+    if let Some(focal) = exif.focal_length {
+        ensure!(focal.d != 0, "invalid EXIF focal-length denominator");
+        metadata.focal_length_mm = Some(f64::from(focal.n) / f64::from(focal.d));
+    }
+    metadata.lens_model = exif.lens_model.clone();
+    Ok(())
 }
 
 fn from_raw(raw: rawler::RawImage, no_crop: bool) -> Result<MonoImage> {
     ensure!(
-        raw.cpp == 1
-            && matches!(
-                raw.photometric,
-                RawPhotometricInterpretation::LinearRaw | RawPhotometricInterpretation::BlackIsZero
-            ),
-        "expected single-channel monochrome DNG; color/CFA input is not demosaiced"
+        raw.cpp == 1,
+        "expected one raw sample per position; developed multi-channel images are not supported"
     );
     let RawImageData::Integer(data) = raw.data else {
         anyhow::bail!("floating-point DNG is not supported; Leica integer samples are required");
@@ -150,11 +159,14 @@ fn from_raw(raw: rawler::RawImage, no_crop: bool) -> Result<MonoImage> {
     );
 
     let levels = raw.blacklevel.as_vec();
-    let black = f64::from(*levels.first().context("missing black level")?);
+    let mut black = f64::from(*levels.first().context("missing black level")?);
     ensure!(
-        black.is_finite() && levels.iter().all(|v| f64::from(*v) == black),
-        "non-uniform or invalid black levels are not supported"
+        levels.iter().all(|v| v.is_finite() && *v >= 0.0),
+        "invalid black levels"
     );
+    if !levels.iter().all(|v| f64::from(*v) == black) {
+        black = levels.iter().map(|&v| f64::from(v)).sum::<f64>() / levels.len() as f64;
+    }
     let white = *raw.whitelevel.0.first().context("missing white level")?;
     ensure!(
         white <= u32::from(u16::MAX) && black >= 0.0 && black < f64::from(white),

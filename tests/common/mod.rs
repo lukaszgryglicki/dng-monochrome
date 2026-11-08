@@ -11,6 +11,10 @@ pub struct Dng {
     pub orientation: u16,
     pub crop: Option<[u32; 4]>,
     pub cfa: bool,
+    pub cfa_pattern: [u8; 4],
+    pub black_pattern: Option<[u32; 4]>,
+    pub active_area: Option<[u32; 4]>,
+    pub color_noise_profile: Option<[[f64; 2]; 3]>,
     pub big_endian: bool,
     pub pixels: Vec<u16>,
     pub iso: Option<u32>,
@@ -33,6 +37,10 @@ impl Dng {
             orientation: 1,
             crop: None,
             cfa: false,
+            cfa_pattern: [0, 1, 1, 2],
+            black_pattern: None,
+            active_area: None,
+            color_noise_profile: None,
             big_endian: false,
             iso: Some(125),
             noise_profile: None,
@@ -111,7 +119,15 @@ impl Dng {
         }
         if self.cfa {
             tags.push((33421, 3, 2, [short(2), short(2)].concat()));
-            tags.push((33422, 1, 4, vec![0, 1, 1, 2]));
+            tags.push((33422, 1, 4, self.cfa_pattern.to_vec()));
+        }
+        if let Some(levels) = self.black_pattern {
+            tags.retain(|entry| entry.0 != 50714);
+            tags.push((50713, 3, 2, [short(2), short(2)].concat()));
+            tags.push((50714, 4, 4, levels.into_iter().flat_map(long).collect()));
+        }
+        if let Some(area) = self.active_area {
+            tags.push((50829, 4, 4, area.into_iter().flat_map(long).collect()));
         }
         let mut exif_tags: Vec<(u16, u16, u32, Vec<u8>)> = vec![
             (
@@ -154,6 +170,20 @@ impl Dng {
                 })
                 .collect();
             tags.push((51041, 12, 2, payload));
+        }
+        if let Some(profiles) = self.color_noise_profile {
+            let payload = profiles
+                .into_iter()
+                .flatten()
+                .flat_map(|v| {
+                    if self.big_endian {
+                        v.to_be_bytes()
+                    } else {
+                        v.to_le_bytes()
+                    }
+                })
+                .collect();
+            tags.push((51041, 12, 6, payload));
         }
         tags.sort_by_key(|v| v.0);
         let base = 8 + 2 + 12 * tags.len() + 4;

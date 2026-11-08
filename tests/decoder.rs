@@ -58,19 +58,10 @@ fn crop_and_all_eight_orientations_are_applied_once() {
 }
 
 #[test]
-fn cfa_invalid_calibration_and_corrupt_files_are_errors() {
+fn invalid_calibration_and_corrupt_files_are_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("bad.DNG");
     let mut dng = Dng::ramp(8, 8);
-    dng.cfa = true;
-    dng.write(&path);
-    assert!(
-        decode(&path, false)
-            .unwrap_err()
-            .to_string()
-            .contains("monochrome")
-    );
-    dng.cfa = false;
     dng.black = dng.white;
     dng.write(&path);
     assert!(
@@ -84,6 +75,22 @@ fn cfa_invalid_calibration_and_corrupt_files_are_errors() {
     std::fs::write(&path, b"II\x2a\0").unwrap();
     assert!(decode(&path, false).is_err());
     assert!(decode(&tmp.path().join("missing.DNG"), false).is_err());
+}
+
+#[test]
+fn forced_monochrome_keeps_cfa_samples_and_aggregates_black_calibration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("color.DNG");
+    let mut dng = Dng::ramp(32, 16);
+    dng.cfa = true;
+    dng.black_pattern = Some([101, 203, 307, 409]);
+    dng.color_noise_profile = Some([[0.0001, 0.00000002]; 3]);
+    dng.write(&path);
+    let image = decode(&path, false).unwrap();
+    assert_eq!(image.pixels, dng.pixels);
+    assert_eq!(image.metadata.black_level, 255.0);
+    assert_eq!(image.metadata.white_level, dng.white as u16);
+    assert_eq!(image.metadata.noise_profile, None);
 }
 
 #[test]

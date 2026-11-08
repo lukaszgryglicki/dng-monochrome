@@ -5,6 +5,7 @@
 *.rs.bk
 *.dng
 *.DNG
+*.[aA][rR][wW]
 *.png
 *.PNG
 *.jp*g

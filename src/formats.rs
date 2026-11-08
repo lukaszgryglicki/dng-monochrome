@@ -65,7 +65,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["no_png", "png"],
-        help = "Save 16-bit grayscale PNG (default)"
+        help = "Save 16-bit PNG (default; grayscale or RGB with --color)"
     )]
     pub png: bool,
     #[arg(long, overrides_with_all = ["png", "no_png"], help = "Do not save PNG")]
@@ -74,7 +74,7 @@ pub struct OutputOptions {
         long,
         visible_alias = "jpeg",
         overrides_with_all = ["no_jpg", "jpg"],
-        help = "Also save the original 8-bit grayscale JPEG"
+        help = "Also save 8-bit JPEG (grayscale or RGB with --color)"
     )]
     pub jpg: bool,
     #[arg(
@@ -87,7 +87,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["no_heic", "heic"],
-        help = "Save monochrome HEIC using x265 at maximum effort"
+        help = "Save HEIC using x265 at maximum effort"
     )]
     pub heic: bool,
     #[arg(long, overrides_with_all = ["heic", "no_heic"], help = "Do not save HEIC (default)")]
@@ -95,7 +95,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["no_avif", "avif"],
-        help = "Save monochrome AVIF using libaom at maximum effort"
+        help = "Save AVIF using libaom at maximum effort"
     )]
     pub avif: bool,
     #[arg(long, overrides_with_all = ["avif", "no_avif"], help = "Do not save AVIF (default)")]
@@ -103,7 +103,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["no_j2k", "j2k"],
-        help = "Save grayscale JPEG2000 in a .jp2 container"
+        help = "Save JPEG2000 in a .jp2 container"
     )]
     pub j2k: bool,
     #[arg(long, overrides_with_all = ["j2k", "no_j2k"], help = "Do not save JPEG2000 (default)")]
@@ -116,7 +116,7 @@ pub struct OutputOptions {
     #[arg(
         long,
         overrides_with_all = ["no_jxl", "jxl"],
-        help = "Save grayscale JPEG XL in a .jxl container"
+        help = "Save JPEG XL in a .jxl container"
     )]
     pub jxl: bool,
     #[arg(long, overrides_with_all = ["jxl", "no_jxl"], help = "Do not save JPEG XL (default)")]
