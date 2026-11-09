@@ -1089,12 +1089,12 @@ This opt-in test uses temporary output directories and can take several minutes.
 
 ## License
 
-This application's source is licensed under [Apache-2.0](LICENSE).
+This application's source is licensed under [AGPL-3.0-only](LICENSE).
 Dependencies retain their respective licenses. In particular,
 [`rawler`](https://github.com/dnglab/dnglab) is LGPL-2.1, libheif is LGPL-3.0,
 and x265 is GPL-2.0-or-later (or separately commercially licensed).
 Distributing linked binaries, especially static binaries, requires observing
 the applicable dependency licensing, source, notice and relinking obligations;
-the application's Apache license does not relicense those libraries.
+the application's AGPL license does not relicense those libraries.
 `Cargo.lock` pins Rust dependencies; the FreeBSD static recipe pins its x265
 source archive and retains its license.
