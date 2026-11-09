@@ -276,6 +276,30 @@ and applies them only to final RGB at the same stage as ratio scaling. Gains
 powers of two. Only final samples are rounded; no channel is boosted and
 companion files are unchanged. Missing or invalid WB is an error. This requires `--color` and conflicts
 with `--keep-color-ratios`; analysis/reports include the gains and applied factors.
+Independent stretching may already compensate much of the sensor imbalance;
+applying RAW WB gains afterward can therefore produce a pink cast.
+
+`--natural-color` (`-nc`) instead estimates white balance from the **developed
+final RGB**, after tone/functions, processed-green averaging and output transfer.
+Recorded RAW WB identifies approximately neutral reference pixels (calibrated
+R/G/B within 10%); gains are estimated from their **processed** values, not copied
+from RAW WB. This avoids treating a genuinely blue sky as a gray reference.
+It uses median processed chromaticities, excluding black/clipped pixels, so a
+few bright references do not dominate differently tone-mapped midtones.
+Without valid RAW WB or enough references (at least 64 pixels and 0.1%, capped
+by image size), it falls back to a whole-image Shades-of-Gray sixth-power mean.
+Inverse reference levels are normalized so the largest factor is 1; no channel
+is boosted, and companion files stay byte-for-byte unchanged.
+JPEG gets its own estimate when its transfer differs from the PNG/native master.
+No eligible reference pixels means no correction, with a warning. This requires
+`--color` and conflicts with `-kc`/`-kcr`, `-wb` and `--analyze`; `--report` records
+`natural_balance` and `natural_jpeg_balance`, including method, factors and sample counts.
+This is an automatic estimate, not guaranteed camera-JPEG matching: strongly
+colored scenes without neutral references can still mislead it.
+
+```sh
+dng-monochrome -c -nc -none -jxl -jpg DSC01869.ARW
+```
 
 PNG remains 16-bit RGB and JPEG is 8-bit RGB with 4:4:4 encoding. Native codecs
 quantize each plane at its own normally selected depth, then **left shift**
@@ -308,6 +332,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--g1`, `--g2`, `--ga` | First green (default), second green, or average of processed greens; requires `--color` |
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
+| `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |

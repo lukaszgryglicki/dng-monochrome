@@ -115,6 +115,20 @@ pub(super) fn process(
         .transpose()?;
     let file_threads = rayon::current_num_threads();
     let first = &planes[selected[0]].image;
+    let natural_reference_mask = if cli.natural_color {
+        decoded
+            .recorded_white_balance
+            .map(|wb| {
+                color::NaturalColor::raw_neutral_mask(
+                    selected.map(|index| &planes[index].image),
+                    second_green.map(|index| &planes[index].image),
+                    wb,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let analysis_channels: BTreeMap<_, _> = planes
         .iter()
         .map(|plane| {
@@ -130,6 +144,7 @@ pub(super) fn process(
         "cfa_assumed": decoded.cfa_assumed,
         "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
         "white_balance": decoded.white_balance,
+        "natural_color": cli.natural_color,
         "width": first.metadata.width, "height": first.metadata.height,
         "channels": analysis_channels, "parameters": cli.parameters,
         "threads": threads, "jobs": jobs, "file_threads": file_threads,
@@ -200,6 +215,65 @@ pub(super) fn process(
                     )
                 })
                 .collect::<Result<_>>()?;
+            let rgb = selected.map(|index| &rendered[index]);
+            let other = second_green.map(|index| &rendered[index]);
+            let enabled = cli.formats.enabled();
+            let natural_balance = if cli.natural_color {
+                let (pixels, _) = color::combine(
+                    rgb.map(|rendered| (rendered.png.as_slice(), 16)),
+                    other.map(|rendered| (rendered.png.as_slice(), 16)),
+                )?;
+                color::NaturalColor::from_rgb_with_neutral_mask(
+                    &pixels,
+                    natural_reference_mask.as_deref(),
+                )?
+            } else {
+                None
+            };
+            let natural_jpeg_balance = if cli.natural_color && enabled.contains(&Format::Jpeg) {
+                if transfers.png == transfers.jpeg {
+                    natural_balance
+                } else {
+                    let pixels = color::combine_jpeg(
+                        rgb.map(|rendered| rendered.jpeg.as_slice()),
+                        other.map(|rendered| rendered.jpeg.as_slice()),
+                        None,
+                    )?;
+                    let pixels: Vec<_> = pixels
+                        .into_par_iter()
+                        .map(|value| u16::from(value) * 257)
+                        .collect();
+                    color::NaturalColor::from_rgb_with_neutral_mask(
+                        &pixels,
+                        natural_reference_mask.as_deref(),
+                    )?
+                }
+            } else {
+                None
+            };
+            let scales = if cli.natural_color {
+                natural_balance.map(|balance| balance.scale_factors)
+            } else {
+                scales
+            };
+            let jpeg_scales = if cli.natural_color {
+                natural_jpeg_balance.map(|balance| balance.scale_factors)
+            } else {
+                scales
+            };
+            if cli.natural_color && !cli.silent {
+                if natural_balance.is_none() {
+                    eprintln!(
+                        "WARNING {}: no unclipped RGB reference samples for natural white balance; RGB is unchanged",
+                        input.path.display()
+                    );
+                } else if enabled.contains(&Format::Jpeg) && natural_jpeg_balance.is_none() {
+                    eprintln!(
+                        "WARNING {}: no unclipped JPEG reference samples for natural white balance; JPEG is unchanged",
+                        input.path.display()
+                    );
+                }
+            }
             let reports: Vec<_> = planes
                 .iter()
                 .zip(&rendered)
@@ -235,15 +309,15 @@ pub(super) fn process(
                 "cfa_assumed": decoded.cfa_assumed,
                 "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
                 "white_balance": decoded.white_balance,
+                "natural_color": cli.natural_color, "natural_balance": natural_balance,
+                "natural_jpeg_balance": natural_jpeg_balance,
+                "natural_reference_white_balance": cli.natural_color.then_some(decoded.recorded_white_balance).flatten(),
                 "width": first.metadata.width, "height": first.metadata.height,
                 "precision_alignment": "left_shift", "channels": channel_reports,
                 "parameters": cli.parameters, "png_transfer": transfers.png, "jpeg_transfer": transfers.jpeg,
                 "jpeg_quality": cli.jpeg_quality,
                 "additional_formats": encodings, "threads": threads, "jobs": jobs, "file_threads": file_threads,
             });
-            let rgb = selected.map(|index| &rendered[index]);
-            let other = second_green.map(|index| &rendered[index]);
-            let enabled = cli.formats.enabled();
             let png = if enabled.contains(&Format::Png) {
                 color::combine_with_scales(
                     rgb.map(|rendered| (rendered.png.as_slice(), 16)),
@@ -258,7 +332,7 @@ pub(super) fn process(
                 color::combine_jpeg(
                     rgb.map(|rendered| rendered.jpeg.as_slice()),
                     other.map(|r| r.jpeg.as_slice()),
-                    scales.as_ref(),
+                    jpeg_scales.as_ref(),
                 )?
             } else {
                 Vec::new()
@@ -336,10 +410,25 @@ pub(super) fn process(
                 if let Some(scales) = scales {
                     progress.push_str(&format!(
                         "\n  {} color scale R {:.6}, G {:.6}, B {:.6}",
-                        if cli.white_balance { "WB" } else { "raw" },
+                        if cli.natural_color {
+                            "natural"
+                        } else if cli.white_balance {
+                            "WB"
+                        } else {
+                            "raw"
+                        },
                         scales[0],
                         scales[1],
                         scales[2]
+                    ));
+                }
+                if cli.natural_color
+                    && transfers.jpeg != transfers.png
+                    && let Some(scales) = jpeg_scales
+                {
+                    progress.push_str(&format!(
+                        "\n  natural JPEG color scale R {:.6}, G {:.6}, B {:.6}",
+                        scales[0], scales[1], scales[2]
                     ));
                 }
                 for (plane, rendered) in planes.iter().zip(&rendered) {

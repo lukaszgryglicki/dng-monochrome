@@ -105,6 +105,159 @@ impl WhiteBalance {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct NaturalColor {
+    pub method: &'static str,
+    pub eligible_pixels: usize,
+    pub reference_levels: [f64; 3],
+    pub scale_factors: [f64; 3],
+}
+
+impl NaturalColor {
+    pub fn raw_neutral_mask(
+        channels: [&MonoImage; 3],
+        second_green: Option<&MonoImage>,
+        white_balance: WhiteBalance,
+    ) -> Result<Vec<bool>> {
+        WhiteBalance::from_coefficients(white_balance.coefficients)?;
+        let count = channels[0].pixels.len();
+        ensure!(
+            count > 0
+                && channels.iter().copied().chain(second_green).all(|image| {
+                    image.pixels.len() == count
+                        && image.metadata.black_level.is_finite()
+                        && image.metadata.black_level >= 0.0
+                        && image.metadata.black_level < f64::from(image.metadata.white_level)
+                }),
+            "natural color reference channels require equal nonempty dimensions and valid calibration"
+        );
+        let signal = |image: &MonoImage, index: usize| {
+            let value = f64::from(image.pixels[index]);
+            let black = image.metadata.black_level;
+            let white = f64::from(image.metadata.white_level);
+            (value > black && value < white).then(|| (value - black) / (white - black))
+        };
+        Ok((0..count)
+            .into_par_iter()
+            .map(|index| {
+                let [Some(red), Some(mut green), Some(blue)] =
+                    channels.map(|image| signal(image, index))
+                else {
+                    return false;
+                };
+                if let Some(other) = second_green {
+                    let Some(other) = signal(other, index) else {
+                        return false;
+                    };
+                    green = (green + other) * 0.5;
+                }
+                let mut reference = [red, green, blue];
+                for (value, gain) in reference.iter_mut().zip(white_balance.coefficients) {
+                    *value *= gain;
+                }
+                let minimum = reference.into_iter().fold(f64::INFINITY, f64::min);
+                let maximum = reference.into_iter().fold(0.0, f64::max);
+                minimum >= maximum * 0.9
+            })
+            .collect())
+    }
+
+    pub fn from_rgb(pixels: &[u16]) -> Result<Option<Self>> {
+        Self::from_rgb_with_neutral_mask(pixels, None)
+    }
+
+    pub fn from_rgb_with_neutral_mask(
+        pixels: &[u16],
+        neutral_mask: Option<&[bool]>,
+    ) -> Result<Option<Self>> {
+        ensure!(
+            !pixels.is_empty()
+                && pixels.len().is_multiple_of(3)
+                && neutral_mask.is_none_or(|mask| mask.len() == pixels.len() / 3),
+            "natural color requires nonempty RGB16 samples and a matching reference mask"
+        );
+        if let Some(mask) = neutral_mask {
+            let references: Vec<_> = pixels
+                .as_chunks::<3>()
+                .0
+                .par_iter()
+                .zip(mask.par_iter())
+                .filter_map(|(pixel, &neutral)| {
+                    if !neutral || pixel.contains(&0) || pixel.contains(&u16::MAX) {
+                        return None;
+                    }
+                    let total = f64::from(pixel.map(u32::from).into_iter().sum::<u32>());
+                    Some(pixel.map(|value| f64::from(value) / total))
+                })
+                .collect();
+            let count = pixels.len() / 3;
+            let eligible_pixels = references.len();
+            if eligible_pixels >= count.div_ceil(1000).max(64).min(count) {
+                let mut reference_levels = [0.0; 3];
+                reference_levels
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(component, level)| {
+                        let mut values: Vec<_> =
+                            references.iter().map(|rgb| rgb[component]).collect();
+                        let (lower, median, _) =
+                            values.select_nth_unstable_by(eligible_pixels / 2, f64::total_cmp);
+                        *level = if eligible_pixels.is_multiple_of(2) {
+                            (lower.iter().copied().fold(0.0, f64::max) + *median) * 0.5
+                        } else {
+                            *median
+                        };
+                    });
+                let minimum = reference_levels.into_iter().fold(f64::INFINITY, f64::min);
+                return Ok(Some(Self {
+                    method: "raw_neutral_chroma_median",
+                    eligible_pixels,
+                    reference_levels,
+                    scale_factors: reference_levels.map(|value| minimum / value),
+                }));
+            }
+        }
+        // Fixed chunks keep the estimate identical across thread counts.
+        let partials: Vec<_> = pixels
+            .par_chunks(3 * 16_384)
+            .map(|chunk| {
+                let mut count = 0usize;
+                let mut sums = [0.0; 3];
+                for pixel in chunk.as_chunks::<3>().0 {
+                    if pixel.contains(&0) || pixel.contains(&u16::MAX) {
+                        continue;
+                    }
+                    count += 1;
+                    for (sum, &value) in sums.iter_mut().zip(pixel) {
+                        *sum += (f64::from(value) / 65535.0).powi(6);
+                    }
+                }
+                (count, sums)
+            })
+            .collect();
+        let (eligible_pixels, sums) = partials.into_iter().fold(
+            (0usize, [0.0; 3]),
+            |(count, mut sums), (partial_count, partial_sums)| {
+                for (sum, value) in sums.iter_mut().zip(partial_sums) {
+                    *sum += value;
+                }
+                (count + partial_count, sums)
+            },
+        );
+        if eligible_pixels == 0 {
+            return Ok(None);
+        }
+        let reference_levels = sums.map(|sum| (sum / eligible_pixels as f64).powf(1.0 / 6.0));
+        let minimum = reference_levels.into_iter().fold(f64::INFINITY, f64::min);
+        Ok(Some(Self {
+            method: "shades_of_gray_6",
+            eligible_pixels,
+            reference_levels,
+            scale_factors: reference_levels.map(|value| minimum / value),
+        }))
+    }
+}
+
 fn validate_scales(scales: &[f64; 3]) -> Result<()> {
     ensure!(
         scales
@@ -226,6 +379,7 @@ pub struct BayerImage {
     pub cfa_assumed: bool,
     pub color_ratios: Option<ColorRatios>,
     pub white_balance: Option<WhiteBalance>,
+    pub recorded_white_balance: Option<WhiteBalance>,
     pub channels: Vec<(Channel, MonoImage)>,
 }
 
@@ -393,13 +547,15 @@ fn decode_inner(
         }
     }
     ensure!(counts == [1, 2, 1], "Bayer cell must contain R/G/G/B");
-    let white_balance = white_balance
-        .then(|| {
-            WhiteBalance::from_coefficients(
-                [planes[0], planes[1], planes[3]].map(|plane| f64::from(raw.wb_coeffs[plane])),
-            )
-        })
-        .transpose()?;
+    let recorded_balance = WhiteBalance::from_coefficients(
+        [planes[0], planes[1], planes[3]].map(|plane| f64::from(raw.wb_coeffs[plane])),
+    );
+    let recorded_white_balance = recorded_balance.as_ref().ok().copied();
+    let white_balance = if white_balance {
+        Some(recorded_balance?)
+    } else {
+        None
+    };
     let black = &raw.blacklevel;
     ensure!(
         black.cpp == 1
@@ -534,6 +690,7 @@ fn decode_inner(
             .then(|| ColorRatios::from_raw_means(raw_means))
             .flatten(),
         white_balance,
+        recorded_white_balance,
         channels,
     })
 }

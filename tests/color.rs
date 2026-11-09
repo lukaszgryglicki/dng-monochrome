@@ -1601,6 +1601,755 @@ fn original_sony_white_balance_and_green_means_match_independent_references() {
 }
 
 #[test]
+fn natural_color_aliases_require_color_and_keep_correction_modes_separate() {
+    let parse = |flags: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "photo.ARW"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    for flag in ["--natural-color", "-natural-color", "--nc", "-nc"] {
+        assert!(parse(&["-c", flag]).unwrap().natural_color);
+        assert!(parse(&[flag]).is_err());
+        for conflict in [
+            "-kc",
+            "-kcr",
+            "--keep-color-ratios",
+            "-wb",
+            "--white-balance",
+            "-analyze",
+        ] {
+            assert!(parse(&["-c", flag, conflict]).is_err());
+            assert!(parse(&["-c", conflict, flag]).is_err());
+        }
+        assert!(!parse(&["--", flag]).unwrap().natural_color);
+        assert_eq!(
+            parse(&["-func", flag]).unwrap().function.as_deref(),
+            Some(flag)
+        );
+    }
+    assert!(parse(&["-c", "--natural-color=true"]).is_err());
+    assert!(!parse(&["-c"]).unwrap().natural_color);
+}
+
+#[test]
+fn natural_color_removes_known_casts_ignores_clipped_pixels_and_is_thread_deterministic() {
+    let mut pixels: Vec<_> = (0..32_768)
+        .flat_map(|index| {
+            let value = (index % 10_000 + 1) as u16;
+            [2 * value, 3 * value, 4 * value]
+        })
+        .collect();
+    let original = color::NaturalColor::from_rgb(&pixels).unwrap().unwrap();
+    pixels.extend([65535, 100, 200, 300, 0, 400, 0, 0, 0, 65535, 65535, 65535]);
+    for threads in [1, 2] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let estimate = pool.install(|| color::NaturalColor::from_rgb(&pixels).unwrap().unwrap());
+        assert_eq!(estimate.eligible_pixels, 32_768);
+        assert_eq!(estimate.reference_levels, original.reference_levels);
+        assert_eq!(estimate.scale_factors, original.scale_factors);
+        for (actual, expected) in estimate
+            .scale_factors
+            .into_iter()
+            .zip([1.0, 2.0 / 3.0, 0.5])
+        {
+            assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+        }
+    }
+    assert_eq!(
+        color::NaturalColor::from_rgb(&[1000, 1000, 1000, 30000, 30000, 30000])
+            .unwrap()
+            .unwrap()
+            .scale_factors,
+        [1.0; 3]
+    );
+    assert!(
+        color::NaturalColor::from_rgb(&[65535, 100, 200, 300, 0, 400])
+            .unwrap()
+            .is_none()
+    );
+    assert!(color::NaturalColor::from_rgb(&[]).is_err());
+    assert!(color::NaturalColor::from_rgb(&[100, 200]).is_err());
+    assert!(color::NaturalColor::from_rgb_with_neutral_mask(&[100, 200, 300], Some(&[])).is_err());
+    let mask: Vec<_> = (0..pixels.len() / 3).map(|index| index % 29 != 0).collect();
+    for (pixel, &neutral) in pixels.as_chunks_mut::<3>().0.iter_mut().zip(&mask) {
+        if !neutral {
+            *pixel = [200, 50000, 5000];
+        }
+    }
+    let reference = color::NaturalColor::from_rgb_with_neutral_mask(&pixels, Some(&mask))
+        .unwrap()
+        .unwrap();
+    for threads in [1, 2] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let estimate = pool.install(|| {
+            color::NaturalColor::from_rgb_with_neutral_mask(&pixels, Some(&mask))
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(estimate.reference_levels, reference.reference_levels);
+        assert_eq!(estimate.scale_factors, reference.scale_factors);
+        for (actual, expected) in estimate
+            .scale_factors
+            .into_iter()
+            .zip([1.0, 2.0 / 3.0, 0.5])
+        {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+    let unavailable = vec![false; pixels.len() / 3];
+    assert_eq!(
+        color::NaturalColor::from_rgb_with_neutral_mask(&pixels, Some(&unavailable))
+            .unwrap()
+            .unwrap()
+            .scale_factors,
+        color::NaturalColor::from_rgb(&pixels)
+            .unwrap()
+            .unwrap()
+            .scale_factors
+    );
+}
+
+#[test]
+fn natural_color_uses_raw_neutrals_without_balancing_away_dominant_scene_colors() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("reference.DNG");
+    let mut dng = fixture();
+    dng.as_shot_neutral = Some([[2, 5], [1, 1], [2, 3]]);
+    dng.black_pattern = Some([100, 1000, 2000, 3000]);
+    for y in 0..dng.height {
+        for x in 0..dng.width {
+            let cell = (y / 2) * (dng.width / 2) + x / 2;
+            let phase = ((y % 2) * 2 + x % 2) as usize;
+            let mut reference = if cell < 256 {
+                [1.0; 4]
+            } else {
+                [0.2, 0.5, 0.5, 1.8]
+            };
+            if (128..256).contains(&cell) {
+                reference[2] *= 1.8;
+            }
+            let signal = (0.12 + f64::from(cell % 64) * 0.004) * reference[phase];
+            let black = dng.black_pattern.unwrap()[phase];
+            dng.pixels[(y * dng.width + x) as usize] = (f64::from(black)
+                + f64::from(dng.white - black) * signal / [2.5, 1.0, 1.0, 1.5][phase])
+                .round() as u16;
+        }
+    }
+    dng.write(&input);
+    let decoded = color::decode(&input, false, Green::G1, true).unwrap();
+    assert!(decoded.white_balance.is_none());
+    let wb = decoded.recorded_white_balance.unwrap();
+    assert_eq!(wb.coefficients, [2.5, 1.0, 1.5]);
+    let plane = |channel| {
+        &decoded
+            .channels
+            .iter()
+            .find(|(kind, _)| *kind == channel)
+            .unwrap()
+            .1
+    };
+    for (flag, green, second_green, expected_count) in [
+        ("-g1", Channel::G1, None, 256),
+        ("-g2", Channel::G2, None, 128),
+        ("-ga", Channel::G1, Some(plane(Channel::G2)), 128),
+    ] {
+        let mask = color::NaturalColor::raw_neutral_mask(
+            [plane(Channel::R), plane(green), plane(Channel::B)],
+            second_green,
+            wb,
+        )
+        .unwrap();
+        assert_eq!(mask.iter().filter(|&&value| value).count(), expected_count);
+        let pixels: Vec<_> = (0..mask.len())
+            .flat_map(|index| {
+                if index < 256 {
+                    let value = 500 + index as u16;
+                    [2 * value, 3 * value, 4 * value]
+                } else {
+                    [5000, 10000, 50000]
+                }
+            })
+            .collect();
+        let estimate = color::NaturalColor::from_rgb_with_neutral_mask(&pixels, Some(&mask))
+            .unwrap()
+            .unwrap();
+        assert_eq!(estimate.eligible_pixels, expected_count);
+        for (actual, expected) in estimate
+            .scale_factors
+            .into_iter()
+            .zip([1.0, 2.0 / 3.0, 0.5])
+        {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        assert!(
+            color::NaturalColor::from_rgb(&pixels)
+                .unwrap()
+                .unwrap()
+                .scale_factors[2]
+                < 0.2
+        );
+        let baseline = dir.path().join(format!("{flag}-independent"));
+        let natural = dir.path().join(format!("{flag}-natural"));
+        let flags = [
+            "-c",
+            flag,
+            "-4",
+            "-none",
+            "-png",
+            "-jxl",
+            "-jpg",
+            "-jpeg-quality",
+            "100",
+            "-jpeg-transfer",
+            "srgb",
+            "-report",
+            "-silent",
+            "-both",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-func",
+            "x^1.2",
+        ];
+        success(run(&input, &baseline, &flags));
+        let mut natural_flags = flags.to_vec();
+        natural_flags.push("-nc");
+        success(run(&input, &natural, &natural_flags));
+        for mode in ["auto", "best"] {
+            let baseline = baseline.join(mode);
+            let natural = natural.join(mode);
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(natural.join("reference.json")).unwrap()).unwrap();
+            let reference = color::NaturalColor::from_rgb_with_neutral_mask(
+                &png(&baseline.join("reference.png")).3,
+                Some(&mask),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                report["natural_balance"]["method"],
+                "raw_neutral_chroma_median"
+            );
+            assert_eq!(
+                report["natural_jpeg_balance"]["method"],
+                "raw_neutral_chroma_median"
+            );
+            assert_eq!(
+                report["natural_balance"]["eligible_pixels"],
+                reference.eligible_pixels
+            );
+            assert!(report["white_balance"].is_null());
+            assert_eq!(
+                report["natural_reference_white_balance"]["coefficients"],
+                serde_json::json!([2.5, 1.0, 1.5])
+            );
+            for format in [Format::Png, Format::Jxl, Format::Jpeg] {
+                let name = format!("reference.{}", format.extension());
+                let original = decode_color(&baseline.join(&name), format);
+                let output = decode_color(&natural.join(name), format);
+                let scales: [f64; 3] = if format == Format::Jpeg {
+                    serde_json::from_value(report["natural_jpeg_balance"]["scale_factors"].clone())
+                        .unwrap()
+                } else {
+                    reference.scale_factors
+                };
+                let expected: Vec<_> = original
+                    .pixels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &value)| (f64::from(value) * scales[index % 3]).round() as u16)
+                    .collect();
+                if format == Format::Jpeg {
+                    let error: u64 = output
+                        .pixels
+                        .iter()
+                        .zip(&expected)
+                        .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                        .sum();
+                    assert!(error < expected.len() as u64 * 2);
+                } else {
+                    assert_eq!(output.pixels, expected, "{flag} {mode} {format}");
+                }
+                for channel in ["R", "G1", "G2", "B"] {
+                    let name = format!("reference{channel}.{}", format.extension());
+                    assert_eq!(
+                        fs::read(baseline.join(&name)).unwrap(),
+                        fs::read(natural.join(name)).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn natural_color_only_changes_final_rgb_after_green_tone_and_transfer_in_every_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("natural.DNG");
+    let mut dng = fixture();
+    let cells = dng.width * dng.height / 4;
+    for y in 0..dng.height {
+        for x in 0..dng.width {
+            let cell = (y / 2) * (dng.width / 2) + x / 2;
+            let value = f64::from(cell + 1) / f64::from(cells + 1);
+            let phase = ((y % 2) * 2 + x % 2) as usize;
+            let level = [value, value * value, value.sqrt(), value.powi(3)][phase];
+            dng.pixels[(y * dng.width + x) as usize] = (1000.0 + 10000.0 * level).round() as u16;
+        }
+    }
+    dng.write(&input);
+    let before = fs::read(&input).unwrap();
+    for green in ["-g1", "-g2", "-ga"] {
+        for jpeg_transfer in ["linear", "srgb"] {
+            let baseline = dir
+                .path()
+                .join(format!("{green}-{jpeg_transfer}-independent"));
+            let corrected = dir.path().join(format!("{green}-{jpeg_transfer}-natural"));
+            let flags = [
+                "-c",
+                "-4",
+                green,
+                "-all",
+                "-report",
+                "-silent",
+                "-both",
+                "-dark",
+                "0",
+                "-light",
+                "0",
+                "-func",
+                "x^1.2",
+                "-png-transfer",
+                "linear",
+                "-jpeg-transfer",
+                jpeg_transfer,
+                "-jpeg-quality",
+                "100",
+            ];
+            success(run(&input, &baseline, &flags));
+            let mut natural_flags = flags.to_vec();
+            natural_flags.push("-nc");
+            success(run(&input, &corrected, &natural_flags));
+            for mode in ["auto", "best"] {
+                let baseline = baseline.join(mode);
+                let corrected = corrected.join(mode);
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(corrected.join("natural.json")).unwrap())
+                        .unwrap();
+                assert_eq!(report["natural_color"], true);
+                assert_eq!(report["keep_color_ratios"], false);
+                assert!(report["white_balance"].is_null());
+                assert!(report["color_ratios"].is_null());
+                let reference =
+                    color::NaturalColor::from_rgb(&png(&baseline.join("natural.png")).3)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    report["natural_balance"]["eligible_pixels"],
+                    reference.eligible_pixels
+                );
+                let master_scales: [f64; 3] =
+                    serde_json::from_value(report["natural_balance"]["scale_factors"].clone())
+                        .unwrap();
+                let jpeg_scales: [f64; 3] =
+                    serde_json::from_value(report["natural_jpeg_balance"]["scale_factors"].clone())
+                        .unwrap();
+                for (actual, expected) in master_scales.into_iter().zip(reference.scale_factors) {
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "{green} {jpeg_transfer} {mode}"
+                    );
+                }
+                if mode == "auto" {
+                    assert!(master_scales.iter().any(|&value| value < 0.99));
+                }
+                if jpeg_transfer == "linear" {
+                    assert_eq!(jpeg_scales, master_scales);
+                } else if mode == "auto" {
+                    assert!(
+                        jpeg_scales
+                            .iter()
+                            .zip(master_scales)
+                            .any(|(&a, b)| (a - b).abs() > 0.001)
+                    );
+                }
+                for format in [
+                    Format::Png,
+                    Format::Jpeg,
+                    Format::Heic,
+                    Format::Avif,
+                    Format::J2k,
+                    Format::Jxl,
+                ] {
+                    let name = format!("natural.{}", format.extension());
+                    let original = decode_color(&baseline.join(&name), format);
+                    let output = decode_color(&corrected.join(&name), format);
+                    assert_eq!(
+                        (output.width, output.height, output.bits),
+                        (original.width, original.height, original.bits)
+                    );
+                    let scales = if format == Format::Jpeg {
+                        jpeg_scales
+                    } else {
+                        master_scales
+                    };
+                    let expected: Vec<_> = original
+                        .pixels
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &value)| {
+                            (f64::from(value) * scales[index % 3]).round() as u16
+                        })
+                        .collect();
+                    if format == Format::Jpeg {
+                        let error: u64 = output
+                            .pixels
+                            .iter()
+                            .zip(&expected)
+                            .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                            .sum();
+                        assert!(error < expected.len() as u64 * 2);
+                    } else {
+                        assert_eq!(
+                            output.pixels, expected,
+                            "{format} {green} {jpeg_transfer} {mode}"
+                        );
+                    }
+                    for channel in ["R", "G1", "G2", "B"] {
+                        let name = format!("natural{channel}.{}", format.extension());
+                        assert_eq!(
+                            fs::read(baseline.join(&name)).unwrap(),
+                            fs::read(corrected.join(name)).unwrap(),
+                            "{format} {green} {jpeg_transfer} {mode} {channel}"
+                        );
+                    }
+                }
+                for channel in ["R", "G1", "G2", "B"] {
+                    let name = format!("natural{channel}.json");
+                    assert_eq!(
+                        fs::read(baseline.join(&name)).unwrap(),
+                        fs::read(corrected.join(name)).unwrap()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(fs::read(input).unwrap(), before);
+}
+
+#[test]
+fn natural_color_without_unclipped_reference_preserves_rgb_and_reports_unavailability() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("black.DNG");
+    fixture().write(&input);
+    let baseline = dir.path().join("independent");
+    let corrected = dir.path().join("natural");
+    let flags = ["-c", "-none", "-png", "-report", "-func", "0"];
+    success(run(&input, &baseline, &flags));
+    let mut natural_flags = flags.to_vec();
+    natural_flags.push("-nc");
+    let result = success(run(&input, &corrected, &natural_flags));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no unclipped RGB reference samples"));
+    assert_eq!(
+        fs::read(baseline.join("black.png")).unwrap(),
+        fs::read(corrected.join("black.png")).unwrap()
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(corrected.join("black.json")).unwrap()).unwrap();
+    assert_eq!(report["natural_color"], true);
+    assert!(report["natural_balance"].is_null());
+    assert!(report["natural_jpeg_balance"].is_null());
+}
+
+#[test]
+#[ignore = "set DNG_COLOR_JXL_SAMPLES to the original Sony ARW directory"]
+fn original_sony_jxl_modes_match_independent_channel_reconstruction() {
+    use dng_monochrome::{
+        expression::FunctionPolicy,
+        range::{self, Histogram, RangeOptions},
+        tone::{self, Transfers},
+    };
+    let root = std::path::PathBuf::from(
+        std::env::var_os("DNG_COLOR_JXL_SAMPLES").expect("set DNG_COLOR_JXL_SAMPLES"),
+    );
+    let native_reference =
+        std::env::var_os("DNG_COLOR_JXL_REFERENCE").map(std::path::PathBuf::from);
+    let natural_pilots = std::env::var_os("DNG_NATURAL_COLOR_PILOTS").map(std::path::PathBuf::from);
+    let natural_reference =
+        std::env::var_os("DNG_NATURAL_COLOR_REFERENCE").map(std::path::PathBuf::from);
+    let cli = Cli::try_parse_compat(
+        ["dng-monochrome", "-c", "-none", "-jxl", "photo.ARW"]
+            .into_iter()
+            .map(OsString::from),
+    )
+    .unwrap();
+    for (stem, mode, recorded_gains) in [
+        ("DSC01862", "wb", [2609.0, 1024.0, 1579.0]),
+        ("DSC01868", "kcr", [2514.0, 1024.0, 1619.0]),
+        ("DSC01869", "independent", [2513.0, 1024.0, 1621.0]),
+    ] {
+        let decoded = color::decode_with_balance(
+            &root.join(format!("{stem}.ARW")),
+            false,
+            Green::G1,
+            true,
+            mode == "kcr",
+            mode == "wb",
+        )
+        .unwrap();
+        let plane = |channel| {
+            &decoded
+                .channels
+                .iter()
+                .find(|(kind, _)| *kind == channel)
+                .unwrap()
+                .1
+        };
+        let raw_means = [Channel::R, Channel::G1, Channel::G2, Channel::B].map(|channel| {
+            let image = plane(channel);
+            image
+                .pixels
+                .iter()
+                .map(|&value| (f64::from(value) - image.metadata.black_level).max(0.0))
+                .sum::<f64>()
+                / image.pixels.len() as f64
+        });
+        let raw_rgb = [
+            raw_means[0],
+            (raw_means[1] + raw_means[2]) / 2.0,
+            raw_means[3],
+        ];
+        let factors = match mode {
+            "wb" => {
+                let wb = decoded.white_balance.unwrap();
+                assert_eq!(
+                    wb.coefficients,
+                    recorded_gains.map(|value| value / recorded_gains[1])
+                );
+                let maximum = recorded_gains.into_iter().fold(0.0, f64::max);
+                let expected = recorded_gains.map(|value| value / maximum);
+                assert_eq!(wb.scale_factors, expected);
+                expected
+            }
+            "kcr" => {
+                let ratios = decoded.color_ratios.unwrap();
+                for (actual, expected) in ratios.reference_means.into_iter().zip(raw_rgb) {
+                    assert!((actual - expected).abs() < 1e-8);
+                }
+                let maximum = raw_rgb.into_iter().fold(0.0, f64::max);
+                let expected = raw_rgb.map(|value| value / maximum);
+                for (actual, expected) in ratios.scale_factors.into_iter().zip(expected) {
+                    assert!((actual - expected).abs() < 1e-12);
+                }
+                expected
+            }
+            _ => [1.0; 3],
+        };
+        let rendered = [Channel::R, Channel::G1, Channel::B].map(|channel| {
+            let image = plane(channel);
+            let histogram = Histogram::new(&image.pixels).unwrap();
+            let range = range::analyze(image, &histogram, RangeOptions::default()).unwrap();
+            let bits = cli
+                .formats
+                .encodings(range.dynamic_range.snr1_stops)
+                .unwrap()[0]
+                .bits;
+            let rendered = tone::render(
+                image,
+                &histogram,
+                &range,
+                true,
+                None,
+                FunctionPolicy::Clip,
+                Transfers::default(),
+            )
+            .unwrap();
+            (rendered.png, bits)
+        });
+        let actual = decode_color(
+            &root.join("dng-mono").join(format!("{stem}.jxl")),
+            Format::Jxl,
+        );
+        let bits = rendered.iter().map(|(_, bits)| *bits).max().unwrap();
+        assert_eq!(
+            (actual.width, actual.height, actual.bits),
+            (3504, 2336, bits)
+        );
+        assert_eq!(actual.transfer, Some(8));
+        let external = native_reference.as_ref().map(|directory| {
+            let image = png(&directory.join(format!("{stem}.png")));
+            assert_eq!(
+                (image.0, image.1, image.2),
+                (3504, 2336, png::ColorType::Rgb)
+            );
+            assert_eq!(image.3.len(), actual.pixels.len());
+            image.3
+        });
+        let mut errors = [0u64; 3];
+        let mut external_errors = [0u64; 3];
+        let mut independent_sum = [0u64; 3];
+        let mut actual_sum = [0u64; 3];
+        let mut maxima = [0u16; 3];
+        for (index, pixel) in actual.pixels.as_chunks::<3>().0.iter().enumerate() {
+            for component in 0..3 {
+                let (samples, depth) = &rendered[component];
+                let independent = quantized(samples[index], *depth) << (bits - depth);
+                let expected = (f64::from(independent) * factors[component]).round() as u16;
+                errors[component] += u64::from(pixel[component] != expected);
+                if let Some(external) = &external {
+                    external_errors[component] += u64::from(
+                        quantized(external[index * 3 + component], bits) != pixel[component],
+                    );
+                }
+                independent_sum[component] += u64::from(independent);
+                actual_sum[component] += u64::from(pixel[component]);
+                maxima[component] = maxima[component].max(pixel[component]);
+            }
+        }
+        let denominator = (actual.pixels.len() / 3) as f64 * f64::from((1u32 << bits) - 1);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "stem": stem, "mode": mode, "bits": bits,
+                "channel_bits": rendered.each_ref().map(|(_, bits)| bits),
+                "raw_means_rg1g2b": raw_means, "scale_factors": factors,
+                "independent_rgb_means": independent_sum.map(|value| value as f64 / denominator),
+                "saved_rgb_means": actual_sum.map(|value| value as f64 / denominator),
+                "saved_rgb_maxima": maxima, "mismatched_samples": errors,
+                "libjxl_mismatched_samples": external.as_ref().map(|_| external_errors),
+            })
+        );
+        assert_eq!(
+            errors, [0; 3],
+            "{stem}: saved JXL differs from independent reference"
+        );
+        assert_eq!(
+            external_errors, [0; 3],
+            "{stem}: independent decoders disagree"
+        );
+        if let Some(pilots) = &natural_pilots {
+            let baseline = png(&pilots.join("independent").join(format!("{stem}.png"))).3;
+            let corrected = png(&pilots.join("natural").join(format!("{stem}.png"))).3;
+            let natural = decode_color(
+                &pilots.join("natural").join(format!("{stem}.jxl")),
+                Format::Jxl,
+            );
+            assert_eq!(
+                (natural.width, natural.height, natural.bits),
+                (3504, 2336, bits)
+            );
+            assert_eq!(baseline.len(), actual.pixels.len());
+            assert_eq!(corrected.len(), baseline.len());
+            let channels = [plane(Channel::R), plane(Channel::G1), plane(Channel::B)];
+            let gains = recorded_gains.map(|value| value / recorded_gains[1]);
+            let mut chroma: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::new());
+            for (index, rgb) in baseline.as_chunks::<3>().0.iter().enumerate() {
+                for component in 0..3 {
+                    assert_eq!(rgb[component], rendered[component].0[index]);
+                }
+                if rgb.contains(&0) || rgb.contains(&65535) {
+                    continue;
+                }
+                let mut reference = [0.0; 3];
+                let mut valid = true;
+                for component in 0..3 {
+                    let image = channels[component];
+                    let sample = f64::from(image.pixels[index]);
+                    let black = image.metadata.black_level;
+                    let white = f64::from(image.metadata.white_level);
+                    valid &= sample > black && sample < white;
+                    reference[component] = (sample - black) / (white - black) * gains[component];
+                }
+                let minimum = reference.into_iter().fold(f64::INFINITY, f64::min);
+                let maximum = reference.into_iter().fold(0.0, f64::max);
+                if !valid || minimum < maximum * 0.9 {
+                    continue;
+                }
+                let total: f64 = rgb.iter().map(|&value| f64::from(value)).sum();
+                for component in 0..3 {
+                    chroma[component].push(f64::from(rgb[component]) / total);
+                }
+            }
+            let eligible = chroma[0].len();
+            assert!(eligible > baseline.len() / 3000);
+            let levels = chroma.map(|mut values| {
+                values.sort_unstable_by(f64::total_cmp);
+                (values[(eligible - 1) / 2] + values[eligible / 2]) * 0.5
+            });
+            let minimum = levels.into_iter().fold(f64::INFINITY, f64::min);
+            let scales = levels.map(|value| minimum / value);
+            let report: serde_json::Value = serde_json::from_slice(
+                &fs::read(pilots.join("natural").join(format!("{stem}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                report["natural_balance"]["method"],
+                "raw_neutral_chroma_median"
+            );
+            assert_eq!(report["natural_balance"]["eligible_pixels"], eligible);
+            let reported_scales: [f64; 3] =
+                serde_json::from_value(report["natural_balance"]["scale_factors"].clone()).unwrap();
+            for (reported, expected) in reported_scales.into_iter().zip(scales) {
+                assert!((reported - expected).abs() < 1e-12);
+            }
+            let external = natural_reference
+                .as_ref()
+                .map(|directory| png(&directory.join(format!("{stem}.png"))).3);
+            let mut png_errors = [0u64; 3];
+            let mut jxl_errors = [0u64; 3];
+            let mut decoder_errors = [0u64; 3];
+            for index in 0..baseline.len() / 3 {
+                for component in 0..3 {
+                    let offset = index * 3 + component;
+                    let (samples, depth) = &rendered[component];
+                    let master = samples[index];
+                    let native = quantized(master, *depth) << (bits - depth);
+                    let expected_png = (f64::from(master) * scales[component]).round() as u16;
+                    let expected_jxl = (f64::from(native) * scales[component]).round() as u16;
+                    png_errors[component] += u64::from(corrected[offset] != expected_png);
+                    jxl_errors[component] += u64::from(natural.pixels[offset] != expected_jxl);
+                    if let Some(external) = &external {
+                        decoder_errors[component] +=
+                            u64::from(quantized(external[offset], bits) != natural.pixels[offset]);
+                    }
+                }
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "stem": stem, "mode": "natural", "bits": bits,
+                    "independent_reference_pixels": eligible, "scale_factors": scales,
+                    "png_mismatched_samples": png_errors, "jxl_mismatched_samples": jxl_errors,
+                    "libjxl_mismatched_samples": external.as_ref().map(|_| decoder_errors),
+                })
+            );
+            assert_eq!(
+                png_errors, [0; 3],
+                "{stem}: natural PNG differs from independent reference"
+            );
+            assert_eq!(
+                jxl_errors, [0; 3],
+                "{stem}: natural JXL differs from independent reference"
+            );
+            assert_eq!(
+                decoder_errors, [0; 3],
+                "{stem}: natural JXL decoders disagree"
+            );
+        }
+    }
+}
+
+#[test]
 fn forced_color_uses_raw_origin_for_cropped_oriented_monochrome_data() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("mono.DNG");

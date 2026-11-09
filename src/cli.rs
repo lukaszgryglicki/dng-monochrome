@@ -112,6 +112,15 @@ pub struct Cli {
     pub white_balance: bool,
 
     #[arg(
+        long,
+        visible_alias = "nc",
+        requires = "color",
+        conflicts_with_all = ["keep_color_ratios", "white_balance", "analyze"],
+        help = "Estimate white balance from developed final RGB, without changing separate channels; use --report for factors"
+    )]
+    pub natural_color: bool,
+
+    #[arg(
         short = 'o',
         long,
         alias = "output-dir",
@@ -384,6 +393,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "kcr",
         "white-balance",
         "wb",
+        "natural-color",
+        "nc",
         "func-clip",
         "func-scale",
         "func-wrap",
