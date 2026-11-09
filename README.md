@@ -266,6 +266,16 @@ The dominant channel is unchanged, and R/G1/G2/B companion files remain identica
 to the uncorrected mode. All-zero reference signals leave RGB unchanged with a
 warning. Analysis/reports record the reference means and factors. This global
 correction does not undo independent tone curves or recover per-pixel color ratios.
+RAW sensor ratios are not white-balanced, so this mode can restore a green cast.
+
+`--white-balance` (`-wb`) is a separate alternative to `-kc`/`-kcr`, not a
+combination with RAW mean ratios. It reads the recorded as-shot RGB WB gains
+(Sony metadata or DNG AsShotNeutral/AsShotWhiteXY), divides them by their maximum,
+and applies them only to final RGB at the same stage as ratio scaling. Gains
+5/3/2 give factors 1/0.6/0.4: factors are floating-point, not bit shifts or
+powers of two. Only final samples are rounded; no channel is boosted and
+companion files are unchanged. Missing or invalid WB is an error. This requires `--color` and conflicts
+with `--keep-color-ratios`; analysis/reports include the gains and applied factors.
 
 PNG remains 16-bit RGB and JPEG is 8-bit RGB with 4:4:4 encoding. Native codecs
 quantize each plane at its own normally selected depth, then **left shift**
@@ -277,8 +287,9 @@ GBR 4:4:4 so lossless encoding preserves these codes without a lossy color trans
 Channel work shares the existing per-file thread budget; native encoders run
 sequentially within each file.
 
-There is deliberately no white balance or camera color matrix, so this independent
-channel development is not intended to match a camera's SOOC JPEG colors.
+White balance is opt-in; there is no camera color matrix. Independent channel
+curves plus final WB scaling are not a full camera color pipeline and need not
+match a camera's SOOC JPEG colors.
 Both modes require integer, single-component raw rasters, not already-developed
 RGB DNGs. Color mode supports declared 2x2 RGB Bayer layouts or the RGGB fallback,
 not interpolating demosaicing of other declared CFA layouts.
@@ -296,6 +307,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `-4, --channels` | Also save R/G1/G2/B monochrome companions; requires `--color` |
 | `--g1`, `--g2`, `--ga` | First green (default), second green, or average of processed greens; requires `--color` |
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
+| `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |

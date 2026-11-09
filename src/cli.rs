@@ -103,6 +103,15 @@ pub struct Cli {
     pub keep_color_ratios: bool,
 
     #[arg(
+        long,
+        visible_alias = "wb",
+        requires = "color",
+        conflicts_with = "keep_color_ratios",
+        help = "Scale only final RGB by recorded RAW white-balance gains normalized to a maximum of 1; separate channels stay unchanged"
+    )]
+    pub white_balance: bool,
+
+    #[arg(
         short = 'o',
         long,
         alias = "output-dir",
@@ -373,6 +382,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "keep-color-ratios",
         "kc",
         "kcr",
+        "white-balance",
+        "wb",
         "func-clip",
         "func-scale",
         "func-wrap",

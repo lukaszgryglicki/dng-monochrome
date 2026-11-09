@@ -1388,6 +1388,219 @@ fn original_color_sample_preserves_independent_channel_codes_in_all_formats() {
 }
 
 #[test]
+fn white_balance_aliases_require_color_and_are_separate_from_raw_ratios() {
+    let parse = |flags: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "photo.ARW"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    for flag in ["--white-balance", "-white-balance", "--wb", "-wb"] {
+        assert!(parse(&["-c", flag]).unwrap().white_balance);
+        assert!(parse(&[flag]).is_err());
+        for ratios in ["--keep-color-ratios", "-kc", "-kcr"] {
+            assert!(parse(&["-c", flag, ratios]).is_err());
+            assert!(parse(&["-c", ratios, flag]).is_err());
+        }
+        assert!(!parse(&["--", flag]).unwrap().white_balance);
+        assert_eq!(
+            parse(&["-func", flag]).unwrap().function.as_deref(),
+            Some(flag)
+        );
+    }
+    assert!(parse(&["-c", "--white-balance=true"]).is_err());
+}
+
+#[test]
+fn white_balance_reads_as_shot_metadata_in_plane_order_and_rejects_missing_or_invalid_gains() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("wb.DNG");
+    let output = dir.path().join("unused");
+    let mut dng = fixture();
+    for (colors, pattern, neutral) in [
+        (None, [0, 1, 1, 2], [[1, 4], [1, 2], [1, 1]]),
+        (Some([2, 0, 1]), [1, 2, 2, 0], [[1, 1], [1, 4], [1, 2]]),
+    ] {
+        dng.cfa_plane_colors = colors;
+        dng.cfa_pattern = pattern;
+        dng.as_shot_neutral = Some(neutral);
+        dng.write(&input);
+        for green in [Green::G1, Green::G2, Green::Average] {
+            let decoded =
+                color::decode_with_balance(&input, false, green, false, false, true).unwrap();
+            let wb = decoded.white_balance.unwrap();
+            assert_eq!(wb.coefficients, [4.0, 2.0, 1.0]);
+            assert_eq!(wb.scale_factors, [1.0, 0.5, 0.25]);
+            assert!(decoded.color_ratios.is_none());
+            assert_eq!(
+                decoded.channels.len(),
+                if green == Green::Average { 4 } else { 3 }
+            );
+        }
+    }
+    dng.cfa_plane_colors = None;
+    dng.cfa_pattern = [0, 1, 1, 2];
+    for neutral in [
+        None,
+        Some([[0, 1], [1, 1], [1, 1]]),
+        Some([[1, 1], [1, 0], [1, 1]]),
+        Some([[1, 1], [1, 1], [0, 0]]),
+    ] {
+        dng.as_shot_neutral = neutral;
+        dng.write(&input);
+        let result = run(&input, &output, &["-c", "-wb", "-analyze", "-none"]);
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("recorded RAW white balance is missing or invalid"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+        assert!(color::decode(&input, false, Green::G1, false).is_ok());
+        assert!(color::decode_with_ratios(&input, false, Green::G1, false, true).is_ok());
+    }
+}
+
+#[test]
+fn white_balance_scales_only_final_rgb_after_green_averaging_and_transfers_in_every_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("wb.DNG");
+    let mut dng = fixture();
+    dng.as_shot_neutral = Some([[1, 5], [1, 3], [1, 2]]);
+    dng.write(&input);
+    let before = fs::read(&input).unwrap();
+    for green in ["-g1", "-g2", "-ga"] {
+        let baseline = dir.path().join(format!("{green}-independent"));
+        let corrected = dir.path().join(format!("{green}-wb"));
+        let flags = [
+            "-c",
+            "-4",
+            green,
+            "-all",
+            "-report",
+            "-silent",
+            "-transfer",
+            "srgb",
+            "-func",
+            "x^1.2",
+            "-jpeg-quality",
+            "100",
+        ];
+        success(run(&input, &baseline, &flags));
+        let mut wb_flags = flags.to_vec();
+        wb_flags.push("-wb");
+        success(run(&input, &corrected, &wb_flags));
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(corrected.join("wb.json")).unwrap()).unwrap();
+        assert_eq!(
+            report["white_balance"]["coefficients"],
+            serde_json::json!([5.0, 3.0, 2.0])
+        );
+        assert_eq!(
+            report["white_balance"]["scale_factors"],
+            serde_json::json!([1.0, 0.6, 0.4])
+        );
+        assert_eq!(report["keep_color_ratios"], false);
+        assert!(report["color_ratios"].is_null());
+        for format in [
+            Format::Png,
+            Format::Jpeg,
+            Format::Heic,
+            Format::Avif,
+            Format::J2k,
+            Format::Jxl,
+        ] {
+            let name = format!("wb.{}", format.extension());
+            let original = decode_color(&baseline.join(&name), format);
+            let output = decode_color(&corrected.join(&name), format);
+            assert_eq!(
+                (output.width, output.height, output.bits),
+                (original.width, original.height, original.bits)
+            );
+            let expected: Vec<_> = original
+                .pixels
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| {
+                    (f64::from(value) * [1.0, 0.6, 0.4][index % 3]).round() as u16
+                })
+                .collect();
+            if format == Format::Jpeg {
+                let error: u64 = output
+                    .pixels
+                    .iter()
+                    .zip(&expected)
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                    .sum();
+                assert!(error < expected.len() as u64 * 2);
+            } else {
+                assert_eq!(output.pixels, expected, "{format} {green}");
+            }
+            for channel in ["R", "G1", "G2", "B"] {
+                let name = format!("wb{channel}.{}", format.extension());
+                assert_eq!(
+                    fs::read(baseline.join(&name)).unwrap(),
+                    fs::read(corrected.join(name)).unwrap(),
+                    "{format} {green} {channel}"
+                );
+            }
+        }
+        for channel in ["R", "G1", "G2", "B"] {
+            let name = format!("wb{channel}.json");
+            assert_eq!(
+                fs::read(baseline.join(&name)).unwrap(),
+                fs::read(corrected.join(name)).unwrap()
+            );
+        }
+    }
+    assert_eq!(fs::read(input).unwrap(), before);
+}
+
+#[test]
+#[ignore = "set DNG_WB_SAMPLE to the original Sony DSC01869.ARW"]
+fn original_sony_white_balance_and_green_means_match_independent_references() {
+    let input = std::path::PathBuf::from(
+        std::env::var_os("DNG_WB_SAMPLE").expect("set DNG_WB_SAMPLE to DSC01869.ARW"),
+    );
+    let mono = dng_monochrome::raw::decode(&input, false).unwrap();
+    assert_eq!(mono.metadata.orientation, 1);
+    assert_eq!((mono.metadata.width, mono.metadata.height), (7008, 4672));
+    assert_eq!(mono.metadata.crop[..2], [12, 8]);
+    let mut sums = [0.0; 4];
+    let mut counts = [0u64; 4];
+    for (y, row) in mono.pixels.chunks_exact(mono.metadata.width).enumerate() {
+        for (x, &value) in row.iter().enumerate() {
+            let phase = (y % 2) * 2 + x % 2;
+            sums[phase] += (f64::from(value) - mono.metadata.black_level).max(0.0);
+            counts[phase] += 1;
+        }
+    }
+    let means = std::array::from_fn::<_, 4, _>(|index| sums[index] / counts[index] as f64);
+    drop(mono);
+    let reference = [means[0], (means[1] + means[2]) / 2.0, means[3]];
+    let ratios = color::decode_with_ratios(&input, false, Green::G1, false, true)
+        .unwrap()
+        .color_ratios
+        .unwrap();
+    for (actual, expected) in ratios.reference_means.into_iter().zip(reference) {
+        assert!((actual - expected).abs() < 1e-8);
+    }
+    let wb = color::decode_with_balance(&input, false, Green::G1, false, false, true)
+        .unwrap()
+        .white_balance
+        .unwrap();
+    assert_eq!(wb.coefficients, [2513.0 / 1024.0, 1.0, 1621.0 / 1024.0]);
+    assert_eq!(wb.scale_factors, [1.0, 1024.0 / 2513.0, 1621.0 / 2513.0]);
+    eprintln!(
+        "Independent R/G1/G2/B means: {means:?}; RAW RGB ratios: {:?}; recorded WB scales: {:?}",
+        ratios.scale_factors, wb.scale_factors
+    );
+}
+
+#[test]
 fn forced_color_uses_raw_origin_for_cropped_oriented_monochrome_data() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("mono.DNG");

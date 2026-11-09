@@ -12,6 +12,8 @@ pub struct Dng {
     pub crop: Option<[u32; 4]>,
     pub cfa: bool,
     pub cfa_pattern: [u8; 4],
+    pub cfa_plane_colors: Option<[u8; 3]>,
+    pub as_shot_neutral: Option<[[u32; 2]; 3]>,
     pub black_pattern: Option<[u32; 4]>,
     pub active_area: Option<[u32; 4]>,
     pub color_noise_profile: Option<[[f64; 2]; 3]>,
@@ -38,6 +40,8 @@ impl Dng {
             crop: None,
             cfa: false,
             cfa_pattern: [0, 1, 1, 2],
+            cfa_plane_colors: None,
+            as_shot_neutral: None,
             black_pattern: None,
             active_area: None,
             color_noise_profile: None,
@@ -120,6 +124,17 @@ impl Dng {
         if self.cfa {
             tags.push((33421, 3, 2, [short(2), short(2)].concat()));
             tags.push((33422, 1, 4, self.cfa_pattern.to_vec()));
+        }
+        if let Some(colors) = self.cfa_plane_colors {
+            tags.push((50710, 1, 3, colors.to_vec()));
+        }
+        if let Some(neutral) = self.as_shot_neutral {
+            tags.push((
+                50728,
+                5,
+                3,
+                neutral.into_iter().flatten().flat_map(long).collect(),
+            ));
         }
         if let Some(levels) = self.black_pattern {
             tags.retain(|entry| entry.0 != 50714);

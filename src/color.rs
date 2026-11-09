@@ -81,16 +81,38 @@ impl ColorRatios {
             scale_factors: reference_means.map(|mean| mean / maximum),
         })
     }
+}
 
-    fn validate(&self) -> Result<()> {
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct WhiteBalance {
+    pub coefficients: [f64; 3],
+    pub scale_factors: [f64; 3],
+}
+
+impl WhiteBalance {
+    fn from_coefficients(coefficients: [f64; 3]) -> Result<Self> {
         ensure!(
-            self.scale_factors
+            coefficients
                 .iter()
-                .all(|factor| factor.is_finite() && (0.0..=1.0).contains(factor)),
-            "color scale factors must be finite and within 0..1"
+                .all(|gain| gain.is_finite() && *gain > 0.0),
+            "recorded RAW white balance is missing or invalid; --white-balance requires finite positive R/G/B gains"
         );
-        Ok(())
+        let maximum = coefficients.into_iter().fold(0.0, f64::max);
+        Ok(Self {
+            coefficients,
+            scale_factors: coefficients.map(|gain| gain / maximum),
+        })
     }
+}
+
+fn validate_scales(scales: &[f64; 3]) -> Result<()> {
+    ensure!(
+        scales
+            .iter()
+            .all(|factor| factor.is_finite() && (0.0..=1.0).contains(factor)),
+        "color scale factors must be finite and within 0..1"
+    );
+    Ok(())
 }
 
 pub fn combine(
@@ -105,8 +127,20 @@ pub fn combine_with_ratios(
     second_green: Option<(&[u16], u8)>,
     ratios: Option<&ColorRatios>,
 ) -> Result<(Vec<u16>, u8)> {
-    if let Some(ratios) = ratios {
-        ratios.validate()?;
+    combine_with_scales(
+        channels,
+        second_green,
+        ratios.map(|ratios| &ratios.scale_factors),
+    )
+}
+
+pub fn combine_with_scales(
+    channels: [(&[u16], u8); 3],
+    second_green: Option<(&[u16], u8)>,
+    scales: Option<&[f64; 3]>,
+) -> Result<(Vec<u16>, u8)> {
+    if let Some(scales) = scales {
+        validate_scales(scales)?;
     }
     let count = channels[0].0.len();
     ensure!(
@@ -140,8 +174,8 @@ pub fn combine_with_ratios(
                 green = (green + other).div_ceil(2);
             }
             pixel[1] = (green << (bits - green_bits)) as u16;
-            if let Some(ratios) = ratios {
-                for (value, factor) in pixel.iter_mut().zip(ratios.scale_factors) {
+            if let Some(scales) = scales {
+                for (value, factor) in pixel.iter_mut().zip(scales) {
                     *value = (f64::from(*value) * factor).round() as u16;
                 }
             }
@@ -152,10 +186,10 @@ pub fn combine_with_ratios(
 pub(crate) fn combine_jpeg(
     channels: [&[u8]; 3],
     second_green: Option<&[u8]>,
-    ratios: Option<&ColorRatios>,
+    scales: Option<&[f64; 3]>,
 ) -> Result<Vec<u8>> {
-    if let Some(ratios) = ratios {
-        ratios.validate()?;
+    if let Some(scales) = scales {
+        validate_scales(scales)?;
     }
     let count = channels[0].len();
     ensure!(
@@ -177,8 +211,8 @@ pub(crate) fn combine_jpeg(
                 (u16::from(channels[1][index]) + u16::from(other[index])).div_ceil(2) as u8
             });
             pixel[2] = channels[2][index];
-            if let Some(ratios) = ratios {
-                for (value, factor) in pixel.iter_mut().zip(ratios.scale_factors) {
+            if let Some(scales) = scales {
+                for (value, factor) in pixel.iter_mut().zip(scales) {
                     *value = (f64::from(*value) * factor).round() as u8;
                 }
             }
@@ -191,6 +225,7 @@ pub struct BayerImage {
     pub cfa: String,
     pub cfa_assumed: bool,
     pub color_ratios: Option<ColorRatios>,
+    pub white_balance: Option<WhiteBalance>,
     pub channels: Vec<(Channel, MonoImage)>,
 }
 
@@ -205,8 +240,30 @@ pub fn decode_with_ratios(
     separate: bool,
     keep_color_ratios: bool,
 ) -> Result<BayerImage> {
+    decode_with_balance(path, no_crop, green, separate, keep_color_ratios, false)
+}
+
+pub fn decode_with_balance(
+    path: &Path,
+    no_crop: bool,
+    green: Green,
+    separate: bool,
+    keep_color_ratios: bool,
+    white_balance: bool,
+) -> Result<BayerImage> {
+    ensure!(
+        !(keep_color_ratios && white_balance),
+        "--keep-color-ratios and --white-balance are separate color modes"
+    );
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_inner(path, no_crop, green, separate, keep_color_ratios)
+        decode_inner(
+            path,
+            no_crop,
+            green,
+            separate,
+            keep_color_ratios,
+            white_balance,
+        )
     }))
     .map_err(|_| anyhow::anyhow!("color raw decoder panicked on malformed data or metadata"))?
 }
@@ -217,6 +274,7 @@ fn decode_inner(
     green: Green,
     separate: bool,
     keep_color_ratios: bool,
+    white_balance: bool,
 ) -> Result<BayerImage> {
     let source = RawSource::new(path).context("opening color raw data")?;
     let params = RawDecodeParams::default();
@@ -335,6 +393,13 @@ fn decode_inner(
         }
     }
     ensure!(counts == [1, 2, 1], "Bayer cell must contain R/G/G/B");
+    let white_balance = white_balance
+        .then(|| {
+            WhiteBalance::from_coefficients(
+                [planes[0], planes[1], planes[3]].map(|plane| f64::from(raw.wb_coeffs[plane])),
+            )
+        })
+        .transpose()?;
     let black = &raw.blacklevel;
     ensure!(
         black.cpp == 1
@@ -468,6 +533,7 @@ fn decode_inner(
         color_ratios: keep_color_ratios
             .then(|| ColorRatios::from_raw_means(raw_means))
             .flatten(),
+        white_balance,
         channels,
     })
 }

@@ -62,13 +62,18 @@ pub(super) fn process(
 ) -> Result<FileOutcome> {
     let start = Instant::now();
     let green = cli.green();
-    let decoded = color::decode_with_ratios(
+    let decoded = color::decode_with_balance(
         &input.path,
         cli.no_crop,
         green,
         cli.channels,
         cli.keep_color_ratios,
+        cli.white_balance,
     )?;
+    let scales = decoded
+        .color_ratios
+        .map(|ratios| ratios.scale_factors)
+        .or_else(|| decoded.white_balance.map(|wb| wb.scale_factors));
     let planes: Vec<Plane> = decoded
         .channels
         .into_par_iter()
@@ -124,6 +129,7 @@ pub(super) fn process(
         "color": true, "cfa": decoded.cfa, "green": green,
         "cfa_assumed": decoded.cfa_assumed,
         "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
+        "white_balance": decoded.white_balance,
         "width": first.metadata.width, "height": first.metadata.height,
         "channels": analysis_channels, "parameters": cli.parameters,
         "threads": threads, "jobs": jobs, "file_threads": file_threads,
@@ -228,6 +234,7 @@ pub(super) fn process(
                 "color": true, "cfa": decoded.cfa, "green": green,
                 "cfa_assumed": decoded.cfa_assumed,
                 "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
+                "white_balance": decoded.white_balance,
                 "width": first.metadata.width, "height": first.metadata.height,
                 "precision_alignment": "left_shift", "channels": channel_reports,
                 "parameters": cli.parameters, "png_transfer": transfers.png, "jpeg_transfer": transfers.jpeg,
@@ -238,10 +245,10 @@ pub(super) fn process(
             let other = second_green.map(|index| &rendered[index]);
             let enabled = cli.formats.enabled();
             let png = if enabled.contains(&Format::Png) {
-                color::combine_with_ratios(
+                color::combine_with_scales(
                     rgb.map(|rendered| (rendered.png.as_slice(), 16)),
                     other.map(|r| (r.png.as_slice(), 16)),
-                    decoded.color_ratios.as_ref(),
+                    scales.as_ref(),
                 )?
                 .0
             } else {
@@ -251,7 +258,7 @@ pub(super) fn process(
                 color::combine_jpeg(
                     rgb.map(|rendered| rendered.jpeg.as_slice()),
                     other.map(|r| r.jpeg.as_slice()),
-                    decoded.color_ratios.as_ref(),
+                    scales.as_ref(),
                 )?
             } else {
                 Vec::new()
@@ -279,14 +286,14 @@ pub(super) fn process(
                             .bits;
                         Ok((rendered[index].png.as_slice(), depth))
                     };
-                    let (pixels, bits) = color::combine_with_ratios(
+                    let (pixels, bits) = color::combine_with_scales(
                         [
                             samples(selected[0])?,
                             samples(selected[1])?,
                             samples(selected[2])?,
                         ],
                         second_green.map(samples).transpose()?,
-                        decoded.color_ratios.as_ref(),
+                        scales.as_ref(),
                     )?;
                     ensure!(
                         bits == encoding.bits,
@@ -326,10 +333,13 @@ pub(super) fn process(
                     paths.primary()?.display(),
                     start.elapsed().as_secs_f64()
                 );
-                if let Some(ratios) = decoded.color_ratios {
+                if let Some(scales) = scales {
                     progress.push_str(&format!(
-                        "\n  raw color scale R {:.6}, G {:.6}, B {:.6}",
-                        ratios.scale_factors[0], ratios.scale_factors[1], ratios.scale_factors[2]
+                        "\n  {} color scale R {:.6}, G {:.6}, B {:.6}",
+                        if cli.white_balance { "WB" } else { "raw" },
+                        scales[0],
+                        scales[1],
+                        scales[2]
                     ));
                 }
                 for (plane, rendered) in planes.iter().zip(&rendered) {
