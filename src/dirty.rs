@@ -209,9 +209,17 @@ impl Preview {
                 b.0.total_cmp(&a.0)
                     .then_with(|| (a.2, a.1).cmp(&(b.2, b.1)))
             });
+            let mut tile_counts = [0; 16 * 12];
+            let mut rank = 0;
+            peaks.retain(|&(_, x, y)| {
+                let tile = (y * 12 / self.height) * 16 + x * 16 / self.width;
+                let keep = rank < 800 || tile_counts[tile] < 16;
+                tile_counts[tile] += 1;
+                rank += 1;
+                keep
+            });
             let fitted: Vec<_> = peaks
                 .par_iter()
-                .take(800)
                 .filter_map(|&(_, x, y)| {
                     grid.fit(self, x as f64, y as f64, sigma)
                         .map(|fit| (x as f64, y as f64, sigma, fit))
@@ -706,6 +714,7 @@ impl Calibration {
             patches,
             report: Report {
                 method: "multi_image_local_flat_field",
+                strength: 1.0,
                 reference_images: self.reference_images,
                 compatible_reference_images: group.map_or(0, |group| group.images),
                 distinct_reference_views: group.map_or(0, |group| group.distinct_views),
@@ -735,6 +744,7 @@ pub struct Spot {
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub method: &'static str,
+    pub strength: f64,
     pub reference_images: usize,
     pub compatible_reference_images: usize,
     pub distinct_reference_views: usize,
@@ -755,6 +765,14 @@ pub struct Plan {
 
 impl Plan {
     pub fn apply(&self, image: &mut MonoImage) -> Result<Report> {
+        self.apply_with_strength(image, 1.0)
+    }
+
+    pub fn apply_with_strength(&self, image: &mut MonoImage, strength: f64) -> Result<Report> {
+        ensure!(
+            strength.is_finite() && (0.0..=2.0).contains(&strength),
+            "sensor-dirt correction strength must be finite and in [0, 2]"
+        );
         let metadata = &image.metadata;
         ensure!(
             self.geometry.accepts(metadata)
@@ -764,6 +782,16 @@ impl Plan {
             "sensor-dirt plan does not match the target raw geometry/crop"
         );
         let mut report = self.report.clone();
+        report.strength = strength;
+        if strength != 1.0 {
+            for spot in &mut report.spots {
+                spot.maximum_gain = spot.maximum_gain.powf(strength).min(MAX_LOG_GAIN.exp());
+            }
+        }
+        if strength == 0.0 {
+            report.warning = Some("zero sensor-dirt strength; pixels are unchanged");
+            return Ok(report);
+        }
         if self.patches.is_empty() {
             return Ok(report);
         }
@@ -847,7 +875,7 @@ impl Plan {
                     if log_gain <= 0.0 || value <= black || value >= white {
                         continue;
                     }
-                    let gain = log_gain.min(MAX_LOG_GAIN).exp();
+                    let gain = (log_gain * strength).min(MAX_LOG_GAIN).exp();
                     let corrected = black + (value - black) * gain;
                     let output = corrected.min(white).round() as u16;
                     changed += usize::from(output != *pixel);

@@ -141,6 +141,16 @@ pub struct Cli {
     pub fix_dirty_list: Vec<PathBuf>,
 
     #[arg(
+        long,
+        visible_alias = "fds",
+        value_parser = parse_dust_strength,
+        allow_hyphen_values = true,
+        value_name = "STRENGTH",
+        help = "Sensor-dirt correction strength 0..2 (default 1); implies --fix-dirty. 0 leaves pixels unchanged; >1 may amplify noise or create bright patches"
+    )]
+    pub fix_dust_strength: Option<f64>,
+
+    #[arg(
         short = 'o',
         long,
         alias = "output-dir",
@@ -376,6 +386,17 @@ fn parse_percentage(input: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_dust_strength(input: &str) -> Result<f64, String> {
+    let value: f64 = input
+        .parse()
+        .map_err(|_| "expected a correction strength such as 0.5 or 1.25".to_string())?;
+    if value.is_finite() && (0.0..=2.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("sensor-dirt correction strength must be finite and in [0, 2]".into())
+    }
+}
+
 fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     const VALUES: &[&str] = &[
         "output",
@@ -403,6 +424,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jobs",
         "fix-dirty-list",
         "fdl",
+        "fix-dust-strength",
+        "fds",
     ];
     const FLAGS: &[&str] = &[
         "color",
@@ -632,7 +655,7 @@ struct FileOutcome {
 }
 
 fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<Vec<dirty::Plan>>> {
-    if !cli.fix_dirty && cli.fix_dirty_list.is_empty() {
+    if !cli.fix_dirty && cli.fix_dirty_list.is_empty() && cli.fix_dust_strength.is_none() {
         return Ok(None);
     }
     let separate = (!cli.fix_dirty_list.is_empty())
@@ -708,9 +731,10 @@ fn dirty_progress(report: &dirty::Report, path: &Path) {
         eprintln!("WARNING {} [sensor dirt]: {warning}", path.display());
     } else {
         eprintln!(
-            "  sensor dirt {}: {} spot(s), {} changed sample(s), maximum gain {:.3}",
+            "  sensor dirt {}: {} spot(s), strength {:.3}, {} changed sample(s), maximum gain {:.3}",
             path.display(),
             report.spots.len(),
+            report.strength,
             report.changed_samples,
             report.maximum_gain
         );
@@ -800,7 +824,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mut image = raw::decode(&input.path, cli.no_crop)?;
                 let dirty_report = dirty_plans
                     .as_ref()
-                    .map(|plans| plans[index].apply(&mut image))
+                    .map(|plans| {
+                        plans[index]
+                            .apply_with_strength(&mut image, cli.fix_dust_strength.unwrap_or(1.0))
+                    })
                     .transpose()?;
                 let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
                 let range =

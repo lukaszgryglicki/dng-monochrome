@@ -236,6 +236,97 @@ fn correction_preserves_black_and_saturated_samples_and_caps_brightening() {
 }
 
 #[test]
+fn strength_zero_default_fractional_and_high_values_scale_the_same_correction() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence = references(dir.path(), None);
+    let calibration = Calibration::new(&evidence).unwrap();
+    let mut image = decode(dir.path(), "target.DNG", &scene(0, true));
+    let before = image.pixels.clone();
+    let plan = calibration.plan(&dirty::analyze(&image).unwrap());
+    let default = plan.apply(&mut image).unwrap();
+    let normal = image.pixels.clone();
+    let black = image.metadata.black_level;
+    let center = 150 * 640 + 180;
+    let normal_gain = (f64::from(normal[center]) - black) / (f64::from(before[center]) - black);
+    assert!(normal_gain > 1.1);
+    let mut previous = before.clone();
+    for strength in [0.0, 0.375, 1.0, 1.35, 2.0] {
+        image.pixels.clone_from(&before);
+        let report = plan.apply_with_strength(&mut image, strength).unwrap();
+        assert_eq!(report.strength, strength);
+        assert!(image.pixels.iter().zip(&previous).all(|(a, b)| a >= b));
+        let expected = black + (f64::from(before[center]) - black) * normal_gain.powf(strength);
+        assert!((f64::from(image.pixels[center]) - expected).abs() <= 2.0);
+        for ((original, ordinary), scaled) in before.iter().zip(&normal).zip(&image.pixels) {
+            if original == ordinary {
+                assert!(original.abs_diff(*scaled) <= 1);
+            }
+        }
+        if strength == 0.0 {
+            assert_eq!(image.pixels, before);
+            assert_eq!(report.changed_samples, 0);
+            assert_eq!(report.clipped_samples, 0);
+            assert_eq!(report.maximum_gain, 1.0);
+            assert!(report.spots.iter().all(|spot| spot.maximum_gain == 1.0));
+            assert!(report.warning.unwrap().contains("zero"));
+        } else if strength == 1.0 {
+            assert_eq!(image.pixels, normal);
+            assert_eq!(
+                serde_json::to_value(report).unwrap(),
+                serde_json::to_value(&default).unwrap()
+            );
+        }
+        previous.clone_from(&image.pixels);
+    }
+    for invalid in [-0.01, 2.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        image.pixels.clone_from(&before);
+        assert!(plan.apply_with_strength(&mut image, invalid).is_err());
+        assert_eq!(image.pixels, before);
+    }
+}
+
+#[test]
+fn high_strength_keeps_gain_white_and_black_safety_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = Vec::new();
+    for index in 0..4 {
+        let mut source = scene(index, false);
+        for y in 0..source.height {
+            for x in 0..source.width {
+                let (px, py) = (f64::from(x / 2 * 2) + 0.5, f64::from(y / 2 * 2) + 0.5);
+                let r2 = ((px - 180.5).powi(2) + (py - 150.5).powi(2)) / 10.0f64.powi(2);
+                let value = &mut source.pixels[(y * source.width + x) as usize];
+                *value = (f64::from(source.black)
+                    + (f64::from(*value) - f64::from(source.black)) * (-(-0.5 * r2).exp()).exp())
+                .round() as u16;
+            }
+        }
+        images.push(decode(dir.path(), &format!("{index}.DNG"), &source));
+    }
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze(image).unwrap())
+        .collect();
+    let plan = Calibration::new(&evidence).unwrap().plan(&evidence[0]);
+    let image = &mut images[0];
+    let center = 150 * 640 + 180;
+    let black = image.metadata.black_level as u16;
+    let white = image.metadata.white_level;
+    image.pixels[center] = black - 1;
+    image.pixels[center + 1] = white;
+    image.pixels[center + 2] = white - 1;
+    let report = plan.apply_with_strength(image, 2.0).unwrap();
+    assert_eq!(report.maximum_gain, 4.0);
+    assert!(report.spots.iter().all(|spot| spot.maximum_gain <= 4.0));
+    assert_eq!(
+        &image.pixels[center..center + 3],
+        &[black - 1, white, white]
+    );
+    assert!(report.clipped_samples > 0);
+    assert!(image.pixels.iter().all(|&pixel| pixel <= white));
+}
+
+#[test]
 fn aperture_lens_and_exposure_metadata_do_not_drive_correction() {
     let dir = tempfile::tempdir().unwrap();
     let evidence = references(dir.path(), None);
@@ -412,6 +503,40 @@ fn cli_aliases_and_separate_reference_lists_parse_without_changing_other_flags()
 }
 
 #[test]
+fn strength_aliases_accept_finite_fractional_values_and_reject_invalid_values() {
+    let parse = |arguments: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "target.ARW"]
+                .into_iter()
+                .chain(arguments.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    assert!(parse(&[]).unwrap().fix_dust_strength.is_none());
+    for flag in ["-fds", "--fds", "-fix-dust-strength", "--fix-dust-strength"] {
+        for value in ["0", "0.375", "1", "1.35", "2"] {
+            let cli = parse(&[flag, value, "-c", "-nc"]).unwrap();
+            assert_eq!(cli.fix_dust_strength, Some(value.parse::<f64>().unwrap()));
+            assert!(cli.color && cli.natural_color);
+        }
+        for value in ["-0.01", "2.01", "NaN", "inf", "-inf", "1e309", "bad", ""] {
+            assert!(parse(&[flag, value]).is_err(), "{flag} {value}");
+        }
+        assert!(parse(&[flag]).is_err());
+    }
+    assert_eq!(
+        parse(&["-fds=1.125"]).unwrap().fix_dust_strength,
+        Some(1.125)
+    );
+    let expression = parse(&["-func", "-fds"]).unwrap();
+    assert_eq!(expression.function.as_deref(), Some("-fds"));
+    assert!(expression.fix_dust_strength.is_none());
+    let positional = parse(&["--", "-fds"]).unwrap();
+    assert!(positional.fix_dust_strength.is_none());
+    assert_eq!(positional.inputs.last().unwrap(), &PathBuf::from("-fds"));
+}
+
+#[test]
 fn all_references_are_analyzed_before_only_the_separate_target_is_written() {
     let dir = tempfile::tempdir().unwrap();
     let refs = dir.path().join("references");
@@ -513,7 +638,14 @@ fn overlapping_reference_lists_are_deduplicated_and_default_list_is_equivalent()
             .output()
             .unwrap(),
     );
+    let strength_only = success(
+        command(&refs, &output)
+            .args(["--analyze", "-silent", "-fds", "1"])
+            .output()
+            .unwrap(),
+    );
     assert_eq!(implicit.stdout, explicit.stdout);
+    assert_eq!(implicit.stdout, strength_only.stdout);
     assert!(implicit.stderr.is_empty() && explicit.stderr.is_empty());
     assert_eq!(
         String::from_utf8(implicit.stdout).unwrap().lines().count(),
@@ -582,6 +714,82 @@ fn unconfirmed_correction_preserves_default_output_exactly() {
         json(&enabled.join("single.json"))["dirty_correction"]["changed_samples"],
         0
     );
+}
+
+#[test]
+fn zero_and_unit_strength_preserve_encoded_mono_rgb_and_channel_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs = dir.path().join("references");
+    fs::create_dir(&refs).unwrap();
+    references(&refs, None);
+    let input = dir.path().join("target.DNG");
+    scene(0, true).write(&input);
+    for color in [false, true] {
+        for (variant, strength) in [
+            ("plain", None),
+            ("zero", Some("0")),
+            ("implicit", None),
+            ("one", Some("1")),
+            ("strong", Some("1.5")),
+        ] {
+            let output = dir.path().join(format!("{color}-{variant}"));
+            let mut invocation = command(&input, &output);
+            invocation.args(["--report", "--transfer", "srgb"]);
+            if color {
+                invocation.args(["-c", "-4", "-nc"]);
+            }
+            if variant != "plain" {
+                invocation.arg("-fdl").arg(&refs);
+            }
+            if let Some(strength) = strength {
+                invocation.args(["-fds", strength]);
+            }
+            let result = success(invocation.output().unwrap());
+            if variant == "zero" {
+                assert!(
+                    String::from_utf8_lossy(&result.stderr)
+                        .contains("analysis complete for all 5 RAWs")
+                );
+            }
+            let report = json(&output.join("target.json"));
+            if variant == "plain" {
+                assert!(report.get("dirty_correction").is_none());
+            } else {
+                assert_eq!(
+                    report["dirty_correction"]["strength"].as_f64(),
+                    Some(strength.unwrap_or("1").parse().unwrap())
+                );
+            }
+        }
+        for suffix in if color {
+            &["", "R", "G1", "G2", "B"][..]
+        } else {
+            &[""][..]
+        } {
+            let bytes = |variant| {
+                fs::read(
+                    dir.path()
+                        .join(format!("{color}-{variant}/target{suffix}.png")),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                bytes("plain"),
+                bytes("zero"),
+                "zero strength {color}/{suffix}"
+            );
+            assert_eq!(
+                bytes("implicit"),
+                bytes("one"),
+                "unit strength {color}/{suffix}"
+            );
+            assert_ne!(
+                bytes("one"),
+                bytes("strong"),
+                "strength must reach {color}/{suffix}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -666,6 +874,89 @@ fn original_sony_dust_is_not_crowded_out_by_textured_foreground() {
 }
 
 #[test]
+fn textured_foreground_does_not_cause_proposal_starvation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = Vec::new();
+    for (index, (a, b)) in [(0.4, 0.1), (-0.2, 0.4), (-0.3, -0.3), (0.2, -0.4)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut source = Dng::ramp(1280, 960);
+        for y in 0..source.height {
+            for x in 0..source.width {
+                let (px, py) = (f64::from(x / 2 * 2) + 0.5, f64::from(y / 2 * 2) + 0.5);
+                let mut light = 0.35f64.ln() + a * (px / 1280.0 - 0.5) + b * (py / 960.0 - 0.5);
+                if y >= 210 {
+                    let mut hash = (x / 2).wrapping_mul(0x9e37_79b1)
+                        ^ (y / 2).wrapping_mul(0x85eb_ca77)
+                        ^ (index as u32).wrapping_mul(0xc2b2_ae3d);
+                    hash = (hash ^ (hash >> 16)).wrapping_mul(0x7feb_352d);
+                    hash ^= hash >> 15;
+                    light += (f64::from(hash) / f64::from(u32::MAX) - 0.5) * 1.6;
+                }
+                let r2 = ((px - 450.5).powi(2) + (py - 150.5).powi(2)) / 10.0f64.powi(2);
+                light -= 0.04 * (-0.5 * r2).exp();
+                source.pixels[(y * source.width + x) as usize] = (f64::from(source.black)
+                    + f64::from(source.white - source.black) * light.exp().min(1.0))
+                .round() as u16;
+            }
+        }
+        images.push(decode(dir.path(), &format!("{index}.DNG"), &source));
+    }
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze(image).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for (image, evidence) in images.iter_mut().zip(&evidence) {
+        let plan = calibration.plan(evidence);
+        assert!(
+            plan.report
+                .spots
+                .iter()
+                .any(|spot| { (spot.sensor_x - 450.5).hypot(spot.sensor_y - 150.5) < 8.0 }),
+            "faint smooth-sky shadow was crowded out: {:?}",
+            plan.report
+        );
+        assert!(plan.apply(image).unwrap().changed_samples > 0);
+    }
+}
+
+#[test]
+#[ignore = "set DNG_DIRTY_LEICA_SAMPLES to the original BearLake DNG directory; read-only"]
+fn original_leica_dust_is_not_lost_to_proposal_starvation() {
+    let root = PathBuf::from(std::env::var_os("DNG_DIRTY_LEICA_SAMPLES").unwrap());
+    let inputs = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
+    let evidence: Vec<_> = inputs
+        .iter()
+        .map(|input| dirty::analyze(&raw::decode(&input.path, false).unwrap()).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for name in [
+        "M1100981.DNG",
+        "M1100983.DNG",
+        "M1100984.DNG",
+        "M1100995.DNG",
+    ] {
+        let index = inputs
+            .iter()
+            .position(|input| input.path.file_name().unwrap() == name)
+            .unwrap();
+        let mut image = raw::decode(&inputs[index].path, false).unwrap();
+        let plan = calibration.plan(&evidence[index]);
+        assert!(
+            plan.report
+                .spots
+                .iter()
+                .any(|spot| (spot.sensor_x - 4392.0).hypot(spot.sensor_y - 529.0) < 20.0),
+            "{name}: known recurring Leica sky shadow was missed: {:?}",
+            plan.report
+        );
+        assert!(plan.apply(&mut image).unwrap().changed_samples > 0);
+    }
+}
+
+#[test]
 #[ignore = "set DNG_DIRTY_SAMPLES; optionally DNG_DIRTY_BINARY for a static executable"]
 fn original_sony_separate_references_export_decodable_color_jxl() {
     let root = PathBuf::from(std::env::var_os("DNG_DIRTY_SAMPLES").unwrap());
@@ -725,6 +1016,70 @@ fn original_sony_separate_references_export_decodable_color_jxl() {
     );
     let render = image.render_frame(0).unwrap();
     let mut pixels = vec![0u16; 3504 * 2336 * 3];
+    assert_eq!(render.stream().write_to_buffer(&mut pixels), pixels.len());
+    assert!(pixels.iter().max() > pixels.iter().min());
+}
+
+#[test]
+#[ignore = "set DNG_DIRTY_LEICA_SAMPLES; optionally DNG_DIRTY_BINARY for a static executable"]
+fn original_leica_separate_references_export_decodable_mono_jxl() {
+    let root = PathBuf::from(std::env::var_os("DNG_DIRTY_LEICA_SAMPLES").unwrap());
+    let binary = std::env::var_os("DNG_DIRTY_BINARY").unwrap_or_else(|| OsString::from(BIN));
+    let output = tempfile::tempdir().unwrap();
+    success(
+        Command::new(binary)
+            .arg(root.join("M1100981.DNG"))
+            .args([
+                "--tone-band",
+                "0:0.25:0.33",
+                "--none",
+                "--lossy",
+                "--jxl",
+                "--jxl-quality",
+                "90",
+                "--report",
+                "--threads",
+                "2",
+                "--jobs",
+                "1",
+                "-fds",
+                "1.25",
+            ])
+            .arg("-o")
+            .arg(output.path())
+            .arg("-fdl")
+            .arg(&root)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 2);
+    let report = json(&output.path().join("M1100981.json"));
+    let references = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
+    assert_eq!(
+        report["dirty_correction"]["reference_images"],
+        references.len()
+    );
+    assert_eq!(report["dirty_correction"]["strength"], 1.25);
+    assert!(
+        report["dirty_correction"]["changed_samples"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let bytes = fs::read(output.path().join("M1100981.jxl")).unwrap();
+    let image = jxl_oxide::JxlImage::builder()
+        .pool(jxl_oxide::JxlThreadPool::none())
+        .read(bytes.as_slice())
+        .unwrap();
+    assert!(image.pixel_format().is_grayscale());
+    assert!(!image.pixel_format().has_alpha());
+    assert_eq!((image.width(), image.height()), (9528, 6328));
+    assert_eq!(
+        image.image_header().metadata.bit_depth.bits_per_sample(),
+        report["additional_formats"][0]["bits"].as_u64().unwrap() as u32
+    );
+    let render = image.render_frame(0).unwrap();
+    let mut pixels = vec![0u16; 9528 * 6328];
     assert_eq!(render.stream().write_to_buffer(&mut pixels), pixels.len());
     assert!(pixels.iter().max() > pixels.iter().min());
 }

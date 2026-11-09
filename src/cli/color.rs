@@ -80,7 +80,11 @@ pub(super) fn process(
         .channels
         .into_par_iter()
         .map(|(channel, mut image)| -> Result<_> {
-            let dirty = dirty_plan.map(|plan| plan.apply(&mut image)).transpose()?;
+            let dirty = dirty_plan
+                .map(|plan| {
+                    plan.apply_with_strength(&mut image, cli.fix_dust_strength.unwrap_or(1.0))
+                })
+                .transpose()?;
             let histogram = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
             let range =
                 range::analyze_with_parameters(&image, &histogram, range_options, &cli.parameters)?;

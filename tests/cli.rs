@@ -144,6 +144,7 @@ fn help_version_and_missing_arguments() {
             "--jobs",
             "--fix-dirty",
             "--fix-dirty-list",
+            "--fix-dust-strength",
             "--no-crop",
             "--report",
             "--analyze",

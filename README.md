@@ -324,6 +324,7 @@ Color reports and analysis JSON contain separate channel metadata/DR results.
 ```sh
 dng-monochrome /path/to/one/DNG-directory -fd -o cleaned --report
 dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory -o cleaned
+dng-monochrome /path/to/one/DNG-directory -fds 1.25 -o stronger --report
 ```
 
 `--fix-dirty` (`-fd`) first decodes and analyzes **every** reference and target
@@ -333,6 +334,15 @@ By default, the processing inputs are also the references. `--fix-dirty-list`
 discovery; it implies `--fix-dirty` and can be repeated. Put target inputs before
 this variadic option. Overlapping inputs are analyzed once; reference-only files
 produce no outputs and target-only files do not contribute detection votes.
+
+`--fix-dust-strength` (`-fix-dust-strength`, `-fds`) accepts a finite value from
+0 to 2 and implies `--fix-dirty`. The default is 1, preserving the normal
+correction amount; 0 still analyzes the batch but leaves pixels unchanged.
+Fractional values weaken the correction, and values above 1 strengthen it by
+scaling the measured log gain (`gain^strength`), still capped at gain 4 and
+the recorded white level. Stronger settings can create bright patches, clipping
+and amplified noise; they do not relax detection confidence or guarantee that
+every shadow disappears.
 
 Use one camera and **one actual directory of references per invocation**.
 Recursive discovery is supported, but references spanning multiple directories
@@ -344,17 +354,18 @@ areas are more useful than repeated shots of the same view. Recorded aperture,
 APEX aperture and lens identifiers do not determine the correction.
 
 The detector looks for compact, recurring dark shadows, rejecting textured
-patches and chance positional matches. Each target supplies its own measured
-shadow shape and strength; confirmed positions without a reliable local estimate
-are left alone. A smooth, feathered local illumination correction brightens
-black-subtracted samples before histogram, clipping and tone processing. Gains
+patches and chance positional matches. Spatially distributed proposals keep
+strong foreground texture from crowding out faint sky shadows. Each target
+supplies its own measured shadow shape and strength; confirmed positions without
+a reliable local estimate are left alone. A smooth, feathered local illumination
+correction brightens black-subtracted samples before histogram, clipping and tone processing. Gains
 are capped at 4 and samples at the recorded white level. Monochrome and color
 use the same correction code; all Bayer planes share the same sensor-position
 gain field, including optional channel files. Final RGB color-factor modes are
 unchanged. Without these flags, the existing pipeline is unchanged.
 
 `--report`, `--verbose` and `--analyze` include `dirty_correction`: reference/view
-counts, accepted sensor positions, gains, changed/clipped samples and warnings.
+counts, accepted sensor positions, strength, gains, changed/clipped samples and warnings.
 Insufficient or ambiguous evidence means unchanged pixels, not guessed repairs.
 This is an estimate, not flat-field calibration or a healing brush: opaque dirt,
 shadows hidden by texture and edge-truncated spots may remain, and recurring
@@ -377,6 +388,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
+| `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |
@@ -1136,13 +1148,15 @@ DNG_COLOR_SAMPLE=/path/shot.ARW \
 Set `DNG_COLOR_BINARY` to test another executable, such as a static build.
 This opt-in test uses temporary output directories and can take several minutes.
 
-The read-only dust regressions use the supplied Sony directory, including
-`DSC01839.ARW`, `DSC01845.ARW` and `DSC01869.ARW`. They also decode a corrected
-lossy JXL; optionally set `DNG_DIRTY_BINARY` to check a static executable:
+The read-only dust regressions use the supplied Sony Nevada and Leica BearLake
+directories. They also decode corrected RGB/monochrome lossy JXLs; optionally
+set `DNG_DIRTY_BINARY` to check a static executable:
 
 ```sh
 DNG_DIRTY_SAMPLES=/path/to/20261108-Nevada/ARW \
   cargo test --release --test dirty original_sony -- --ignored
+DNG_DIRTY_LEICA_SAMPLES=/path/to/20261109-BearLake/DNG \
+  cargo test --release --test dirty original_leica -- --ignored
 ```
 
 ## License
