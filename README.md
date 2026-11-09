@@ -319,6 +319,48 @@ RGB DNGs. Color mode supports declared 2x2 RGB Bayer layouts or the RGGB fallbac
 not interpolating demosaicing of other declared CFA layouts.
 Color reports and analysis JSON contain separate channel metadata/DR results.
 
+### Sensor-dirt correction
+
+```sh
+dng-monochrome /path/to/one/DNG-directory -fd -o cleaned --report
+dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory -o cleaned
+```
+
+`--fix-dirty` (`-fd`) first decodes and analyzes **every** reference and target
+RAW, before any development or output. A failed analysis prevents all outputs.
+By default, the processing inputs are also the references. `--fix-dirty-list`
+(`-fix-dirty-list`, `-fdl`) instead accepts files/directories using normal input
+discovery; it implies `--fix-dirty` and can be repeated. Put target inputs before
+this variadic option. Overlapping inputs are analyzed once; reference-only files
+produce no outputs and target-only files do not contribute detection votes.
+
+Use one camera and **one actual directory of references per invocation**.
+Recursive discovery is supported, but references spanning multiple directories
+are rejected rather than silently pooled. Matching sensor dimensions/crops are
+analyzed separately, in sensor coordinates regardless of EXIF rotation.
+At least three distinct views must confirm a position; near-duplicate frames
+do not provide independent support. Varied scenes with smooth, adequately exposed
+areas are more useful than repeated shots of the same view. Recorded aperture,
+APEX aperture and lens identifiers do not determine the correction.
+
+The detector looks for compact, recurring dark shadows, rejecting textured
+patches and chance positional matches. Each target supplies its own measured
+shadow shape and strength; confirmed positions without a reliable local estimate
+are left alone. A smooth, feathered local illumination correction brightens
+black-subtracted samples before histogram, clipping and tone processing. Gains
+are capped at 4 and samples at the recorded white level. Monochrome and color
+use the same correction code; all Bayer planes share the same sensor-position
+gain field, including optional channel files. Final RGB color-factor modes are
+unchanged. Without these flags, the existing pipeline is unchanged.
+
+`--report`, `--verbose` and `--analyze` include `dirty_correction`: reference/view
+counts, accepted sensor positions, gains, changed/clipped samples and warnings.
+Insufficient or ambiguous evidence means unchanged pixels, not guessed repairs.
+This is an estimate, not flat-field calibration or a healing brush: opaque dirt,
+shadows hidden by texture and edge-truncated spots may remain, and recurring
+scene structure can still mislead an automatic detector. Brightening also
+amplifies noise and cannot recover detail that was never recorded.
+
 ### All command-line options
 
 The documented `--long` options also accept `-long`, including `-help`,
@@ -333,6 +375,8 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
 | `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
+| `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
+| `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |
@@ -636,11 +680,15 @@ EXIF rationals or JSON numeric precision.
 
 ## What happens to the pixels
 
+With `--fix-dirty`, the whole-reference/target analysis pass finishes before this
+development pipeline starts.
+
 1. Decode the raw integer samples, including lossless JPEG compression. There
    is no demosaicing, white balance, color matrix, or embedded-preview conversion.
    Apply DNG linearization when supplied by the decoder. Apply the recommended
    crop (or active area when no crop is supplied) and physically apply EXIF
-   orientation. `--no-crop` disables only cropping.
+   orientation. `--no-crop` disables only cropping. Apply the measured sensor-dirt
+   correction here when requested, before independently developing each channel.
 2. Build an exact **65,536-bin histogram** of the retained raw pixels. All
    integer codes remain available; there is no preliminary 8-bit image.
 3. Select lower and upper endpoints, automatically or from the requested
@@ -653,7 +701,7 @@ EXIF rationals or JSON numeric precision.
    Save only the selected formats. JPEG samples use the selected JPEG transfer;
    HEIC/AVIF/JPEG2000 quantize this master to their DR-selected precision.
 
-All calculations after decoding use `f64`. Each expression is evaluated once
+Tone calculations use `f64`. Each expression is evaluated once
 per occupied raw code, not once per pixel, and cached in a lookup table.
 Histogram construction, noise sampling, pixel mapping and supported raw
 decompression use Rayon. Selected PNG and JPEG encoding can run concurrently
@@ -1025,8 +1073,9 @@ Batch conversion continues after individual input/variant failures and exits
 nonzero if any failed. Syntax errors exit with code 2; processing errors with
 code 1; successful conversion/help/version with code 0.
 
-The intended input is monochrome integer DNG. Color/CFA samples, unsupported
-floating-point DNGs or non-uniform black-level layouts are rejected explicitly.
+Inputs must be integer, single-component DNG/ARW rasters; floating-point or
+already-developed RGB rasters are rejected. CFA metadata does not select color
+mode: only `--color` enables channel splitting.
 The raw decoder does not reproduce a proprietary Leica rendering or apply
 every DNG opcode/profile. It is not a substitute for dark/flat calibration of
 a modified full-spectrum sensor.
@@ -1086,6 +1135,15 @@ DNG_COLOR_SAMPLE=/path/shot.ARW \
 
 Set `DNG_COLOR_BINARY` to test another executable, such as a static build.
 This opt-in test uses temporary output directories and can take several minutes.
+
+The read-only dust regressions use the supplied Sony directory, including
+`DSC01839.ARW`, `DSC01845.ARW` and `DSC01869.ARW`. They also decode a corrected
+lossy JXL; optionally set `DNG_DIRTY_BINARY` to check a static executable:
+
+```sh
+DNG_DIRTY_SAMPLES=/path/to/20261108-Nevada/ARW \
+  cargo test --release --test dirty original_sony -- --ignored
+```
 
 ## License
 

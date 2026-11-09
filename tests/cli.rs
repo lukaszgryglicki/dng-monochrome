@@ -142,6 +142,8 @@ fn help_version_and_missing_arguments() {
             "--jpeg-quality",
             "--threads",
             "--jobs",
+            "--fix-dirty",
+            "--fix-dirty-list",
             "--no-crop",
             "--report",
             "--analyze",

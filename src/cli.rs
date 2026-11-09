@@ -1,4 +1,5 @@
 use crate::{
+    dirty,
     expression::{Expression, FunctionPolicy, ToneBand},
     formats::{Encoding, Format, OutputOptions},
     output::{self, OutputPaths},
@@ -11,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{ArgGroup, CommandFactory, Parser};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -44,7 +45,8 @@ mod color;
         clipping strength is 3, PNG and JPEG transfers are both linear. \
         Tunable constants are exposed as --param-* options.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
-        Pipeline: crop/orient -> range stretch -> optimize (unless --no-optimize) -> function/tone-band -> policy -> transfers.\n\
+        Pipeline: crop/orient -> optional sensor-dirt correction -> range stretch -> optimize -> function/tone-band -> policy -> transfers.\n\
+        --fix-dirty/-fd completes all RAW analysis before development; --no-optimize skips optimization.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
         dng-monochrome photos/ -o dng-mono --both --report\n  \
@@ -57,6 +59,7 @@ mod color;
         dng-monochrome shot.DNG -heic -heic-mode lossy -heic-quality 95\n\
         dng-monochrome --color --none --jxl --j2k --avif shot.ARW\n  \
         dng-monochrome -c -4 -ga -kc --both --report photos/\n\
+        dng-monochrome shot.ARW -c -nc --transfer srgb -fdl reference-raws/ -o cleaned\n\
         Expressions: + - * / % ^, unary +/- and parentheses; pi, e; sqrt, abs, exp, ln, log,\n\
         log2, log10, log1p, exp2, expm1, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh/tanh,\n\
         asinh/acosh/atanh, floor/ceil/round, sign/signum, min/max, pow, hypot, clamp,\n\
@@ -119,6 +122,23 @@ pub struct Cli {
         help = "Estimate white balance from developed final RGB, without changing separate channels; use --report for factors"
     )]
     pub natural_color: bool,
+
+    #[arg(
+        long,
+        visible_alias = "fd",
+        help = "Analyze all RAWs first, then brighten confidently recurring sensor-dirt shadows before development"
+    )]
+    pub fix_dirty: bool,
+
+    #[arg(
+        long,
+        visible_alias = "fdl",
+        num_args = 1..,
+        action = clap::ArgAction::Append,
+        value_name = "RAW_OR_DIRECTORY",
+        help = "Separate dirt-reference files/directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
+    )]
+    pub fix_dirty_list: Vec<PathBuf>,
 
     #[arg(
         short = 'o',
@@ -381,6 +401,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jxl-quality",
         "threads",
         "jobs",
+        "fix-dirty-list",
+        "fdl",
     ];
     const FLAGS: &[&str] = &[
         "color",
@@ -395,6 +417,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "wb",
         "natural-color",
         "nc",
+        "fix-dirty",
+        "fd",
         "func-clip",
         "func-scale",
         "func-wrap",
@@ -607,6 +631,92 @@ struct FileOutcome {
     analysis: Option<serde_json::Value>,
 }
 
+fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<Vec<dirty::Plan>>> {
+    if !cli.fix_dirty && cli.fix_dirty_list.is_empty() {
+        return Ok(None);
+    }
+    let separate = (!cli.fix_dirty_list.is_empty())
+        .then(|| discover(&cli.fix_dirty_list))
+        .transpose()?;
+    let references = separate.as_deref().unwrap_or(inputs);
+    let parent = references[0].path.parent();
+    ensure!(
+        references.iter().all(|input| input.path.parent() == parent),
+        "--fix-dirty reference RAWs must come from a single directory; run separate directories independently"
+    );
+    let mut paths = Vec::new();
+    let mut indices = HashMap::new();
+    for input in references.iter().chain(inputs) {
+        if !indices.contains_key(&input.path) {
+            indices.insert(input.path.clone(), paths.len());
+            paths.push(input.path.as_path());
+        }
+    }
+    if !cli.silent {
+        eprintln!(
+            "Sensor-dirt prepass: {} reference(s), {} additional target(s); analyzing all {} RAWs before conversion",
+            references.len(),
+            paths.len() - references.len(),
+            paths.len()
+        );
+    }
+    let completed = AtomicUsize::new(0);
+    let results = process_files(paths.len(), threads, usize::from(cli.jobs), |index| {
+        let result =
+            raw::decode(paths[index], cli.no_crop).and_then(|image| dirty::analyze(&image));
+        if !cli.silent {
+            let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "  dirt analysis [{count}/{}] {}",
+                paths.len(),
+                paths[index].display()
+            );
+        }
+        result
+    })?;
+    let mut evidence = Vec::with_capacity(results.len());
+    let mut failures = 0;
+    for (path, result) in paths.iter().zip(results) {
+        match result {
+            Ok(frame) => evidence.push(frame),
+            Err(error) => {
+                failures += 1;
+                eprintln!("ERROR sensor-dirt analysis {}: {error:#}", path.display());
+            }
+        }
+    }
+    ensure!(
+        failures == 0,
+        "sensor-dirt prepass failed for {failures} RAW(s); no output files were written"
+    );
+    let calibration = dirty::Calibration::new(&evidence[..references.len()])?;
+    let plans = inputs
+        .iter()
+        .map(|input| calibration.plan(&evidence[indices[&input.path]]))
+        .collect();
+    if !cli.silent {
+        eprintln!(
+            "Sensor-dirt analysis complete for all {} RAWs; starting target processing",
+            paths.len()
+        );
+    }
+    Ok(Some(plans))
+}
+
+fn dirty_progress(report: &dirty::Report, path: &Path) {
+    if let Some(warning) = report.warning {
+        eprintln!("WARNING {} [sensor dirt]: {warning}", path.display());
+    } else {
+        eprintln!(
+            "  sensor dirt {}: {} spot(s), {} changed sample(s), maximum gain {:.3}",
+            path.display(),
+            report.spots.len(),
+            report.changed_samples,
+            report.maximum_gain
+        );
+    }
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     cli.parameters.validate()?;
     cli.formats.validate(cli.analyze)?;
@@ -653,6 +763,7 @@ pub fn run(cli: Cli) -> Result<()> {
         usize::from(cli.threads)
     };
     let jobs = usize::from(cli.jobs).min(threads).min(inputs.len());
+    let dirty_plans = prepare_dirty(&cli, &inputs, threads)?;
     let results = process_files(
         inputs.len(),
         threads,
@@ -670,6 +781,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     &modes,
                     range_options,
                     expression.as_ref(),
+                    dirty_plans.as_ref().map(|plans| &plans[index]),
                 ) {
                     Ok(outcome) => Ok(outcome),
                     Err(error) => {
@@ -685,7 +797,11 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut outcome = FileOutcome::default();
             let start = Instant::now();
             let decoded = (|| -> Result<_> {
-                let image = raw::decode(&input.path, cli.no_crop)?;
+                let mut image = raw::decode(&input.path, cli.no_crop)?;
+                let dirty_report = dirty_plans
+                    .as_ref()
+                    .map(|plans| plans[index].apply(&mut image))
+                    .transpose()?;
                 let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
                 let range =
                     range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
@@ -694,9 +810,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 } else {
                     cli.formats.encodings(range.dynamic_range.snr1_stops)?
                 };
-                Ok((image, hist, range, encodings))
+                Ok((image, hist, range, encodings, dirty_report))
             })();
-            let (image, hist, range, encodings) = match decoded {
+            let (image, hist, range, encodings, dirty_report) = match decoded {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("ERROR {}: {error:#}", input.path.display());
@@ -705,6 +821,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             };
             if !cli.silent {
+                if let Some(report) = &dirty_report {
+                    dirty_progress(report, &input.path);
+                }
                 for warning in &range.warnings {
                     eprintln!("WARNING {}: {warning}", input.path.display());
                 }
@@ -713,7 +832,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
             if cli.verbose {
-                let diagnostic = serde_json::json!({
+                let mut diagnostic = serde_json::json!({
                     "source": input.path.to_string_lossy(),
                     "metadata": image.metadata,
                     "range": range,
@@ -722,10 +841,13 @@ pub fn run(cli: Cli) -> Result<()> {
                     "jobs": jobs,
                     "file_threads": file_threads,
                 });
+                if let Some(report) = &dirty_report {
+                    diagnostic["dirty_correction"] = serde_json::to_value(report)?;
+                }
                 eprintln!("{}", serde_json::to_string_pretty(&diagnostic)?);
             }
             if cli.analyze {
-                let report = serde_json::json!({
+                let mut report = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "source": input.path.to_string_lossy(),
                     "metadata": image.metadata,
@@ -735,6 +857,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     "jobs": jobs,
                     "file_threads": file_threads,
                 });
+                if let Some(dirty) = &dirty_report {
+                    report["dirty_correction"] = serde_json::to_value(dirty)?;
+                }
                 outcome.analysis = Some(report);
                 outcome.successes += 1;
                 return Ok(outcome);
@@ -772,6 +897,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         file_threads,
                         parameters: &cli.parameters,
                         additional_formats: encodings.clone(),
+                        dirty_correction: dirty_report.as_ref(),
                     };
                     let warnings = output::save_with_encodings(
                         &paths,
@@ -970,6 +1096,8 @@ struct ConversionReport<'a> {
     parameters: &'a Parameters,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     additional_formats: Vec<Encoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty_correction: Option<&'a dirty::Report>,
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ struct Plane {
     histogram: Histogram,
     range: range::RangeAnalysis,
     encodings: Vec<Encoding>,
+    dirty: Option<dirty::Report>,
 }
 
 fn channel_paths(
@@ -59,6 +60,7 @@ pub(super) fn process(
     modes: &[bool],
     range_options: RangeOptions,
     expression: Option<&Expression>,
+    dirty_plan: Option<&dirty::Plan>,
 ) -> Result<FileOutcome> {
     let start = Instant::now();
     let green = cli.green();
@@ -77,7 +79,8 @@ pub(super) fn process(
     let planes: Vec<Plane> = decoded
         .channels
         .into_par_iter()
-        .map(|(channel, image)| -> Result<_> {
+        .map(|(channel, mut image)| -> Result<_> {
+            let dirty = dirty_plan.map(|plan| plan.apply(&mut image)).transpose()?;
             let histogram = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
             let range =
                 range::analyze_with_parameters(&image, &histogram, range_options, &cli.parameters)?;
@@ -92,6 +95,7 @@ pub(super) fn process(
                 histogram,
                 range,
                 encodings,
+                dirty,
             })
         })
         .collect::<Result<_>>()?;
@@ -115,6 +119,24 @@ pub(super) fn process(
         .transpose()?;
     let file_threads = rayon::current_num_threads();
     let first = &planes[selected[0]].image;
+    let dirty_report = planes[selected[0]].dirty.clone().map(|mut report| {
+        report.changed_samples = planes
+            .iter()
+            .filter_map(|plane| plane.dirty.as_ref())
+            .map(|report| report.changed_samples)
+            .sum();
+        report.clipped_samples = planes
+            .iter()
+            .filter_map(|plane| plane.dirty.as_ref())
+            .map(|report| report.clipped_samples)
+            .sum();
+        report.maximum_gain = planes
+            .iter()
+            .filter_map(|plane| plane.dirty.as_ref())
+            .map(|report| report.maximum_gain)
+            .fold(1.0, f64::max);
+        report
+    });
     let natural_reference_mask = if cli.natural_color {
         decoded
             .recorded_white_balance
@@ -138,7 +160,7 @@ pub(super) fn process(
             )
         })
         .collect();
-    let analysis = serde_json::json!({
+    let mut analysis = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"), "source": input.path.to_string_lossy(),
         "color": true, "cfa": decoded.cfa, "green": green,
         "cfa_assumed": decoded.cfa_assumed,
@@ -149,10 +171,16 @@ pub(super) fn process(
         "channels": analysis_channels, "parameters": cli.parameters,
         "threads": threads, "jobs": jobs, "file_threads": file_threads,
     });
+    if let Some(report) = &dirty_report {
+        analysis["dirty_correction"] = serde_json::to_value(report)?;
+    }
     if cli.verbose {
         eprintln!("{}", serde_json::to_string_pretty(&analysis)?);
     }
     if !cli.silent {
+        if let Some(report) = &dirty_report {
+            dirty_progress(report, &input.path);
+        }
         if decoded.cfa_assumed {
             eprintln!(
                 "WARNING {}: no CFA layout; --color assumes RGGB at the raw origin",
@@ -296,6 +324,7 @@ pub(super) fn process(
                     file_threads,
                     parameters: &cli.parameters,
                     additional_formats: plane.encodings.clone(),
+                    dirty_correction: plane.dirty.as_ref(),
                 })
                 .collect();
             let channel_reports: BTreeMap<_, _> = planes
@@ -303,7 +332,7 @@ pub(super) fn process(
                 .zip(&reports)
                 .map(|(plane, report)| (plane.channel.name(), report))
                 .collect();
-            let report = serde_json::json!({
+            let mut report = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"), "source": input.path.to_string_lossy(), "mode": mode,
                 "color": true, "cfa": decoded.cfa, "green": green,
                 "cfa_assumed": decoded.cfa_assumed,
@@ -318,6 +347,9 @@ pub(super) fn process(
                 "jpeg_quality": cli.jpeg_quality,
                 "additional_formats": encodings, "threads": threads, "jobs": jobs, "file_threads": file_threads,
             });
+            if let Some(dirty) = &dirty_report {
+                report["dirty_correction"] = serde_json::to_value(dirty)?;
+            }
             let png = if enabled.contains(&Format::Png) {
                 color::combine_with_scales(
                     rgb.map(|rendered| (rendered.png.as_slice(), 16)),
