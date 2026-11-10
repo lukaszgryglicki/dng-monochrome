@@ -98,6 +98,111 @@ fn fixture(root: &Path) -> (std::path::PathBuf, Dng) {
 }
 
 #[test]
+fn noise_reduction_flags_aliases_bounds_and_argument_boundaries() {
+    let parse = |flags: &[&str]| {
+        dng_monochrome::cli::Cli::try_parse_compat(
+            ["dng-monochrome", "photo.DNG"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(std::ffi::OsString::from),
+        )
+    };
+    let defaults = parse(&[]).unwrap();
+    assert!(!defaults.noise_reduction && defaults.noise_reduction_level.is_none());
+    for flag in ["--noise-reduction", "-noise-reduction", "--nr", "-nr"] {
+        assert!(parse(&[flag]).unwrap().noise_reduction);
+    }
+    for flag in [
+        "--noise-reduction-level",
+        "-noise-reduction-level",
+        "--nrl",
+        "-nrl",
+    ] {
+        for level in ["0", "0.5", "1", "1.25", "2"] {
+            assert_eq!(
+                parse(&[flag, level]).unwrap().noise_reduction_level,
+                Some(level.parse().unwrap())
+            );
+        }
+        for level in ["-0.1", "2.01", "NaN", "inf", "-inf", "1e300", "bad"] {
+            assert!(parse(&[flag, level]).is_err(), "{flag} {level}");
+        }
+        assert_eq!(
+            parse(&[&format!("{flag}=0.25")])
+                .unwrap()
+                .noise_reduction_level,
+            Some(0.25)
+        );
+    }
+    assert!(parse(&["--nr=true"]).is_err());
+    assert!(!parse(&["-func", "-nr"]).unwrap().noise_reduction);
+    let boundary = parse(&["--", "-nr", "-nrl"]).unwrap();
+    assert!(!boundary.noise_reduction && boundary.noise_reduction_level.is_none());
+}
+
+#[test]
+fn noise_reduction_zero_is_encoded_noop_and_preserves_original_analysis() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("photo.DNG");
+    Dng::noisy(128, 96).write(&input);
+    let original = fs::read(&input).unwrap();
+    let flags = ["-both", "-report", "-silent"];
+    for (name, noise_flags) in [
+        ("off", vec![]),
+        ("zero", vec!["-nr", "-nrl", "0"]),
+        ("on", vec!["-nr"]),
+        ("explicit", vec!["-nrl", "1"]),
+    ] {
+        let output = dir.path().join(name);
+        let mut arguments = flags.to_vec();
+        arguments.extend(noise_flags);
+        let result = success(run(&input, &output, &arguments));
+        assert!(result.stdout.is_empty() && result.stderr.is_empty());
+    }
+    for mode in ["auto", "best"] {
+        let root = |name| dir.path().join(name).join(mode);
+        for extension in ["png", "jpg"] {
+            let file = format!("photo.{extension}");
+            assert_eq!(
+                fs::read(root("off").join(&file)).unwrap(),
+                fs::read(root("zero").join(&file)).unwrap(),
+                "{mode} {extension} zero"
+            );
+            assert_eq!(
+                fs::read(root("on").join(&file)).unwrap(),
+                fs::read(root("explicit").join(&file)).unwrap(),
+                "{mode} {extension} implied"
+            );
+        }
+        assert_ne!(
+            read_png(&root("off").join("photo.png")).pixels,
+            read_png(&root("on").join("photo.png")).pixels
+        );
+        let before = json(&root("off").join("photo.json"));
+        let zero = json(&root("zero").join("photo.json"));
+        let after = json(&root("on").join("photo.json"));
+        assert_eq!(before, zero);
+        assert_eq!(before["range"], after["range"]);
+        assert_eq!(before["tone"], after["tone"]);
+        assert_eq!(after["noise_reduction"]["applied"], true);
+        assert_eq!(after["noise_reduction"]["level"], 1.0);
+        assert!(before.get("noise_reduction").is_none());
+    }
+    let analysis = success(run(
+        &input,
+        &dir.path().join("analysis"),
+        &["--analyze", "--nr", "--silent"],
+    ));
+    let analysis: serde_json::Value = serde_json::from_slice(&analysis.stdout).unwrap();
+    assert_eq!(analysis["noise_reduction"]["applied"], true);
+    assert_eq!(
+        analysis["range"],
+        json(&dir.path().join("off/auto/photo.json"))["range"]
+    );
+    assert_eq!(fs::read(input).unwrap(), original);
+}
+
+#[test]
 fn help_version_and_missing_arguments() {
     let defaults = dng_monochrome::cli::Cli::try_parse_compat(
         ["dng-monochrome", "photo.DNG"]
@@ -145,6 +250,8 @@ fn help_version_and_missing_arguments() {
             "--fix-dirty",
             "--fix-dirty-list",
             "--fix-dust-strength",
+            "--noise-reduction",
+            "--noise-reduction-level",
             "--no-crop",
             "--report",
             "--analyze",

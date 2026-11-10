@@ -10,6 +10,7 @@ struct Plane {
     range: range::RangeAnalysis,
     encodings: Vec<Encoding>,
     dirty: Option<dirty::Report>,
+    noise_reduction: Option<denoise::Reduction>,
 }
 
 fn channel_paths(
@@ -88,6 +89,9 @@ pub(super) fn process(
             let histogram = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
             let range =
                 range::analyze_with_parameters(&image, &histogram, range_options, &cli.parameters)?;
+            let noise_reduction = (cli.noise_level() != 0.0)
+                .then(|| denoise::reduce(&image, &range.noise, cli.noise_level()))
+                .transpose()?;
             let encodings = if cli.analyze {
                 Vec::new()
             } else {
@@ -100,6 +104,7 @@ pub(super) fn process(
                 range,
                 encodings,
                 dirty,
+                noise_reduction,
             })
         })
         .collect::<Result<_>>()?;
@@ -158,10 +163,13 @@ pub(super) fn process(
     let analysis_channels: BTreeMap<_, _> = planes
         .iter()
         .map(|plane| {
-            (
-                plane.channel.name(),
-                serde_json::json!({ "metadata": plane.image.metadata, "range": plane.range }),
-            )
+            let mut channel = serde_json::json!({
+                "metadata": plane.image.metadata, "range": plane.range
+            });
+            if let Some(reduction) = &plane.noise_reduction {
+                channel["noise_reduction"] = serde_json::json!(reduction.report);
+            }
+            (plane.channel.name(), channel)
         })
         .collect();
     let mut analysis = serde_json::json!({
@@ -198,6 +206,9 @@ pub(super) fn process(
             );
         }
         for plane in &planes {
+            if let Some(reduction) = &plane.noise_reduction {
+                noise_progress(&reduction.report, &input.path, Some(plane.channel.name()));
+            }
             for warning in plane
                 .range
                 .warnings
@@ -235,7 +246,7 @@ pub(super) fn process(
             let rendered: Vec<_> = planes
                 .par_iter()
                 .map(|plane| {
-                    tone::render_with_parameters(
+                    tone::render_with_noise_reduction(
                         &plane.image,
                         &plane.histogram,
                         &plane.range,
@@ -244,6 +255,7 @@ pub(super) fn process(
                         cli.policy(),
                         transfers,
                         &cli.parameters,
+                        plane.noise_reduction.as_ref(),
                     )
                 })
                 .collect::<Result<_>>()?;
@@ -329,6 +341,10 @@ pub(super) fn process(
                     parameters: &cli.parameters,
                     additional_formats: plane.encodings.clone(),
                     dirty_correction: plane.dirty.as_ref(),
+                    noise_reduction: plane
+                        .noise_reduction
+                        .as_ref()
+                        .map(|reduction| &reduction.report),
                 })
                 .collect();
             let channel_reports: BTreeMap<_, _> = planes

@@ -28,6 +28,24 @@ pub struct Dng {
 }
 
 impl Dng {
+    pub fn noisy(width: u32, height: u32) -> Self {
+        let mut image = Self::ramp(width, height);
+        let mut state = 1234567u64;
+        let mut uniform = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 32) as f64 + 0.5) / 4294967296.0
+        };
+        for (i, value) in image.pixels.iter_mut().enumerate() {
+            let noise = (-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos();
+            *value = (2000.0
+                + 6.0 * (i % width as usize) as f64
+                + 3.0 * (i / width as usize) as f64
+                + 25.0 * noise)
+                .round() as u16;
+        }
+        image
+    }
+
     pub fn ramp(width: u32, height: u32) -> Self {
         let n = width * height;
         Self {

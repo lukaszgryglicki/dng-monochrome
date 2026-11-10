@@ -1,5 +1,5 @@
 use crate::{
-    dirty,
+    denoise, dirty,
     expression::{Expression, FunctionPolicy, ToneBand},
     formats::{Encoding, Format, OutputOptions},
     output::{self, OutputPaths},
@@ -45,8 +45,10 @@ mod color;
         clipping strength is 3, PNG and JPEG transfers are both linear. \
         Tunable constants are exposed as --param-* options.",
     after_help = "Single-dash long options also work: -dark 0.8 -light 1.2% -clip-strength 9 -func 'x^.5' -best.\n\
-        Pipeline: crop/orient -> optional sensor-dirt correction -> range stretch -> optimize -> function/tone-band -> policy -> transfers.\n\
+        Pipeline: crop/orient -> optional sensor-dirt correction -> optional noise reduction -> range stretch -> optimize -> function/tone-band -> policy -> transfers.\n\
         --fix-dirty/-fd completes all RAW analysis before development; --no-optimize skips optimization.\n\
+        --noise-reduction/-nr defaults to level 1; --noise-reduction-level/-nrl accepts 0..2 and also enables it.\n\
+        Noise/range/DR and tone fitting use the original pre-denoising samples.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
         dng-monochrome photos/ -o dng-mono --both --report\n  \
@@ -149,6 +151,23 @@ pub struct Cli {
         help = "Sensor-dirt correction strength 0..2 (default 1); implies --fix-dirty. 0 leaves pixels unchanged; >1 may amplify noise or create bright patches"
     )]
     pub fix_dust_strength: Option<f64>,
+
+    #[arg(
+        long,
+        visible_alias = "nr",
+        help = "Enable noise-adaptive, edge-preserving RAW denoising at level 1; disabled by default"
+    )]
+    pub noise_reduction: bool,
+
+    #[arg(
+        long,
+        visible_alias = "nrl",
+        value_parser = parse_noise_level,
+        allow_hyphen_values = true,
+        value_name = "LEVEL",
+        help = "Noise reduction level 0..2 (default 1 when enabled); implies --noise-reduction. 0 is unchanged; higher levels may soften fine detail"
+    )]
+    pub noise_reduction_level: Option<f64>,
 
     #[arg(
         short = 'o',
@@ -309,6 +328,11 @@ pub struct Cli {
 }
 
 impl Cli {
+    fn noise_level(&self) -> f64 {
+        self.noise_reduction_level
+            .unwrap_or(if self.noise_reduction { 1.0 } else { 0.0 })
+    }
+
     pub fn green(&self) -> crate::color::Green {
         if self.ga {
             crate::color::Green::Average
@@ -397,6 +421,17 @@ fn parse_dust_strength(input: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_noise_level(input: &str) -> Result<f64, String> {
+    let value: f64 = input
+        .parse()
+        .map_err(|_| "expected a noise reduction level such as 0.5 or 1.25".to_string())?;
+    if value.is_finite() && (0.0..=2.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("noise reduction level must be finite and in [0, 2]".into())
+    }
+}
+
 fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     const VALUES: &[&str] = &[
         "output",
@@ -426,6 +461,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "fdl",
         "fix-dust-strength",
         "fds",
+        "noise-reduction-level",
+        "nrl",
     ];
     const FLAGS: &[&str] = &[
         "color",
@@ -442,6 +479,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "nc",
         "fix-dirty",
         "fd",
+        "noise-reduction",
+        "nr",
         "func-clip",
         "func-scale",
         "func-wrap",
@@ -741,6 +780,22 @@ fn dirty_progress(report: &dirty::Report, path: &Path) {
     }
 }
 
+fn noise_progress(report: &denoise::Report, path: &Path, channel: Option<&str>) {
+    let label = channel.map_or_else(
+        || path.display().to_string(),
+        |channel| format!("{} [{channel}]", path.display()),
+    );
+    if report.applied {
+        eprintln!(
+            "  noise reduction {label}: level {:.3}, {} scales, {} changed sample(s)",
+            report.level, report.scales, report.changed_samples
+        );
+    }
+    for warning in &report.warnings {
+        eprintln!("WARNING {label} [noise reduction]: {warning}");
+    }
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     cli.parameters.validate()?;
     cli.formats.validate(cli.analyze)?;
@@ -832,14 +887,17 @@ pub fn run(cli: Cli) -> Result<()> {
                 let hist = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
                 let range =
                     range::analyze_with_parameters(&image, &hist, range_options, &cli.parameters)?;
+                let noise_reduction = (cli.noise_level() != 0.0)
+                    .then(|| denoise::reduce(&image, &range.noise, cli.noise_level()))
+                    .transpose()?;
                 let encodings = if cli.analyze {
                     Vec::new()
                 } else {
                     cli.formats.encodings(range.dynamic_range.snr1_stops)?
                 };
-                Ok((image, hist, range, encodings, dirty_report))
+                Ok((image, hist, range, encodings, dirty_report, noise_reduction))
             })();
-            let (image, hist, range, encodings, dirty_report) = match decoded {
+            let (image, hist, range, encodings, dirty_report, noise_reduction) = match decoded {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("ERROR {}: {error:#}", input.path.display());
@@ -850,6 +908,9 @@ pub fn run(cli: Cli) -> Result<()> {
             if !cli.silent {
                 if let Some(report) = &dirty_report {
                     dirty_progress(report, &input.path);
+                }
+                if let Some(reduction) = &noise_reduction {
+                    noise_progress(&reduction.report, &input.path, None);
                 }
                 for warning in &range.warnings {
                     eprintln!("WARNING {}: {warning}", input.path.display());
@@ -871,6 +932,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 if let Some(report) = &dirty_report {
                     diagnostic["dirty_correction"] = serde_json::to_value(report)?;
                 }
+                if let Some(reduction) = &noise_reduction {
+                    diagnostic["noise_reduction"] = serde_json::to_value(&reduction.report)?;
+                }
                 eprintln!("{}", serde_json::to_string_pretty(&diagnostic)?);
             }
             if cli.analyze {
@@ -887,6 +951,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 if let Some(dirty) = &dirty_report {
                     report["dirty_correction"] = serde_json::to_value(dirty)?;
                 }
+                if let Some(reduction) = &noise_reduction {
+                    report["noise_reduction"] = serde_json::to_value(&reduction.report)?;
+                }
                 outcome.analysis = Some(report);
                 outcome.successes += 1;
                 return Ok(outcome);
@@ -894,7 +961,7 @@ pub fn run(cli: Cli) -> Result<()> {
             for &optimized in &modes {
                 let mode = if optimized { "best" } else { "auto" };
                 let result = (|| -> Result<()> {
-                    let rendered = tone::render_with_parameters(
+                    let rendered = tone::render_with_noise_reduction(
                         &image,
                         &hist,
                         &range,
@@ -903,6 +970,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         cli.policy(),
                         transfers,
                         &cli.parameters,
+                        noise_reduction.as_ref(),
                     )?;
                     let paths = output_paths(&cli, input, optimized);
                     let report = ConversionReport {
@@ -925,6 +993,9 @@ pub fn run(cli: Cli) -> Result<()> {
                         parameters: &cli.parameters,
                         additional_formats: encodings.clone(),
                         dirty_correction: dirty_report.as_ref(),
+                        noise_reduction: noise_reduction
+                            .as_ref()
+                            .map(|reduction| &reduction.report),
                     };
                     let warnings = output::save_with_encodings(
                         &paths,
@@ -1125,6 +1196,8 @@ struct ConversionReport<'a> {
     additional_formats: Vec<Encoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dirty_correction: Option<&'a dirty::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    noise_reduction: Option<&'a denoise::Report>,
 }
 
 #[cfg(test)]

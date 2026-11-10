@@ -416,3 +416,81 @@ pub fn render_with_parameters(
         stats,
     })
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_noise_reduction(
+    image: &MonoImage,
+    hist: &Histogram,
+    range: &RangeAnalysis,
+    optimized: bool,
+    expression: Option<&Expression>,
+    policy: FunctionPolicy,
+    transfers: Transfers,
+    parameters: &Parameters,
+    reduction: Option<&crate::denoise::Reduction>,
+) -> Result<Rendered> {
+    let Some(samples) = reduction.and_then(|reduction| reduction.pixels.as_deref()) else {
+        return render_with_parameters(
+            image, hist, range, optimized, expression, policy, transfers, parameters,
+        );
+    };
+    ensure!(
+        samples.len() == image.pixels.len(),
+        "denoised sample count must match the image"
+    );
+    let tone = ToneCurve::fit_with_parameters(
+        hist,
+        range,
+        optimized,
+        image.metadata.black_level,
+        parameters,
+    )?;
+    let mut values: Vec<_> = samples
+        .par_iter()
+        .map(|&value| {
+            ensure!(
+                value.is_finite() && (0.0..=65535.0).contains(&value),
+                "denoised RAW samples must be finite and in [0, 65535]"
+            );
+            Ok(tone.map(range.normalize(f64::from(value))))
+        })
+        .collect::<Result<_>>()?;
+    let function = expression::apply_samples(&mut values, expression, policy)?;
+    let png: Vec<_> = values
+        .par_iter()
+        .map(|&value| {
+            let value = match transfers.png {
+                Transfer::Srgb => srgb_encode(value),
+                Transfer::Linear => value,
+            };
+            (value.clamp(0.0, 1.0) * 65535.0).round() as u16
+        })
+        .collect();
+    let jpeg: Vec<_> = png
+        .par_iter()
+        .map(|&value| {
+            let value = f64::from(value) / 65535.0;
+            let value = match (transfers.png, transfers.jpeg) {
+                (Transfer::Srgb, Transfer::Linear) => srgb_decode(value),
+                (Transfer::Linear, Transfer::Srgb) => srgb_encode(value),
+                _ => value,
+            };
+            (value.clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+        .collect();
+    let output_hist = Histogram::with_parameters(&png, parameters)?;
+    let stats = RenderStats {
+        png_min: output_hist.min,
+        png_max: output_hist.max,
+        png_occupied_codes: output_hist.bins.iter().filter(|&&count| count > 0).count(),
+        jpeg_min: *jpeg.iter().min().expect("nonempty image"),
+        jpeg_max: *jpeg.iter().max().expect("nonempty image"),
+    };
+    Ok(Rendered {
+        png,
+        jpeg,
+        tone,
+        function,
+        stats,
+    })
+}

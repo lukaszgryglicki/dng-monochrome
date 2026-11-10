@@ -1,10 +1,349 @@
 use dng_monochrome::{
+    denoise,
     expression::{Expression, FunctionPolicy},
+    noise::{NoiseBin, NoiseEstimate, NoiseModel},
     parameters::Parameters,
     range::{self, Histogram, RangeOptions},
     raw::{MonoImage, SensorMetadata},
     tone::{self, ToneCurve, Transfer},
 };
+
+fn reduction_noise(shot: f64, read: f64) -> NoiseEstimate {
+    NoiseEstimate {
+        model: Some(NoiseModel {
+            shot_coefficient: shot,
+            read_variance: read,
+            source: "synthetic",
+        }),
+        read_noise_resolved: true,
+        ..NoiseEstimate::default()
+    }
+}
+
+#[test]
+fn noise_reduction_preserves_gradients_edges_and_visible_texture() {
+    let width = 256;
+    let truth: Vec<_> = (0..width * width)
+        .map(|i| {
+            let (x, y) = (i % width, i / width);
+            let texture = if (176..208).contains(&x) && (80..176).contains(&y) {
+                if (x / 2) % 2 == 0 { -160.0 } else { 160.0 }
+            } else {
+                0.0
+            };
+            (if x < 128 { 2000.0 } else { 9000.0 }) + 0.2 * y as f64 + texture
+        })
+        .collect();
+    let pixels = truth
+        .iter()
+        .zip(normal_noise(truth.len()))
+        .map(|(&value, noise)| (value + 30.0 * noise).round() as u16)
+        .collect();
+    let image = image(pixels, width, 1023.0, 16383);
+    let original = image.pixels.clone();
+    let noise = reduction_noise(0.0, 900.0);
+    let flat: Vec<_> = (0..truth.len())
+        .filter(|&i| {
+            let (x, y) = (i % width, i / width);
+            (32..224).contains(&y) && ((32..96).contains(&x) || (224..240).contains(&x))
+        })
+        .collect();
+    let mse = |values: &[f32]| {
+        flat.iter()
+            .map(|&i| (f64::from(values[i]) - truth[i]).powi(2))
+            .sum::<f64>()
+            / flat.len() as f64
+    };
+    let baseline: Vec<_> = original.iter().map(|&value| f32::from(value)).collect();
+    let mut previous = mse(&baseline);
+    for level in [0.5, 1.0, 2.0] {
+        let reduced = denoise::reduce(&image, &noise, level).unwrap();
+        let values = reduced.pixels.as_ref().unwrap();
+        let error = mse(values);
+        assert!(
+            error < previous,
+            "level={level}, mse={error}, previous={previous}"
+        );
+        previous = error;
+        let mean_error = flat
+            .iter()
+            .map(|&i| f64::from(values[i]) - truth[i])
+            .sum::<f64>()
+            / flat.len() as f64;
+        assert!(
+            mean_error.abs() < 2.0,
+            "level={level}, mean error={mean_error}"
+        );
+        assert!(
+            values
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=65535.0).contains(v))
+        );
+        if level == 1.0 {
+            assert!(error < 0.3 * mse(&baseline), "mse={error}");
+            let edge: f64 = (32..64)
+                .map(|y| f64::from(values[y * width + 128] - values[y * width + 127]))
+                .sum::<f64>()
+                / 32.0;
+            assert!(edge > 0.99 * 7000.0, "edge={edge}");
+            let texture: f64 = (96..160)
+                .flat_map(|y| (184..200).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    f64::from(values[y * width + x]) * if (x / 2) % 2 == 0 { -1.0 } else { 1.0 }
+                })
+                .sum::<f64>()
+                / (64 * 16) as f64;
+            assert!(texture > 140.0, "texture amplitude={texture}");
+        }
+    }
+    assert_eq!(image.pixels, original);
+}
+
+#[test]
+fn noise_reduction_uses_signal_dependent_variance_and_is_thread_deterministic() {
+    let width = 256;
+    let truth: Vec<_> = (0..width * 192)
+        .map(|i| 1123.0 + 1000.0 * ((i % width) / 64) as f64)
+        .collect();
+    let pixels = truth
+        .iter()
+        .zip(normal_noise(truth.len()))
+        .map(|(&value, noise)| {
+            (value + noise * (8.0 * (value - 1023.0) + 16.0).sqrt()).round() as u16
+        })
+        .collect();
+    let image = image(pixels, width, 1023.0, 16383);
+    let noise = reduction_noise(8.0, 16.0);
+    let run = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                denoise::reduce(&image, &noise, 1.0)
+                    .unwrap()
+                    .pixels
+                    .unwrap()
+            })
+    };
+    let reduced = run(1);
+    assert_eq!(reduced, run(2));
+    for band in 0..4 {
+        let indices: Vec<_> = (16..176)
+            .flat_map(|y| (band * 64 + 16..band * 64 + 48).map(move |x| y * width + x))
+            .collect();
+        let original: f64 = indices
+            .iter()
+            .map(|&i| (f64::from(image.pixels[i]) - truth[i]).powi(2))
+            .sum();
+        let filtered: f64 = indices
+            .iter()
+            .map(|&i| (f64::from(reduced[i]) - truth[i]).powi(2))
+            .sum();
+        assert!(
+            filtered < original * 0.4,
+            "band={band}, ratio={}",
+            filtered / original
+        );
+        let bias = indices
+            .iter()
+            .map(|&i| f64::from(reduced[i]) - truth[i])
+            .sum::<f64>()
+            / indices.len() as f64;
+        assert!(bias.abs() < 8.0, "band={band}, bias={bias}");
+    }
+}
+
+#[test]
+fn noise_reduction_uses_measured_bins_when_profile_is_unresolved() {
+    let pixels = normal_noise(64 * 64)
+        .into_iter()
+        .map(|noise| (3000.0 + 25.0 * noise).round() as u16)
+        .collect();
+    let image = image(pixels, 64, 1023.0, 16383);
+    let expected = denoise::reduce(&image, &reduction_noise(0.0, 625.0), 1.0).unwrap();
+    let mut measured = NoiseEstimate {
+        bins: vec![NoiseBin {
+            signal_codes: 2000.0,
+            sigma_codes: 25.0,
+            patches: 16,
+        }],
+        ..NoiseEstimate::default()
+    };
+    for profile in [
+        None,
+        Some(NoiseModel {
+            shot_coefficient: 100.0,
+            read_variance: 1e6,
+            source: "dng_noise_profile",
+        }),
+    ] {
+        measured.model = profile;
+        let actual = denoise::reduce(&image, &measured, 1.0).unwrap();
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(actual.report.noise_source, Some("measured_noise_bins"));
+    }
+}
+
+#[test]
+fn noise_reduction_handles_zero_missing_noise_geometry_and_clipping() {
+    let mut image = image(vec![2000; 64 * 64], 64, 1023.0, 16383);
+    let noise = reduction_noise(0.0, 900.0);
+    let constant = denoise::reduce(&image, &noise, 1.0).unwrap();
+    assert_eq!(constant.pixels.unwrap(), vec![2000.0; 64 * 64]);
+    assert_eq!(constant.report.changed_samples, 0);
+    image.pixels[0..3].copy_from_slice(&[0, 16383, 65535]);
+    for level in [0.5, 1.0, 2.0] {
+        let reduced = denoise::reduce(&image, &noise, level).unwrap();
+        assert_eq!(&reduced.pixels.unwrap()[..3], &[0.0, 16383.0, 65535.0]);
+    }
+    assert!(
+        denoise::reduce(&image, &noise, 0.0)
+            .unwrap()
+            .pixels
+            .is_none()
+    );
+    for level in [-0.1, 2.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(denoise::reduce(&image, &noise, level).is_err());
+    }
+    assert!(denoise::reduce(&image, &reduction_noise(0.0, f64::INFINITY), 1.0).is_err());
+    let unavailable = denoise::reduce(&image, &NoiseEstimate::default(), 1.0).unwrap();
+    assert!(unavailable.pixels.is_none() && !unavailable.report.warnings.is_empty());
+    for side in [1, 2, 4, 5, 9, 17, 33] {
+        let small = self::image(vec![2000; side * side], side, 1023.0, 16383);
+        let reduced = denoise::reduce(&small, &noise, 1.0).unwrap();
+        assert_eq!(reduced.report.applied, side > 4);
+    }
+    image.metadata.width += 1;
+    assert!(denoise::reduce(&image, &noise, 1.0).is_err());
+    image.metadata.width = usize::MAX;
+    assert!(denoise::reduce(&image, &noise, 1.0).is_err());
+}
+
+#[test]
+fn noise_reduction_keeps_fractional_samples_and_evaluates_actual_function_inputs() {
+    let image = image(
+        (0..64 * 64)
+            .map(|i| 2000 + ((i % 64 + i / 64) % 2) as u16)
+            .collect(),
+        64,
+        0.0,
+        4095,
+    );
+    let hist = Histogram::new(&image.pixels).unwrap();
+    let range = range::analyze(&image, &hist, manual()).unwrap();
+    let reduced = denoise::reduce(&image, &reduction_noise(0.0, 16.0), 1.0).unwrap();
+    assert!(
+        reduced
+            .pixels
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|&value| value == 2000.5)
+    );
+    let render = |source: &str, policy, transfers, reduction: Option<&denoise::Reduction>| {
+        let expression = Expression::parse(source).unwrap();
+        tone::render_with_noise_reduction(
+            &image,
+            &hist,
+            &range,
+            false,
+            Some(&expression),
+            policy,
+            transfers,
+            &Parameters::default(),
+            reduction,
+        )
+    };
+    for png in [Transfer::Linear, Transfer::Srgb] {
+        for jpeg in [Transfer::Linear, Transfer::Srgb] {
+            let transfers = tone::Transfers { png, jpeg };
+            let out = render("x^2", FunctionPolicy::Clip, transfers, Some(&reduced)).unwrap();
+            let encoded = if png == Transfer::Linear {
+                0.25
+            } else {
+                tone::srgb_encode(0.25)
+            };
+            let master = (encoded * 65535.0).round() as u16;
+            assert!(out.png.iter().all(|&value| value == master));
+            let from_master = f64::from(master) / 65535.0;
+            let expected = match (png, jpeg) {
+                (Transfer::Linear, Transfer::Srgb) => tone::srgb_encode(from_master),
+                (Transfer::Srgb, Transfer::Linear) => tone::srgb_decode(from_master),
+                _ => from_master,
+            };
+            assert!(
+                out.jpeg
+                    .iter()
+                    .all(|&value| value == (expected * 255.0).round() as u8)
+            );
+            let zero = denoise::reduce(&image, &NoiseEstimate::default(), 0.0).unwrap();
+            let baseline = render("x^2", FunctionPolicy::Clip, transfers, None).unwrap();
+            let disabled = render("x^2", FunctionPolicy::Clip, transfers, Some(&zero)).unwrap();
+            assert_eq!(baseline.png, disabled.png);
+            assert_eq!(baseline.jpeg, disabled.jpeg);
+        }
+    }
+    assert!(
+        render(
+            "1/(x-.5)",
+            FunctionPolicy::Clip,
+            tone::Transfers::default(),
+            None
+        )
+        .is_ok()
+    );
+    for policy in [
+        FunctionPolicy::Clip,
+        FunctionPolicy::Scale,
+        FunctionPolicy::Wrap,
+    ] {
+        assert!(
+            render(
+                "1/(x-.5)",
+                policy,
+                tone::Transfers::default(),
+                Some(&reduced)
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        render(
+            "x",
+            FunctionPolicy::Scale,
+            tone::Transfers::default(),
+            Some(&reduced)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn noise_reduction_fractional_function_policies_preserve_extrema_and_overflow_safety() {
+    let expression = Expression::parse("4*x-1").unwrap();
+    for (policy, expected) in [
+        (FunctionPolicy::Clip, [0.0, 0.5, 1.0, 1.0]),
+        (FunctionPolicy::Scale, [0.0, 0.5, 0.75, 1.0]),
+        (FunctionPolicy::Wrap, [0.5, 0.5, 1.0, 0.5]),
+    ] {
+        let mut values = [0.125, 0.375, 0.5, 0.625];
+        let report =
+            dng_monochrome::expression::apply_samples(&mut values, Some(&expression), policy)
+                .unwrap();
+        assert_eq!(values, expected);
+        assert_eq!((report.observed_min, report.observed_max), (-0.5, 1.5));
+        assert_eq!(report.outside_unit_range_percent, 50.0);
+    }
+    let mut values = [0.0, 0.5, 1.0];
+    dng_monochrome::expression::apply_samples(
+        &mut values,
+        Some(&Expression::parse("(2*x-1)*1e308").unwrap()),
+        FunctionPolicy::Scale,
+    )
+    .unwrap();
+    assert_eq!(values, [0.0, 0.5, 1.0]);
+}
 
 #[test]
 fn selective_srgb_zero_full_and_midpoint_preserve_all_code_quantization() {

@@ -66,6 +66,88 @@ fn fixture() -> common::Dng {
 }
 
 #[test]
+fn noise_reduction_color_companions_match_monochrome_and_green_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut dng = common::Dng::noisy(192, 128);
+    dng.cfa = true;
+    dng.as_shot_neutral = Some([[2, 1], [1, 1], [3, 1]]);
+    let input = dir.path().join("photo.DNG");
+    dng.write(&input);
+    let original = fs::read(&input).unwrap();
+    let flags = [
+        "-nr",
+        "-dark",
+        "0",
+        "-light",
+        "0",
+        "-no-optimize",
+        "-report",
+        "-silent",
+    ];
+    let output = dir.path().join("color");
+    let mut arguments = vec!["-c", "-4", "-ga"];
+    arguments.extend(flags);
+    success(run(&input, &output, &arguments));
+    for (phase, channel) in ["R", "G1", "G2", "B"].into_iter().enumerate() {
+        let mut mono = common::Dng::ramp(dng.width / 2, dng.height / 2);
+        mono.pixels = (0..mono.height)
+            .flat_map(|y| {
+                let dng = &dng;
+                (0..mono.width).map(move |x| {
+                    dng.pixels[(2 * y as usize + phase / 2) * dng.width as usize
+                        + 2 * x as usize
+                        + phase % 2]
+                })
+            })
+            .collect();
+        let reference = dir.path().join(format!("{channel}.DNG"));
+        mono.write(&reference);
+        let mono_output = dir.path().join(channel);
+        success(run(&reference, &mono_output, &flags));
+        assert_eq!(
+            png(&output.join(format!("photo{channel}.png"))),
+            png(&mono_output.join(format!("{channel}.png"))),
+            "{channel}"
+        );
+    }
+    let r = png(&output.join("photoR.png")).3;
+    let g1 = png(&output.join("photoG1.png")).3;
+    let g2 = png(&output.join("photoG2.png")).3;
+    let b = png(&output.join("photoB.png")).3;
+    for green in ["-ga", "-g1", "-g2"] {
+        let selected = if green == "-ga" {
+            output.clone()
+        } else {
+            let selected = dir.path().join(green);
+            let mut arguments = vec!["-c", green];
+            arguments.extend(flags);
+            success(run(&input, &selected, &arguments));
+            selected
+        };
+        let rgb = png(&selected.join("photo.png")).3;
+        for i in 0..r.len() {
+            let g = match green {
+                "-g1" => g1[i],
+                "-g2" => g2[i],
+                _ => (u32::from(g1[i]) + u32::from(g2[i])).div_ceil(2) as u16,
+            };
+            assert_eq!(&rgb[3 * i..3 * i + 3], &[r[i], g, b[i]]);
+        }
+    }
+    let balanced = dir.path().join("balanced");
+    let mut arguments = vec!["-c", "-4", "-wb"];
+    arguments.extend(flags);
+    success(run(&input, &balanced, &arguments));
+    for channel in ["R", "G1", "G2", "B"] {
+        assert_eq!(
+            png(&output.join(format!("photo{channel}.png"))),
+            png(&balanced.join(format!("photo{channel}.png")))
+        );
+    }
+    assert_eq!(fs::read(input).unwrap(), original);
+}
+
+#[test]
 fn color_flags_accept_both_dash_forms_and_require_explicit_color_mode() {
     let parse = |flags: &[&str]| {
         Cli::try_parse_compat(

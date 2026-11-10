@@ -372,6 +372,35 @@ shadows hidden by texture and edge-truncated spots may remain, and recurring
 scene structure can still mislead an automatic detector. Brightening also
 amplifies noise and cannot recover detail that was never recorded.
 
+### Optional noise reduction
+
+```sh
+dng-monochrome *.ARW -c -nc --transfer srgb -fd -nr --none --jxl --lossy --jxl-quality 90
+dng-monochrome shot.DNG -nr -nrl 0.5
+```
+
+`--noise-reduction` (`-nr`) enables noise-adaptive spatial filtering at level 1.
+`--noise-reduction-level` (`-nrl`) accepts a finite value from 0 to 2 and also
+enables filtering. Without either option, or with an explicit level 0, existing
+pixels and output behavior are unchanged. Higher levels suppress more noise
+but can soften faint texture and fine detail; they do not recover missing detail.
+
+The shared monochrome/Bayer-plane filter follows dirt correction and precedes
+tone/function/transfer mapping. It uses measured signal-dependent noise and
+multiscale local detail energy, retaining fractional RAW estimates rather than
+rounding them back to sensor codes. Optional channel files receive the same
+filter as independently developed monochrome images; final RGB color-factor
+modes are unchanged. Sensor-zero and saturated samples are preserved.
+
+Histogram clipping, noise/DR reports, tone fitting and automatic codec precision
+still use the **unfiltered** samples: denoising is not a measured increase in
+sensor dynamic range. Expressions operate on the actual filtered values,
+including their fractional inputs and any newly encountered singularities.
+`--report`, `--verbose` and `--analyze` include `noise_reduction` details for each
+processed plane. Images too small to filter, or without a usable noise estimate,
+are left unchanged with an explicit warning. Noise reduction does not change
+the default tone profile to imitate a darker camera JPEG.
+
 ### All command-line options
 
 The documented `--long` options also accept `-long`, including `-help`,
@@ -389,6 +418,8 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |
+| `--noise-reduction`, `-nr` | Enable measured-noise, edge-preserving RAW denoising at level 1; default off; mono and color |
+| `--noise-reduction-level N`, `-nrl N` | Denoising level 0..2; implies `--noise-reduction`; 0 is unchanged, >1 can soften more detail |
 | `-o, --output DIR` | Output root, default `dng-mono`; alias `--output-dir` |
 | `--all` | Shortcut for `--jpg --png --heic --avif --j2k --jxl`; later format switches override |
 | `--none` | Disable all six formats before selecting individual ones, e.g. `-none -jxl` |
@@ -800,7 +831,8 @@ scene content can bias the spatial estimate. Saturated highlights and genuine
 black regions can be indistinguishable from unwanted tails. Nothing can restore
 detail already clipped by the camera. Inspect both versions and use manual
 percentages, particularly `--dark 0 --light 0`, when preservation is paramount.
-This tool does not spatially denoise, sharpen, or create missing tonal detail.
+Without `--noise-reduction`, this tool does not spatially denoise. It does not
+sharpen or create missing tonal detail.
 
 Manual clipping uses the **full cropped-image histogram**, before either tail
 is removed and without automatically clamping that overridden end to camera
@@ -842,7 +874,7 @@ contrast slopes stay between 0.5125 and 2.5; noisy regions have tighter caps.
 This is not unrestricted histogram equalization or mere variance maximization.
 
 The whole mapping is global, monotonic, continuous and endpoint-preserving.
-There is no local tone-map halo, sharpening or spatial denoising. Constant
+Optimization itself adds no local tone-map halo, sharpening or spatial denoising. Constant
 images are not given artificial contrast. Reports contain exposure, predicted
 midtone noise and all curve control points. Deliberately low-key/high-key
 photographs may still be better without this mode.

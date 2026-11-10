@@ -3,6 +3,7 @@ use crate::{
     range::{Histogram, LEVELS},
 };
 use anyhow::{Context, Result, bail, ensure};
+use rayon::prelude::*;
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug)]
@@ -502,5 +503,59 @@ pub fn apply(
         observed_min: min,
         observed_max: max,
         outside_unit_range_percent: 100.0 * outside as f64 / hist.total as f64,
+    })
+}
+
+pub fn apply_samples(
+    values: &mut [f64],
+    expression: Option<&Expression>,
+    policy: FunctionPolicy,
+) -> Result<FunctionReport> {
+    ensure!(!values.is_empty(), "cannot map an empty image");
+    let (min, max, outside) = values.par_iter_mut().enumerate()
+        .map_init(|| expression.map(Expression::bind), |function, (index, value)| {
+            let x = *value;
+            let y = function.as_mut().map_or(x, |function| function(x));
+            ensure!(y.is_finite(),
+                "function is undefined/non-finite at x={x:.17} (pixel {index}); clip/scale/wrap cannot repair NaN or infinity");
+            *value = y;
+            Ok((y, y, usize::from(!(0.0..=1.0).contains(&y))))
+        })
+        .try_reduce(|| (f64::INFINITY, f64::NEG_INFINITY, 0),
+            |(amin, amax, count), (bmin, bmax, other)| -> Result<_> {
+                Ok((amin.min(bmin), amax.max(bmax), count + other))
+            })?;
+    if policy == FunctionPolicy::Scale {
+        ensure!(
+            max > min,
+            "cannot scale a constant function on the pixels in this image"
+        );
+    }
+    values.par_iter_mut().for_each(|value| {
+        *value = match policy {
+            FunctionPolicy::Clip => value.clamp(0.0, 1.0),
+            FunctionPolicy::Scale => {
+                let span = max - min;
+                if span.is_finite() {
+                    ((*value - min) / span).clamp(0.0, 1.0)
+                } else {
+                    ((*value * 0.5 - min * 0.5) / (max * 0.5 - min * 0.5)).clamp(0.0, 1.0)
+                }
+            }
+            FunctionPolicy::Wrap => {
+                if (0.0..=1.0).contains(value) {
+                    *value
+                } else {
+                    value.rem_euclid(1.0)
+                }
+            }
+        };
+    });
+    Ok(FunctionReport {
+        expression: expression.map(|expression| expression.source.clone()),
+        policy,
+        observed_min: min,
+        observed_max: max,
+        outside_unit_range_percent: 100.0 * outside as f64 / values.len() as f64,
     })
 }
