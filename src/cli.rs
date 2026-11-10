@@ -49,6 +49,7 @@ mod color;
         --fix-dirty/-fd completes all RAW analysis before development; --no-optimize skips optimization.\n\
         --noise-reduction/-nr defaults to level 1; --noise-reduction-level/-nrl accepts 0..2 and also enables it.\n\
         Noise/range/DR and tone fitting use the original pre-denoising samples.\n\
+        --max-color/-mc enhances final RGB only; --max-color-level/-mcl: 0 off, 1 gamut-safe vivid, 2 extreme.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
         dng-monochrome photos/ -o dng-mono --both --report\n  \
@@ -128,6 +129,27 @@ pub struct Cli {
         help = "Estimate white balance from developed final RGB, without changing separate channels; use --report for factors"
     )]
     pub natural_color: bool,
+
+    #[arg(
+        long,
+        visible_alias = "mc",
+        requires = "color",
+        conflicts_with = "analyze",
+        help = "Enhance final RGB chroma at level 1 without added clipping; after color scaling, before channel selection; default off"
+    )]
+    pub max_color: bool,
+
+    #[arg(
+        long,
+        visible_alias = "mcl",
+        requires = "color",
+        conflicts_with = "analyze",
+        value_parser = parse_color_level,
+        allow_hyphen_values = true,
+        value_name = "LEVEL",
+        help = "Max-color level 0..2 (default 1 when enabled); implies --max-color. 0 is unchanged; >1 subtracts competing channels for extreme colors and may exaggerate noise"
+    )]
+    pub max_color_level: Option<f64>,
 
     #[arg(
         long,
@@ -332,6 +354,11 @@ pub struct Cli {
 }
 
 impl Cli {
+    fn color_level(&self) -> f64 {
+        self.max_color_level
+            .unwrap_or(if self.max_color { 1.0 } else { 0.0 })
+    }
+
     fn noise_level(&self) -> f64 {
         self.noise_reduction_level
             .unwrap_or(if self.noise_reduction { 1.0 } else { 0.0 })
@@ -453,6 +480,17 @@ fn parse_noise_level(input: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_color_level(input: &str) -> Result<f64, String> {
+    let value: f64 = input
+        .parse()
+        .map_err(|_| "expected a max-color level such as 0.5 or 1.25".to_string())?;
+    if value.is_finite() && (0.0..=2.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("max-color level must be finite and in [0, 2]".into())
+    }
+}
+
 fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     const VALUES: &[&str] = &[
         "output",
@@ -485,6 +523,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "fds",
         "noise-reduction-level",
         "nrl",
+        "max-color-level",
+        "mcl",
     ];
     const FLAGS: &[&str] = &[
         "color",
@@ -499,6 +539,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "wb",
         "natural-color",
         "nc",
+        "max-color",
+        "mc",
         "fix-dirty",
         "fd",
         "noise-reduction",

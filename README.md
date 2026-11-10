@@ -258,7 +258,7 @@ All these switches require `--color`; ordinary monochrome behavior is unchanged.
 `--channel-order bgr` (shortcut `-bgr`) swaps red and blue in **final RGB only**.
 Any three lowercase `r`/`g`/`b` letters are accepted, including repeated channels
 (`-ggr`, `-rbb`) and identity (`-rgb`, the default). This applies after green
-selection, tone/transfers and any color scaling, in every RGB output format.
+selection, tone/transfers, color scaling and max-color enhancement, in every RGB output format.
 Companion files are unchanged. Requires `--color`; useful for IR false colors.
 
 `--keep-color-ratios` (`-kc`, `-kcr`) optionally scales **only final RGB samples**.
@@ -305,6 +305,26 @@ colored scenes without neutral references can still mislead it.
 
 ```sh
 dng-monochrome -c -nc -none -jxl -jpg DSC01869.ARW
+```
+
+`--max-color` (`-max-color`, `-mc`) makes **only final RGB** more vivid.
+`--max-color-level` (`-mcl`) accepts 0..2 and also enables it: 0 is exactly
+unchanged, 1 is the default, and fractional levels allow fine control.
+Through level 1, expand chroma at fixed linear-light luminance, with up to 4x
+gain smoothly limited by the available gamut. Neutral pixels stay unchanged;
+integer rounding introduces no new black/white clipping. This works with linear
+or sRGB transfer at each output's actual precision, after WB/KCR/NC scaling
+but before `-bgr` and other channel selectors. RAWs, channel companions and
+range/noise/color estimates are unchanged. Requires `--color`, not `--analyze`.
+Levels above 1 progressively subtract competing channels; 2 gives deliberately
+extreme colors while retaining each pixel's peak brightness. These levels can
+change luminance/hues, reach zero and exaggerate noise. This is not a Sony VV2
+emulation or automatic white balance; lossy codecs can also alter sample extrema.
+`--report` records `max_color_level` only when explicitly requested.
+
+```sh
+dng-monochrome -c -nc -mc --transfer srgb --none --jxl photo.ARW
+dng-monochrome -c -bgr -mc -mcl 1.25 --transfer srgb --none --jxl infrared.ARW
 ```
 
 PNG remains 16-bit RGB and JPEG is 8-bit RGB with 4:4:4 encoding. Native codecs
@@ -422,6 +442,8 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
 | `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
+| `--max-color`, `-mc` | Make final RGB more vivid at gamut-safe level 1; default off; requires `--color`; before channel selection, companions unchanged |
+| `--max-color-level N`, `-mcl N` | Vivid-color level 0..2; implies `--max-color`; 0 is unchanged, >1 exaggerates channel separation; conflicts with `--analyze` |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |

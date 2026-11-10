@@ -74,6 +74,7 @@ pub(super) fn process(
 ) -> Result<FileOutcome> {
     let start = Instant::now();
     let green = cli.green();
+    let color_level = cli.color_level();
     let channel_order_name = cli
         .channel_order
         .map(|order| order.map(|component| ["r", "g", "b"][component]).concat());
@@ -385,6 +386,9 @@ pub(super) fn process(
             if let Some(order) = &channel_order_name {
                 report["channel_order"] = serde_json::json!(order);
             }
+            if cli.max_color || cli.max_color_level.is_some() {
+                report["max_color_level"] = serde_json::json!(color_level);
+            }
             if let Some(dirty) = &dirty_report {
                 report["dirty_correction"] = serde_json::to_value(dirty)?;
             }
@@ -407,6 +411,8 @@ pub(super) fn process(
             } else {
                 Vec::new()
             };
+            color::maximize_color(&mut png, 16, color_level, transfers.png)?;
+            color::maximize_jpeg_color(&mut jpeg, color_level, transfers.jpeg)?;
             reorder_rgb(&mut png, cli.channel_order);
             reorder_rgb(&mut jpeg, cli.channel_order);
             let paths = output_paths(cli, input, optimized);
@@ -445,6 +451,7 @@ pub(super) fn process(
                         bits == encoding.bits,
                         "RGB precision must equal the maximum selected channel precision"
                     );
+                    color::maximize_color(&mut pixels, bits, color_level, transfers.png)?;
                     reorder_rgb(&mut pixels, cli.channel_order);
                     Ok(Cow::Owned(pixels))
                 },

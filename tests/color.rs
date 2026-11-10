@@ -66,6 +66,492 @@ fn fixture() -> common::Dng {
 }
 
 #[test]
+fn max_color_flags_levels_and_argument_boundaries() {
+    let parse = |flags: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "photo.ARW"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    for flag in ["--max-color", "-max-color", "--mc", "-mc"] {
+        assert!(parse(&["-c", flag]).is_ok(), "{flag}");
+        assert!(parse(&[flag]).is_err());
+        assert!(parse(&["-c", flag, "-analyze"]).is_err());
+        assert!(parse(&["--", flag]).is_ok());
+        assert_eq!(
+            parse(&["-func", flag]).unwrap().function.as_deref(),
+            Some(flag)
+        );
+        for compatible in ["-wb", "-kcr", "-nc", "-bgr", "-rbb", "-nr", "-fd"] {
+            assert!(parse(&["-c", flag, compatible]).is_ok());
+        }
+    }
+    for flag in ["--max-color-level", "-max-color-level", "--mcl", "-mcl"] {
+        for level in ["0", "0.25", "1", "1.25", "2"] {
+            assert!(parse(&["-c", flag, level]).is_ok(), "{flag} {level}");
+            assert!(parse(&["-c", "-mc", flag, level]).is_ok());
+            assert!(parse(&["-c", &format!("{flag}={level}")]).is_ok());
+            assert!(parse(&[flag, level]).is_err());
+        }
+        for level in ["-0.01", "2.01", "NaN", "inf", "-inf", "one", ""] {
+            assert!(parse(&["-c", flag, level]).is_err(), "{flag} {level}");
+        }
+        assert!(parse(&["-c", flag]).is_err());
+        assert!(parse(&["-c", flag, "1", "-analyze"]).is_err());
+        assert!(parse(&["-c", flag, "-bgr"]).is_err());
+        assert!(parse(&["--", flag]).is_ok());
+        assert_eq!(
+            parse(&["-func", flag]).unwrap().function.as_deref(),
+            Some(flag)
+        );
+    }
+    assert!(parse(&["-c", "--max-color=true"]).is_err());
+}
+
+#[test]
+fn max_color_levels_preserve_neutrals_luminance_and_unclipped_codes() {
+    use dng_monochrome::tone::srgb_decode;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("vivid.DNG");
+    let palette = [
+        [0, 0, 0],
+        [65535, 65535, 65535],
+        [1, 1, 1],
+        [1000, 1000, 1000],
+        [32768, 32768, 32768],
+        [65534, 65534, 65534],
+        [42000, 20000, 12000],
+        [12000, 42000, 20000],
+        [20000, 12000, 42000],
+        [30000, 32000, 28000],
+        [65534, 2, 32767],
+        [10000, 10001, 9999],
+        [65535, 12000, 3000],
+        [10000, 0, 30000],
+        [500, 300, 200],
+    ];
+    let mut dng = codec_fixture(64, 48, [10.2; 3]);
+    for y in 0..dng.height {
+        for x in 0..dng.width {
+            let cell = (y / 2 * (dng.width / 2) + x / 2) as usize;
+            let component = [0, 1, 1, 2][((y % 2) * 2 + x % 2) as usize];
+            dng.pixels[(y * dng.width + x) as usize] = palette[cell % palette.len()][component];
+        }
+    }
+    dng.write(&input);
+    let original_file = fs::read(&input).unwrap();
+    for transfer in ["linear", "srgb"] {
+        let flags = [
+            "-c",
+            "-none",
+            "-png",
+            "-no-optimize",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-transfer",
+            transfer,
+            "-report",
+            "-silent",
+        ];
+        let baseline = dir.path().join(format!("{transfer}-baseline"));
+        success(run(&input, &baseline, &flags));
+        let original = png(&baseline.join("vivid.png")).3;
+        let linear = |value: u16| {
+            let value = f64::from(value) / 65535.0;
+            if transfer == "srgb" {
+                srgb_decode(value)
+            } else {
+                value
+            }
+        };
+        let mut previous = original.clone();
+        let mut level_one = Vec::new();
+        for level in ["0", "0.25", "0.5", "1", "1.5", "2"] {
+            let amount: f64 = level.parse().unwrap();
+            let out = dir.path().join(format!("{transfer}-{level}"));
+            let mut arguments = flags.to_vec();
+            arguments.extend(["-mc", "-mcl", level]);
+            success(run(&input, &out, &arguments));
+            let pixels = png(&out.join("vivid.png")).3;
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(out.join("vivid.json")).unwrap()).unwrap();
+            assert_eq!(report["max_color_level"], amount);
+            for ((before, after), previous) in original
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(pixels.as_chunks::<3>().0)
+                .zip(previous.as_chunks::<3>().0)
+            {
+                if before[0] == before[1] && before[1] == before[2] {
+                    assert_eq!(after, before, "{transfer} {level} neutral");
+                }
+                let span = |rgb: &[u16; 3]| rgb.iter().max().unwrap() - rgb.iter().min().unwrap();
+                assert!(span(after) >= span(previous), "{transfer} {level} chroma");
+                if amount <= 1.0 {
+                    for (&old, &new) in before.iter().zip(after) {
+                        assert!(new != 0 || old == 0, "{transfer} {level} black clipping");
+                        assert!(
+                            new != 65535 || old == 65535,
+                            "{transfer} {level} white clipping"
+                        );
+                    }
+                    let luminance = |rgb: &[u16; 3]| {
+                        rgb.map(linear)
+                            .into_iter()
+                            .zip([0.2126, 0.7152, 0.0722])
+                            .map(|(value, weight)| value * weight)
+                            .sum::<f64>()
+                    };
+                    assert!((luminance(before) - luminance(after)).abs() < 3.0 / 65535.0);
+                }
+            }
+            if amount == 0.0 {
+                assert_eq!(
+                    fs::read(out.join("vivid.png")).unwrap(),
+                    fs::read(baseline.join("vivid.png")).unwrap()
+                );
+            } else {
+                assert_ne!(pixels, original);
+            }
+            if amount == 1.0 {
+                level_one = pixels.clone();
+            }
+            if amount == 2.0 {
+                assert!(
+                    pixels.iter().filter(|&&value| value == 0).count()
+                        > level_one.iter().filter(|&&value| value == 0).count()
+                );
+            }
+            previous = pixels;
+        }
+        let default = dir.path().join(format!("{transfer}-default"));
+        let mut arguments = flags.to_vec();
+        arguments.push("-mc");
+        success(run(&input, &default, &arguments));
+        assert_eq!(png(&default.join("vivid.png")).3, level_one);
+    }
+    assert_eq!(fs::read(input).unwrap(), original_file);
+}
+
+#[test]
+fn max_color_composes_with_scaling_routing_and_all_codecs_without_changing_companions() {
+    use dng_monochrome::tone::srgb_decode;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("vivid.DNG");
+    for (case, balance, green, transfer, dr, bits, selector, order) in [
+        (
+            "eight",
+            None,
+            "-g1",
+            "linear",
+            [5.2, 6.2, 7.2],
+            8,
+            "-bgr",
+            [2, 1, 0],
+        ),
+        (
+            "ten",
+            Some("-wb"),
+            "-ga",
+            "srgb",
+            [8.2, 9.2, 7.2],
+            10,
+            "-ggr",
+            [1, 1, 0],
+        ),
+        (
+            "twelve",
+            Some("-kcr"),
+            "-g2",
+            "linear",
+            [10.2, 11.2, 9.2],
+            12,
+            "-rbb",
+            [0, 2, 2],
+        ),
+        (
+            "sixteen",
+            Some("-nc"),
+            "-ga",
+            "srgb",
+            [13.2, 15.2, 14.2],
+            16,
+            "-rbg",
+            [0, 2, 1],
+        ),
+    ] {
+        let mut dng = codec_fixture(70, 54, dr);
+        dng.as_shot_neutral = Some([[1, 5], [1, 3], [1, 2]]);
+        dng.write(&input);
+        let baseline = dir.path().join(format!("{case}-baseline"));
+        let enhanced = dir.path().join(format!("{case}-enhanced"));
+        let routed = dir.path().join(format!("{case}-routed"));
+        let mut flags = vec![
+            "-c",
+            "-4",
+            green,
+            "-all",
+            "-report",
+            "-silent",
+            "-no-optimize",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-png-transfer",
+            transfer,
+            "-jpeg-transfer",
+            if transfer == "linear" {
+                "srgb"
+            } else {
+                "linear"
+            },
+            "-jpeg-quality",
+            "100",
+        ];
+        flags.extend(balance);
+        success(run(&input, &baseline, &flags));
+        let mut arguments = flags.clone();
+        arguments.push("-mc");
+        success(run(&input, &enhanced, &arguments));
+        arguments.push(selector);
+        success(run(&input, &routed, &arguments));
+        let before: serde_json::Value =
+            serde_json::from_slice(&fs::read(baseline.join("vivid.json")).unwrap()).unwrap();
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&fs::read(routed.join("vivid.json")).unwrap()).unwrap();
+        assert_eq!(report["max_color_level"], 1.0);
+        assert_eq!(report["channel_order"], &selector[1..]);
+        report.as_object_mut().unwrap().remove("max_color_level");
+        report.as_object_mut().unwrap().remove("channel_order");
+        assert_eq!(report, before);
+        let zero = dir.path().join(format!("{case}-zero"));
+        let mut arguments = flags;
+        arguments.extend(["-mcl", "0"]);
+        success(run(&input, &zero, &arguments));
+        for format in [
+            Format::Png,
+            Format::Jpeg,
+            Format::Heic,
+            Format::Avif,
+            Format::J2k,
+            Format::Jxl,
+        ] {
+            let name = format!("vivid.{}", format.extension());
+            let original = decode_color(&baseline.join(&name), format);
+            let vivid = decode_color(&enhanced.join(&name), format);
+            let output = decode_color(&routed.join(&name), format);
+            assert_eq!(
+                vivid.bits,
+                match format {
+                    Format::Png => 16,
+                    Format::Jpeg => 8,
+                    Format::Heic | Format::Avif => bits.min(12),
+                    Format::J2k | Format::Jxl => bits,
+                }
+            );
+            assert_eq!(
+                (vivid.width, vivid.height, vivid.bits, vivid.transfer),
+                (
+                    original.width,
+                    original.height,
+                    original.bits,
+                    original.transfer
+                )
+            );
+            assert_color_exif(&vivid);
+            assert_ne!(
+                vivid.pixels, original.pixels,
+                "{case} {format} must enhance"
+            );
+            let expected: Vec<_> = vivid
+                .pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|pixel| order.map(|component| pixel[component]))
+                .collect();
+            if format == Format::Jpeg {
+                let error: u64 = output
+                    .pixels
+                    .iter()
+                    .zip(&expected)
+                    .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                    .sum();
+                assert!(error < expected.len() as u64 * 2, "{case} JPEG routing");
+            } else {
+                assert_eq!(output.pixels, expected, "{case} {format} routing");
+                let maximum = ((1u32 << vivid.bits) - 1) as u16;
+                let linear = |value: u16| {
+                    let value = f64::from(value) / f64::from(maximum);
+                    if transfer == "srgb" {
+                        srgb_decode(value)
+                    } else {
+                        value
+                    }
+                };
+                for (before, after) in original
+                    .pixels
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(vivid.pixels.as_chunks::<3>().0)
+                {
+                    let mut delta = 0.0;
+                    for ((&old, &new), weight) in
+                        before.iter().zip(after).zip([0.2126, 0.7152, 0.0722])
+                    {
+                        assert!(new != 0 || old == 0, "{case} {format} black clipping");
+                        assert!(
+                            new != maximum || old == maximum,
+                            "{case} {format} white clipping"
+                        );
+                        delta += (linear(new) - linear(old)) * weight;
+                    }
+                    assert!(
+                        delta.abs() < 3.0 / f64::from(maximum),
+                        "{case} {format} luminance"
+                    );
+                }
+            }
+            assert_eq!(
+                fs::read(zero.join(&name)).unwrap(),
+                fs::read(baseline.join(&name)).unwrap()
+            );
+            for channel in ["R", "G1", "G2", "B"] {
+                let name = format!("vivid{channel}.{}", format.extension());
+                assert_eq!(
+                    fs::read(enhanced.join(&name)).unwrap(),
+                    fs::read(baseline.join(&name)).unwrap()
+                );
+                assert_eq!(
+                    fs::read(routed.join(&name)).unwrap(),
+                    fs::read(baseline.join(&name)).unwrap()
+                );
+            }
+        }
+        for channel in ["R", "G1", "G2", "B"] {
+            let name = format!("vivid{channel}.json");
+            assert_eq!(
+                fs::read(enhanced.join(&name)).unwrap(),
+                fs::read(baseline.join(&name)).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn max_color_precision_extremes_and_parallel_determinism() {
+    use dng_monochrome::tone::{Transfer, srgb_decode};
+    let serial = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let parallel = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    for bits in 1..=16 {
+        let maximum = ((1u32 << bits) - 1) as u16;
+        let mut coordinates = vec![0, 1, maximum / 4, maximum / 2, maximum - 1, maximum];
+        coordinates.sort_unstable();
+        coordinates.dedup();
+        let mut original = Vec::new();
+        for &r in &coordinates {
+            for &g in &coordinates {
+                for &b in &coordinates {
+                    original.extend([r, g, b]);
+                }
+            }
+        }
+        for transfer in [Transfer::Linear, Transfer::Srgb] {
+            let mut previous = original.clone();
+            let mut safe = Vec::new();
+            for level in [0.0, 0.25, 0.5, 1.0, 1.5, 2.0] {
+                let mut enhanced = original.clone();
+                serial
+                    .install(|| color::maximize_color(&mut enhanced, bits, level, transfer))
+                    .unwrap();
+                let mut threaded = original.clone();
+                parallel
+                    .install(|| color::maximize_color(&mut threaded, bits, level, transfer))
+                    .unwrap();
+                assert_eq!(threaded, enhanced);
+                assert!(enhanced.iter().all(|&value| value <= maximum));
+                if level == 0.0 {
+                    assert_eq!(enhanced, original);
+                }
+                for ((before, after), previous) in original
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(enhanced.as_chunks::<3>().0)
+                    .zip(previous.as_chunks::<3>().0)
+                {
+                    if before[0] == before[1] && before[1] == before[2] {
+                        assert_eq!(before, after);
+                    }
+                    let span =
+                        |rgb: &[u16; 3]| rgb.iter().max().unwrap() - rgb.iter().min().unwrap();
+                    assert!(span(after) >= span(previous), "{bits} {transfer:?} {level}");
+                    if level <= 1.0 {
+                        let mut delta = 0.0;
+                        let linear = |value: u16| {
+                            let value = f64::from(value) / f64::from(maximum);
+                            match transfer {
+                                Transfer::Linear => value,
+                                Transfer::Srgb => srgb_decode(value),
+                            }
+                        };
+                        for ((&old, &new), weight) in
+                            before.iter().zip(after).zip([0.2126, 0.7152, 0.0722])
+                        {
+                            assert!(new != 0 || old == 0);
+                            assert!(new != maximum || old == maximum);
+                            delta += (linear(new) - linear(old)) * weight;
+                        }
+                        assert!(delta.abs() < 3.0 / f64::from(maximum));
+                    }
+                }
+                if level == 1.0 {
+                    safe = enhanced.clone();
+                    if bits >= 3 {
+                        assert_ne!(safe, original);
+                    }
+                }
+                if level == 2.0 {
+                    for (before, after) in safe
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(enhanced.as_chunks::<3>().0)
+                    {
+                        assert_eq!(before.iter().max(), after.iter().max());
+                        if after[0] != after[1] || after[1] != after[2] {
+                            assert!(after.contains(&0));
+                        }
+                    }
+                }
+                previous = enhanced;
+            }
+        }
+    }
+    for level in [-0.01, 2.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(color::maximize_color(&mut [10, 20, 30], 8, level, Transfer::Srgb).is_err());
+    }
+    for bits in [0, 17, u8::MAX] {
+        assert!(color::maximize_color(&mut [10, 20, 30], bits, 1.0, Transfer::Linear).is_err());
+    }
+    assert!(color::maximize_color(&mut [256, 20, 30], 8, 1.0, Transfer::Linear).is_err());
+    assert!(color::maximize_color(&mut [10, 20], 8, 1.0, Transfer::Linear).is_err());
+}
+
+#[test]
 fn noise_reduction_color_companions_match_monochrome_and_green_selection() {
     let dir = tempfile::tempdir().unwrap();
     let mut dng = common::Dng::noisy(192, 128);

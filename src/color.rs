@@ -1,6 +1,7 @@
 use crate::{
     formats::quantize,
     raw::{MonoImage, SensorMetadata, apply_exif_metadata},
+    tone::{Transfer, srgb_decode, srgb_encode},
 };
 use anyhow::{Context, Result, ensure};
 use rawler::{
@@ -371,6 +372,100 @@ pub(crate) fn combine_jpeg(
             }
         });
     Ok(pixels)
+}
+
+pub fn maximize_color(pixels: &mut [u16], bits: u8, level: f64, transfer: Transfer) -> Result<()> {
+    ensure!((1..=16).contains(&bits), "RGB precision must be 1-16 bits");
+    maximize_samples(
+        pixels,
+        f64::from((1u32 << bits) - 1),
+        level,
+        transfer,
+        |code| code as u16,
+    )
+}
+
+pub(crate) fn maximize_jpeg_color(pixels: &mut [u8], level: f64, transfer: Transfer) -> Result<()> {
+    maximize_samples(pixels, 255.0, level, transfer, |code| code as u8)
+}
+
+fn maximize_samples<T: Copy + Send + Into<f64>>(
+    pixels: &mut [T],
+    maximum: f64,
+    level: f64,
+    transfer: Transfer,
+    from_code: fn(f64) -> T,
+) -> Result<()> {
+    ensure!(
+        level.is_finite() && (0.0..=2.0).contains(&level),
+        "max-color level must be finite and in [0, 2]"
+    );
+    ensure!(
+        pixels.len().is_multiple_of(3),
+        "RGB samples must form complete pixels"
+    );
+    if level == 0.0 {
+        return Ok(());
+    }
+    let decode = |value| match transfer {
+        Transfer::Linear => value,
+        Transfer::Srgb => srgb_decode(value),
+    };
+    // Reserve half a code so rounding cannot introduce clipped endpoints.
+    let lower = decode(0.5 / maximum);
+    let upper = decode(1.0 - 0.5 / maximum);
+    pixels
+        .as_chunks_mut::<3>()
+        .0
+        .par_iter_mut()
+        .try_for_each(|pixel| {
+            let codes: [f64; 3] = (*pixel).map(Into::into);
+            ensure!(
+                codes.iter().all(|value| (0.0..=maximum).contains(value)),
+                "RGB sample exceeds declared precision"
+            );
+            if codes[0] == codes[1] && codes[1] == codes[2] {
+                return Ok(());
+            }
+            let rgb = codes.map(|value| decode(value / maximum));
+            let luminance = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+            let chroma = rgb.map(|value| value - luminance);
+            let limit = chroma
+                .iter()
+                .map(|&delta| {
+                    if delta > 0.0 {
+                        (upper - luminance) / delta
+                    } else if delta < 0.0 {
+                        (lower - luminance) / delta
+                    } else {
+                        f64::INFINITY
+                    }
+                })
+                .fold(f64::INFINITY, f64::min)
+                .max(1.0);
+            let gain = 1.0 + level.min(1.0) * 3.0 * (limit - 1.0) / (limit + 3.0);
+            if gain == 1.0 && level <= 1.0 {
+                return Ok(());
+            }
+            let mut enhanced = chroma.map(|delta| luminance + delta * gain);
+            if level > 1.0 {
+                let sum = rgb.iter().sum::<f64>();
+                let opponent = rgb.map(|value| (1.5 * value - 0.5 * sum).max(0.0));
+                let strongest = opponent.into_iter().fold(0.0, f64::max);
+                let peak = enhanced.into_iter().fold(0.0, f64::max);
+                for (value, opponent) in enhanced.iter_mut().zip(opponent) {
+                    *value = (2.0 - level) * *value + (level - 1.0) * peak * (opponent / strongest);
+                }
+            }
+            for (sample, value) in pixel.iter_mut().zip(enhanced) {
+                let encoded = match transfer {
+                    Transfer::Linear => value,
+                    Transfer::Srgb => srgb_encode(value),
+                };
+                *sample = from_code((encoded * maximum).round());
+            }
+            Ok(())
+        })
 }
 
 #[derive(Debug)]
