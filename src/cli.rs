@@ -103,6 +103,10 @@ pub struct Cli {
         help = "Average independently developed G1/G2 after aligning their precision")]
     pub ga: bool,
 
+    #[arg(long, requires = "color", value_parser = parse_channel_order, value_name = "RGB",
+        help = "Select final RGB channels with three r/g/b letters (default rgb); shortcuts include -bgr, -ggr and -rbb; companions unchanged")]
+    pub channel_order: Option<[usize; 3]>,
+
     #[arg(long, visible_aliases = ["kc", "kcr"], requires = "color",
         help = "Scale final RGB by black-subtracted RAW mean ratios; keep the strongest channel and separate channel files unchanged")]
     pub keep_color_ratios: bool,
@@ -410,6 +414,23 @@ fn parse_percentage(input: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_channel_order(input: &str) -> Result<[usize; 3], String> {
+    let mut order = [0; 3];
+    let error = "channel order must be three lowercase r/g/b letters, e.g. bgr or ggr";
+    if input.len() != order.len() {
+        return Err(error.into());
+    }
+    for (component, letter) in order.iter_mut().zip(input.bytes()) {
+        *component = match letter {
+            b'r' => 0,
+            b'g' => 1,
+            b'b' => 2,
+            _ => return Err(error.into()),
+        };
+    }
+    Ok(order)
+}
+
 fn parse_dust_strength(input: &str) -> Result<f64, String> {
     let value: f64 = input
         .parse()
@@ -436,6 +457,7 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
     const VALUES: &[&str] = &[
         "output",
         "output-dir",
+        "channel-order",
         "dark",
         "light",
         "clip-strength",
@@ -536,6 +558,12 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
             if text == "--" {
                 positional = true;
                 return vec![arg];
+            }
+            if let Some(order) = text.strip_prefix("--").or_else(|| text.strip_prefix('-'))
+                && order.len() == 3
+                && parse_channel_order(order).is_ok()
+            {
+                return vec![OsString::from("--channel-order"), OsString::from(order)];
             }
             if matches!(text, "-all" | "--all") {
                 return [

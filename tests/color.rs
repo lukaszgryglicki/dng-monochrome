@@ -184,6 +184,226 @@ fn color_flags_accept_both_dash_forms_and_require_explicit_color_mode() {
 }
 
 #[test]
+fn channel_order_aliases_require_color_and_preserve_argument_boundaries() {
+    let parse = |flags: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "photo.ARW"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    for r in ['r', 'g', 'b'] {
+        for g in ['r', 'g', 'b'] {
+            for b in ['r', 'g', 'b'] {
+                let order = format!("{r}{g}{b}");
+                for prefix in ["-", "--"] {
+                    let flag = format!("{prefix}{order}");
+                    assert!(parse(&["-c", &flag]).is_ok(), "{flag}");
+                    assert!(parse(&[&flag]).is_err(), "{flag} without color");
+                    assert!(parse(&["--", &flag]).is_ok());
+                    assert_eq!(
+                        parse(&["-func", &flag]).unwrap().function.as_deref(),
+                        Some(flag.as_str())
+                    );
+                }
+                for flag in ["--channel-order", "-channel-order"] {
+                    assert!(parse(&["-c", flag, &order]).is_ok());
+                    assert!(parse(&[flag, &order]).is_err());
+                }
+            }
+        }
+    }
+    assert!(parse(&["-c", "--channel-order=bgr"]).is_ok());
+    assert!(parse(&["-c", "--channel-order"]).is_err());
+    for value in ["", "rg", "rgbr", "rrx", "RGB", "r1g", " bgr", "bgr "] {
+        assert!(
+            parse(&["-c", "--channel-order", value]).is_err(),
+            "{value:?}"
+        );
+    }
+}
+
+fn channel_order_fixture() -> common::Dng {
+    let mut dng = fixture();
+    dng.as_shot_neutral = Some([[1, 5], [1, 3], [1, 2]]);
+    let cells = dng.width * dng.height / 4;
+    for y in 0..dng.height {
+        for x in 0..dng.width {
+            let cell = y / 2 * (dng.width / 2) + x / 2;
+            let value = f64::from(cell + 1) / f64::from(cells + 1);
+            let phase = ((y % 2) * 2 + x % 2) as usize;
+            let level = [value, value * value, value.sqrt(), value.powi(3)][phase];
+            dng.pixels[(y * dng.width + x) as usize] = (1000.0 + 10000.0 * level).round() as u16;
+        }
+    }
+    dng
+}
+
+#[test]
+fn channel_order_all_selectors_preserve_png_companions_and_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("order.DNG");
+    channel_order_fixture().write(&input);
+    let before = fs::read(&input).unwrap();
+    let baseline = dir.path().join("baseline");
+    let flags = [
+        "-c",
+        "-4",
+        "-ga",
+        "-none",
+        "-png",
+        "-report",
+        "-silent",
+        "-no-optimize",
+        "-dark",
+        "0",
+        "-light",
+        "0",
+        "-func",
+        "sin(pi*x/2)^1.2",
+        "-transfer",
+        "srgb",
+    ];
+    success(run(&input, &baseline, &flags));
+    let original = png(&baseline.join("order.png"));
+    let baseline_report: serde_json::Value =
+        serde_json::from_slice(&fs::read(baseline.join("order.json")).unwrap()).unwrap();
+    assert!(baseline_report.get("channel_order").is_none());
+    for (r, red) in ['r', 'g', 'b'].into_iter().enumerate() {
+        for (g, green) in ['r', 'g', 'b'].into_iter().enumerate() {
+            for (b, blue) in ['r', 'g', 'b'].into_iter().enumerate() {
+                let name = format!("{red}{green}{blue}");
+                let selector = format!("-{name}");
+                let out = dir.path().join(&name);
+                let mut arguments = flags.to_vec();
+                arguments.push(&selector);
+                success(run(&input, &out, &arguments));
+                let output = png(&out.join("order.png"));
+                assert_eq!(
+                    (output.0, output.1, output.2),
+                    (original.0, original.1, original.2)
+                );
+                let expected: Vec<_> = original
+                    .3
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|pixel| [pixel[r], pixel[g], pixel[b]])
+                    .collect();
+                assert_eq!(output.3, expected, "{name}");
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(out.join("order.json")).unwrap()).unwrap();
+                assert_eq!(report["channel_order"], name);
+                assert_eq!(report["channels"], baseline_report["channels"]);
+                for channel in ["R", "G1", "G2", "B"] {
+                    for extension in ["png", "json"] {
+                        let filename = format!("order{channel}.{extension}");
+                        assert_eq!(
+                            fs::read(out.join(&filename)).unwrap(),
+                            fs::read(baseline.join(&filename)).unwrap(),
+                            "{name} {filename}"
+                        );
+                    }
+                }
+                if name == "rgb" {
+                    assert_eq!(
+                        fs::read(out.join("order.png")).unwrap(),
+                        fs::read(baseline.join("order.png")).unwrap()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(fs::read(input).unwrap(), before);
+}
+
+#[test]
+fn channel_order_follows_color_scaling_in_every_output_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("order.DNG");
+    channel_order_fixture().write(&input);
+    for (balance, green, selector, order) in [
+        (None, "-g1", "-bgr", [2, 1, 0]),
+        (Some("-wb"), "-ga", "-ggr", [1, 1, 0]),
+        (Some("-kcr"), "-g2", "-rbb", [0, 2, 2]),
+        (Some("-nc"), "-ga", "-rbg", [0, 2, 1]),
+    ] {
+        let baseline = dir.path().join(format!("{selector}-baseline"));
+        let out = dir.path().join(selector);
+        let mut flags = vec![
+            "-c",
+            "-4",
+            green,
+            "-all",
+            "-report",
+            "-silent",
+            "-func",
+            "x^1.2",
+            "-png-transfer",
+            "linear",
+            "-jpeg-transfer",
+            "srgb",
+            "-jpeg-quality",
+            "100",
+        ];
+        flags.extend(balance);
+        success(run(&input, &baseline, &flags));
+        flags.push(selector);
+        success(run(&input, &out, &flags));
+        let original_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(baseline.join("order.json")).unwrap()).unwrap();
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("order.json")).unwrap()).unwrap();
+        assert_eq!(report["channel_order"], &selector[1..]);
+        report.as_object_mut().unwrap().remove("channel_order");
+        assert_eq!(report, original_report);
+        for format in [
+            Format::Png,
+            Format::Jpeg,
+            Format::Heic,
+            Format::Avif,
+            Format::J2k,
+            Format::Jxl,
+        ] {
+            let name = format!("order.{}", format.extension());
+            let original = decode_color(&baseline.join(&name), format);
+            let output = decode_color(&out.join(&name), format);
+            assert_eq!(
+                (output.width, output.height, output.bits),
+                (original.width, original.height, original.bits)
+            );
+            let expected: Vec<_> = original
+                .pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|pixel| order.map(|component| pixel[component]))
+                .collect();
+            if format == Format::Jpeg {
+                let error: u64 = output
+                    .pixels
+                    .iter()
+                    .zip(&expected)
+                    .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                    .sum();
+                assert!(error < expected.len() as u64 * 2, "{selector} {balance:?}");
+            } else {
+                assert_eq!(output.pixels, expected, "{selector} {balance:?} {format}");
+            }
+            for channel in ["R", "G1", "G2", "B"] {
+                let name = format!("order{channel}.{}", format.extension());
+                assert_eq!(
+                    fs::read(out.join(&name)).unwrap(),
+                    fs::read(baseline.join(&name)).unwrap(),
+                    "{selector} {name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn color_planes_match_independent_monochrome_processing_and_selected_rgb() {
     let dir = tempfile::tempdir().unwrap();
     let dng = fixture();

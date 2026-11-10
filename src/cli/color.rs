@@ -13,6 +13,15 @@ struct Plane {
     noise_reduction: Option<denoise::Reduction>,
 }
 
+fn reorder_rgb<T: Copy + Send>(pixels: &mut [T], order: Option<[usize; 3]>) {
+    if let Some(order) = order.filter(|order| *order != [0, 1, 2]) {
+        pixels.par_chunks_exact_mut(3).for_each(|pixel| {
+            let original = [pixel[0], pixel[1], pixel[2]];
+            pixel.copy_from_slice(&order.map(|component| original[component]));
+        });
+    }
+}
+
 fn channel_paths(
     cli: &Cli,
     input: &Input,
@@ -65,6 +74,9 @@ pub(super) fn process(
 ) -> Result<FileOutcome> {
     let start = Instant::now();
     let green = cli.green();
+    let channel_order_name = cli
+        .channel_order
+        .map(|order| order.map(|component| ["r", "g", "b"][component]).concat());
     let decoded = color::decode_with_balance(
         &input.path,
         cli.no_crop,
@@ -183,6 +195,9 @@ pub(super) fn process(
         "channels": analysis_channels, "parameters": cli.parameters,
         "threads": threads, "jobs": jobs, "file_threads": file_threads,
     });
+    if let Some(order) = &channel_order_name {
+        analysis["channel_order"] = serde_json::json!(order);
+    }
     if let Some(report) = &dirty_report {
         analysis["dirty_correction"] = serde_json::to_value(report)?;
     }
@@ -367,10 +382,13 @@ pub(super) fn process(
                 "jpeg_quality": cli.jpeg_quality,
                 "additional_formats": encodings, "threads": threads, "jobs": jobs, "file_threads": file_threads,
             });
+            if let Some(order) = &channel_order_name {
+                report["channel_order"] = serde_json::json!(order);
+            }
             if let Some(dirty) = &dirty_report {
                 report["dirty_correction"] = serde_json::to_value(dirty)?;
             }
-            let png = if enabled.contains(&Format::Png) {
+            let mut png = if enabled.contains(&Format::Png) {
                 color::combine_with_scales(
                     rgb.map(|rendered| (rendered.png.as_slice(), 16)),
                     other.map(|r| (r.png.as_slice(), 16)),
@@ -380,7 +398,7 @@ pub(super) fn process(
             } else {
                 Vec::new()
             };
-            let jpeg = if enabled.contains(&Format::Jpeg) {
+            let mut jpeg = if enabled.contains(&Format::Jpeg) {
                 color::combine_jpeg(
                     rgb.map(|rendered| rendered.jpeg.as_slice()),
                     other.map(|r| r.jpeg.as_slice()),
@@ -389,6 +407,8 @@ pub(super) fn process(
             } else {
                 Vec::new()
             };
+            reorder_rgb(&mut png, cli.channel_order);
+            reorder_rgb(&mut jpeg, cli.channel_order);
             let paths = output_paths(cli, input, optimized);
             let mut warnings = output::save_components_with_encodings(
                 &paths,
@@ -412,7 +432,7 @@ pub(super) fn process(
                             .bits;
                         Ok((rendered[index].png.as_slice(), depth))
                     };
-                    let (pixels, bits) = color::combine_with_scales(
+                    let (mut pixels, bits) = color::combine_with_scales(
                         [
                             samples(selected[0])?,
                             samples(selected[1])?,
@@ -425,6 +445,7 @@ pub(super) fn process(
                         bits == encoding.bits,
                         "RGB precision must equal the maximum selected channel precision"
                     );
+                    reorder_rgb(&mut pixels, cli.channel_order);
                     Ok(Cow::Owned(pixels))
                 },
             )?;

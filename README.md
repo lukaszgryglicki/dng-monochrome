@@ -255,6 +255,12 @@ to the nearest integer, not their raw values. The last green switch wins.
 in every selected format. Without it, an unused green is not processed.
 All these switches require `--color`; ordinary monochrome behavior is unchanged.
 
+`--channel-order bgr` (shortcut `-bgr`) swaps red and blue in **final RGB only**.
+Any three lowercase `r`/`g`/`b` letters are accepted, including repeated channels
+(`-ggr`, `-rbb`) and identity (`-rgb`, the default). This applies after green
+selection, tone/transfers and any color scaling, in every RGB output format.
+Companion files are unchanged. Requires `--color`; useful for IR false colors.
+
 `--keep-color-ratios` (`-kc`, `-kcr`) optionally scales **only final RGB samples**.
 It measures `max(raw - black, 0)` before clipping or tone processing, over the
 complete cropped cells. The reference green is always the average of both RAW
@@ -412,6 +418,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `-c, --color` | Force independent 2x2-channel development into half-size RGB; default mode is always monochrome |
 | `-4, --channels` | Also save R/G1/G2/B monochrome companions; requires `--color` |
 | `--g1`, `--g2`, `--ga` | First green (default), second green, or average of processed greens; requires `--color` |
+| `--channel-order RGB`, `-bgr`, `-ggr`, etc. | Select final RGB components using any three r/g/b letters; default rgb; requires `--color`; companions unchanged |
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
 | `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
