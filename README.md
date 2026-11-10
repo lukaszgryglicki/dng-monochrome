@@ -258,8 +258,31 @@ All these switches require `--color`; ordinary monochrome behavior is unchanged.
 `--channel-order bgr` (shortcut `-bgr`) swaps red and blue in **final RGB only**.
 Any three lowercase `r`/`g`/`b` letters are accepted, including repeated channels
 (`-ggr`, `-rbb`) and identity (`-rgb`, the default). This applies after green
-selection, tone/transfers, color scaling and max-color enhancement, in every RGB output format.
+selection, tone/transfers, color scaling, mixing, hue and max-color enhancement,
+in every RGB output format.
 Companion files are unchanged. Requires `--color`; useful for IR false colors.
+
+`--channel-mix` (`-channel-mix`, `-cm`) takes nine comma-separated weights:
+`RR,RG,RB,GR,GG,GB,BR,BG,BB`. Each output R/G/B row is normalized separately:
+`1,2,3,2,1,2,4,5,1` uses `0.4,0.2,0.4` for its green output. Weights must
+be finite and nonnegative; every row needs positive total weight.
+`--bw-from-color` (`-bw`) is the equivalent matrix with `0.299,0.587,0.114`
+in every row, producing equal RGB channels without changing the output format.
+It conflicts with a custom matrix.
+
+`--hue` (`-hue`) rotates HSV hue in degrees: positive clockwise (red toward
+yellow), negative counterclockwise (red toward magenta), wrapping modulo 360.
+Saturation/value and neutral grays are preserved. Mixing and hue operate on
+the **final transferred RGB values**, using floating-point arithmetic at the
+existing output depth, not an extra 8-bit intermediate. Order: WB/KCR/NC scaling,
+mixing/BW, hue, max-color, channel selection. These controls require `--color`,
+reject `--analyze`, and never change independent channel files or color estimates.
+`--report` records the normalized `channel_mix` and requested `hue_degrees`.
+
+```sh
+dng-monochrome -c -cm 1,2,3,0,2,0,4,5,1 -hue -10 --none --jxl photo.ARW
+dng-monochrome -c -bw --none --jxl photo.ARW
+```
 
 `--keep-color-ratios` (`-kc`, `-kcr`) optionally scales **only final RGB samples**.
 It measures `max(raw - black, 0)` before clipping or tone processing, over the
@@ -303,8 +326,17 @@ No eligible reference pixels means no correction, with a warning. This requires
 This is an automatic estimate, not guaranteed camera-JPEG matching: strongly
 colored scenes without neutral references can still mislead it.
 
+`--natural-color-level` (`-ncl`) accepts 0..2 and also enables NC. No controls
+means off; `-nc` defaults to 1, preserving its existing output exactly.
+Level 0 bypasses correction; positive levels raise the estimated factors to that
+power, so 0.5 is gentler and 2 squares them for aggressive correction. This never
+boosts a channel, but can overcorrect a misleading estimate; stronger does not
+always mean less green. It has the same conflicts as `-nc`; explicit levels
+are recorded as `natural_color_level`.
+
 ```sh
 dng-monochrome -c -nc -none -jxl -jpg DSC01869.ARW
+dng-monochrome -c -nc -ncl 1.5 -hue -10 --transfer srgb --none --jxl photo.ARW
 ```
 
 `--max-color` (`-max-color`, `-mc`) makes **only final RGB** more vivid.
@@ -313,7 +345,7 @@ unchanged, 1 is the default, and fractional levels allow fine control.
 Through level 1, expand chroma at fixed linear-light luminance, with up to 4x
 gain smoothly limited by the available gamut. Neutral pixels stay unchanged;
 integer rounding introduces no new black/white clipping. This works with linear
-or sRGB transfer at each output's actual precision, after WB/KCR/NC scaling
+or sRGB transfer at each output's actual precision, after color scaling/mixing/hue
 but before `-bgr` and other channel selectors. RAWs, channel companions and
 range/noise/color estimates are unchanged. Requires `--color`, not `--analyze`.
 Levels above 1 progressively subtract competing channels; 2 gives deliberately
@@ -439,9 +471,13 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `-4, --channels` | Also save R/G1/G2/B monochrome companions; requires `--color` |
 | `--g1`, `--g2`, `--ga` | First green (default), second green, or average of processed greens; requires `--color` |
 | `--channel-order RGB`, `-bgr`, `-ggr`, etc. | Select final RGB components using any three r/g/b letters; default rgb; requires `--color`; companions unchanged |
+| `--channel-mix MATRIX`, `-cm MATRIX` | Nine nonnegative row-major RGB weights; normalize each output row; final RGB only, requires `--color` |
+| `--bw-from-color`, `-bw` | Equal RGB outputs from 0.299 R + 0.587 G + 0.114 B; requires `--color`, conflicts with `--channel-mix` |
+| `--hue DEGREES`, `-hue DEGREES` | Signed HSV hue rotation after mixing; positive clockwise, modulo 360; requires `--color` |
 | `--keep-color-ratios`, `-kc`, `-kcr` | Scale only final RGB by black-subtracted RAW mean ratios; default off; requires `--color` |
 | `--white-balance`, `-wb` | Scale only final RGB by recorded WB gains normalized to maximum 1; requires `--color`, conflicts with `-kc`/`-kcr` |
 | `--natural-color`, `-nc` | Estimate final-image white balance; requires `--color`; separate from RAW ratios/WB and `--analyze`; companions unchanged |
+| `--natural-color-level N`, `-ncl N` | Natural-color strength 0..2; implies NC; 0 off, 1 existing correction, 2 aggressive; same conflicts as `-nc` |
 | `--max-color`, `-mc` | Make final RGB more vivid at gamut-safe level 1; default off; requires `--color`; before channel selection, companions unchanged |
 | `--max-color-level N`, `-mcl N` | Vivid-color level 0..2; implies `--max-color`; 0 is unchanged, >1 exaggerates channel separation; conflicts with `--analyze` |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |

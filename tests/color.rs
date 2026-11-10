@@ -66,6 +66,809 @@ fn fixture() -> common::Dng {
 }
 
 #[test]
+fn color_controls_cli_aliases_ranges_and_argument_boundaries() {
+    let parse = |flags: &[&str]| {
+        Cli::try_parse_compat(
+            ["dng-monochrome", "photo.ARW"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    let matrix = "1,2,3,0,2,0,4,5,1";
+    for (aliases, value) in [
+        (
+            ["--channel-mix", "-channel-mix", "--cm", "-cm"].as_slice(),
+            matrix,
+        ),
+        (
+            [
+                "--natural-color-level",
+                "-natural-color-level",
+                "--ncl",
+                "-ncl",
+            ]
+            .as_slice(),
+            "1.25",
+        ),
+        (["--hue", "-hue"].as_slice(), "-10"),
+    ] {
+        for &flag in aliases {
+            let result = parse(&["-c", flag, value]);
+            assert!(result.is_ok(), "{flag}: {result:?}");
+            assert!(parse(&["-c", &format!("{flag}={value}")]).is_ok());
+            assert!(parse(&[flag, value]).is_err());
+            assert!(parse(&["-c", flag, value, "-analyze"]).is_err());
+            assert!(parse(&["-c", flag]).is_err());
+            assert!(parse(&["-c", flag, "-bgr"]).is_err());
+            assert!(parse(&["--", flag]).is_ok());
+            assert_eq!(
+                parse(&["-func", flag]).unwrap().function.as_deref(),
+                Some(flag)
+            );
+        }
+    }
+    for flag in ["--bw-from-color", "-bw-from-color", "--bw", "-bw"] {
+        assert!(parse(&["-c", flag]).is_ok());
+        assert!(parse(&[flag]).is_err());
+        assert!(parse(&["-c", flag, "-analyze"]).is_err());
+        assert!(parse(&["-c", flag, "-cm", matrix]).is_err());
+        assert!(parse(&["-c", "-cm", matrix, flag]).is_err());
+        assert!(parse(&["-c", &format!("{flag}=true")]).is_err());
+        assert!(parse(&["--", flag]).is_ok());
+        assert_eq!(
+            parse(&["-func", flag]).unwrap().function.as_deref(),
+            Some(flag)
+        );
+        for compatible in ["-wb", "-kcr", "-nc", "-mc", "-bgr", "-rbb", "-nr", "-fd"] {
+            assert!(parse(&["-c", flag, compatible]).is_ok());
+        }
+    }
+    for value in [
+        "0.5,0.1,0.4,0.1,0.8,0.1,0,0.3,0.7",
+        "1,2,3,2,1,2,4,5,1",
+        " 1, 2, 3, 0, 2, 0, 4, 5, 1 ",
+        "1e308,1e308,1e308,0,2,0,1e-300,2e-300,3e-300",
+    ] {
+        assert!(parse(&["-c", "-cm", value]).is_ok(), "{value}");
+    }
+    for value in [
+        "",
+        "1,2",
+        "1,0,0,0,1,0,0,1",
+        "1,0,0,0,1,0,0,0,1,2",
+        "1,0,0,0,0,0,0,0,1",
+        "-1,2,0,0,1,0,0,0,1",
+        "1,,0,0,1,0,0,0,1",
+        "NaN,0,0,0,1,0,0,0,1",
+        "inf,0,0,0,1,0,0,0,1",
+        "1e309,0,0,0,1,0,0,0,1",
+        "one,0,0,0,1,0,0,0,1",
+    ] {
+        assert!(parse(&["-c", "-cm", value]).is_err(), "{value}");
+    }
+    for level in ["0", "0.25", "0.5", "1", "1.5", "2"] {
+        assert!(parse(&["-c", "-ncl", level]).is_ok());
+        assert!(parse(&["-c", "-nc", "-ncl", level]).is_ok());
+    }
+    for value in ["-0.01", "2.01", "NaN", "inf", "-inf", "one", ""] {
+        assert!(parse(&["-c", "-ncl", value]).is_err(), "{value}");
+    }
+    for value in ["0", "10", "-10", "360", "-1080.25", "1e300", "-1e300"] {
+        assert!(parse(&["-c", "-hue", value]).is_ok(), "{value}");
+    }
+    for value in ["NaN", "inf", "-inf", "1e309", "ten", ""] {
+        assert!(parse(&["-c", "-hue", value]).is_err(), "{value}");
+    }
+    for conflict in [
+        "-wb",
+        "-kcr",
+        "-kc",
+        "--white-balance",
+        "--keep-color-ratios",
+    ] {
+        assert!(parse(&["-c", "-ncl", "0", conflict]).is_err());
+        assert!(parse(&["-c", conflict, "-ncl", "1"]).is_err());
+        assert!(parse(&["-c", conflict, "-cm", matrix, "-hue", "-10"]).is_ok());
+    }
+    assert!(
+        parse(&[
+            "-c", "-nc", "-ncl", "1.5", "-cm", matrix, "-hue", "-10", "-mc", "-bgr"
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
+fn color_controls_mix_normalizes_each_row_and_bw_is_the_exact_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("mix.DNG");
+    let mut dng = codec_fixture(64, 48, [12.2; 3]);
+    let palette = [
+        [0, 0, 0],
+        [65535, 65535, 65535],
+        [1, 1, 1],
+        [101, 110, 120],
+        [65535, 0, 0],
+        [0, 65535, 0],
+        [0, 0, 65535],
+        [12345, 23456, 34567],
+        [30000, 30000, 30000],
+    ];
+    for y in 0..dng.height {
+        for x in 0..dng.width {
+            let cell = (y / 2 * (dng.width / 2) + x / 2) as usize;
+            let component = [0, 1, 1, 2][((y % 2) * 2 + x % 2) as usize];
+            dng.pixels[(y * dng.width + x) as usize] = palette[cell % palette.len()][component];
+        }
+    }
+    dng.write(&input);
+    let original_file = fs::read(&input).unwrap();
+    for transfer in ["linear", "srgb"] {
+        let flags = [
+            "-c",
+            "-4",
+            "-ga",
+            "-none",
+            "-png",
+            "-no-optimize",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-transfer",
+            transfer,
+            "-report",
+            "-silent",
+        ];
+        let baseline = dir.path().join(format!("{transfer}-baseline"));
+        success(run(&input, &baseline, &flags));
+        let original = png(&baseline.join("mix.png")).3;
+        let original_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(baseline.join("mix.json")).unwrap()).unwrap();
+        let mut integer_bytes = Vec::new();
+        let mut bw_bytes = Vec::new();
+        for (case, option, argument, weights) in [
+            (
+                "identity",
+                "-cm",
+                Some("2,0,0,0,7,0,0,0,9"),
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            ),
+            (
+                "fractional",
+                "-cm",
+                Some("0.5,0.1,0.4,0.1,0.8,0.1,0,0.3,0.7"),
+                [[0.5, 0.1, 0.4], [0.1, 0.8, 0.1], [0.0, 0.3, 0.7]],
+            ),
+            (
+                "integers",
+                "-cm",
+                Some("1,2,3,2,1,2,4,5,1"),
+                [
+                    [1.0 / 6.0, 2.0 / 6.0, 0.5],
+                    [0.4, 0.2, 0.4],
+                    [0.4, 0.5, 0.1],
+                ],
+            ),
+            (
+                "rescaled",
+                "-cm",
+                Some("8,16,24,8,4,8,8,10,2"),
+                [
+                    [1.0 / 6.0, 2.0 / 6.0, 0.5],
+                    [0.4, 0.2, 0.4],
+                    [0.4, 0.5, 0.1],
+                ],
+            ),
+            (
+                "green",
+                "-cm",
+                Some("1,2,3,0,2,0,4,5,1"),
+                [
+                    [1.0 / 6.0, 2.0 / 6.0, 0.5],
+                    [0.0, 1.0, 0.0],
+                    [0.4, 0.5, 0.1],
+                ],
+            ),
+            (
+                "extremes",
+                "-cm",
+                Some("1e308,1e308,1e308,0,1e308,0,1e-300,2e-300,3e-300"),
+                [[1.0 / 3.0; 3], [0.0, 1.0, 0.0], [1.0 / 6.0, 2.0 / 6.0, 0.5]],
+            ),
+            ("bw", "-bw", None, [[0.299, 0.587, 0.114]; 3]),
+            (
+                "bw-matrix",
+                "-cm",
+                Some("0.299,0.587,0.114,0.299,0.587,0.114,0.299,0.587,0.114"),
+                [[0.299, 0.587, 0.114]; 3],
+            ),
+        ] {
+            let out = dir.path().join(format!("{transfer}-{case}"));
+            let mut arguments = flags.to_vec();
+            arguments.push(option);
+            arguments.extend(argument);
+            success(run(&input, &out, &arguments));
+            let pixels = png(&out.join("mix.png"));
+            assert_eq!(pixels.2, png::ColorType::Rgb);
+            let mut report: serde_json::Value =
+                serde_json::from_slice(&fs::read(out.join("mix.json")).unwrap()).unwrap();
+            let actual: [[f64; 3]; 3] =
+                serde_json::from_value(report["channel_mix"].clone()).unwrap();
+            for (row, expected) in actual.iter().zip(weights) {
+                assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-14);
+                for (&value, expected) in row.iter().zip(expected) {
+                    assert!((value - expected).abs() < 1e-14, "{case}");
+                }
+            }
+            for (before, after) in original
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(pixels.3.as_chunks::<3>().0)
+            {
+                for (&actual, row) in after.iter().zip(weights) {
+                    let expected = before
+                        .iter()
+                        .zip(row)
+                        .map(|(&value, weight)| f64::from(value) * weight)
+                        .sum::<f64>();
+                    assert!(actual.abs_diff(expected.round() as u16) <= 1, "{case}");
+                }
+                if before[0] == before[1] && before[1] == before[2] {
+                    assert_eq!(before, after);
+                }
+                if case.starts_with("bw") {
+                    assert_eq!(after[0], after[1]);
+                    assert_eq!(after[1], after[2]);
+                }
+            }
+            let bytes = fs::read(out.join("mix.png")).unwrap();
+            match case {
+                "identity" => assert_eq!(bytes, fs::read(baseline.join("mix.png")).unwrap()),
+                "integers" => integer_bytes = bytes,
+                "rescaled" => assert_eq!(bytes, integer_bytes),
+                "bw" => bw_bytes = bytes,
+                "bw-matrix" => assert_eq!(bytes, bw_bytes),
+                _ => {}
+            }
+            report.as_object_mut().unwrap().remove("channel_mix");
+            assert_eq!(report, original_report);
+            for channel in ["R", "G1", "G2", "B"] {
+                for extension in ["png", "json"] {
+                    let name = format!("mix{channel}.{extension}");
+                    assert_eq!(
+                        fs::read(out.join(&name)).unwrap(),
+                        fs::read(baseline.join(name)).unwrap()
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(fs::read(input).unwrap(), original_file);
+}
+
+fn reference_hue(rgb: [f64; 3], degrees: f64) -> [f64; 3] {
+    let maximum = rgb.into_iter().fold(0.0, f64::max);
+    let minimum = rgb.into_iter().fold(f64::INFINITY, f64::min);
+    let chroma = maximum - minimum;
+    if chroma == 0.0 {
+        return rgb;
+    }
+    let hue = if maximum == rgb[0] {
+        (rgb[1] - rgb[2]) / chroma
+    } else if maximum == rgb[1] {
+        2.0 + (rgb[2] - rgb[0]) / chroma
+    } else {
+        4.0 + (rgb[0] - rgb[1]) / chroma
+    };
+    [5.0, 3.0, 1.0].map(|offset| {
+        let k = (hue + degrees.rem_euclid(360.0) / 60.0 + offset).rem_euclid(6.0);
+        maximum - chroma * k.min(4.0 - k).clamp(0.0, 1.0)
+    })
+}
+
+#[test]
+fn color_controls_hue_precision_direction_wrapping_and_parallelism() {
+    let serial = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let parallel = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let matrix = [[0.5, 0.25, 0.25], [0.125, 0.75, 0.125], [0.25, 0.25, 0.5]];
+    for bits in 1..=16 {
+        let maximum = ((1u32 << bits) - 1) as u16;
+        let mut original: Vec<_> = [
+            [maximum, 0, 0],
+            [0, maximum, 0],
+            [0, 0, maximum],
+            [maximum, maximum, 0],
+            [0, maximum, maximum],
+            [maximum, 0, maximum],
+            [0; 3],
+            [1; 3],
+            [maximum / 2; 3],
+            [maximum; 3],
+            [maximum / 5, maximum / 2, maximum - 1],
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if bits >= 8 {
+            original.extend([101, 110, 120, 71, 72, 73]);
+        }
+        for mix in [None, Some(&matrix)] {
+            for degrees in [
+                -370.25, -120.0, -60.0, -10.0, 0.0, 10.0, 60.0, 120.0, 180.0, 360.0, 720.0,
+            ] {
+                let mut output = original.clone();
+                serial
+                    .install(|| color::adjust_color(&mut output, bits, mix, degrees))
+                    .unwrap();
+                let mut threaded = original.clone();
+                parallel
+                    .install(|| color::adjust_color(&mut threaded, bits, mix, degrees))
+                    .unwrap();
+                assert_eq!(output, threaded);
+                for (before, after) in original
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(output.as_chunks::<3>().0)
+                {
+                    let rgb = before.map(f64::from);
+                    let mixed = mix.map_or(rgb, |rows| {
+                        rows.map(|row| {
+                            rgb.iter()
+                                .zip(row)
+                                .map(|(&value, weight)| value * weight)
+                                .sum::<f64>()
+                        })
+                    });
+                    let expected = reference_hue(mixed, degrees).map(|value| value.round() as u16);
+                    for (&actual, expected) in after.iter().zip(expected) {
+                        assert!(actual.abs_diff(expected) <= 1, "{bits} {degrees}");
+                        assert!(actual <= maximum);
+                    }
+                    if before[0] == before[1] && before[1] == before[2] {
+                        assert_eq!(before, after);
+                    }
+                    if mix.is_none() {
+                        assert_eq!(before.iter().max(), after.iter().max());
+                        assert_eq!(before.iter().min(), after.iter().min());
+                    }
+                }
+                if mix.is_none() && degrees.rem_euclid(360.0) == 0.0 {
+                    assert_eq!(output, original);
+                }
+                if mix.is_none() && degrees == 60.0 {
+                    assert_eq!(
+                        &output[..9],
+                        &[
+                            maximum, maximum, 0, 0, maximum, maximum, maximum, 0, maximum
+                        ]
+                    );
+                }
+                if mix.is_none() && degrees == -60.0 {
+                    assert_eq!(
+                        &output[..9],
+                        &[
+                            maximum, 0, maximum, maximum, maximum, 0, 0, maximum, maximum
+                        ]
+                    );
+                }
+            }
+        }
+    }
+    for degrees in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(color::adjust_color(&mut [10, 20, 30], 8, None, degrees).is_err());
+    }
+    for bits in [0, 17, u8::MAX] {
+        assert!(color::adjust_color(&mut [10, 20, 30], bits, None, 10.0).is_err());
+    }
+    assert!(color::adjust_color(&mut [256, 20, 30], 8, None, 10.0).is_err());
+    assert!(color::adjust_color(&mut [10, 20], 8, None, 10.0).is_err());
+    for invalid in [
+        [[0.0; 3]; 3],
+        [[1.0; 3]; 3],
+        [[-1.0, 1.0, 1.0]; 3],
+        [[f64::NAN, 0.0, 1.0]; 3],
+    ] {
+        assert!(color::adjust_color(&mut [10, 20, 30], 8, Some(&invalid), 0.0).is_err());
+    }
+}
+
+#[test]
+fn color_controls_natural_level_preserves_zero_one_and_scales_estimated_correction() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("natural.DNG");
+    channel_order_fixture().write(&input);
+    let original_file = fs::read(&input).unwrap();
+    for transfer in ["linear", "srgb"] {
+        let flags = [
+            "-c",
+            "-4",
+            "-ga",
+            "-none",
+            "-png",
+            "-jpg",
+            "-jxl",
+            "-jpeg-quality",
+            "100",
+            "-report",
+            "-silent",
+            "-no-optimize",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-png-transfer",
+            transfer,
+            "-jpeg-transfer",
+            if transfer == "linear" {
+                "srgb"
+            } else {
+                "linear"
+            },
+        ];
+        let plain = dir.path().join(format!("{transfer}-plain"));
+        let standard = dir.path().join(format!("{transfer}-standard"));
+        success(run(&input, &plain, &flags));
+        let mut arguments = flags.to_vec();
+        arguments.push("-nc");
+        success(run(&input, &standard, &arguments));
+        let reference: serde_json::Value =
+            serde_json::from_slice(&fs::read(standard.join("natural.json")).unwrap()).unwrap();
+        assert!(reference.get("natural_color_level").is_none());
+        for level in ["0", "0.25", "0.5", "1", "1.5", "2"] {
+            let amount: f64 = level.parse().unwrap();
+            let out = dir.path().join(format!("{transfer}-{level}"));
+            let mut arguments = flags.to_vec();
+            arguments.extend(["-ncl", level]);
+            success(run(&input, &out, &arguments));
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(out.join("natural.json")).unwrap()).unwrap();
+            assert_eq!(report["natural_color_level"], amount);
+            assert_eq!(report["natural_color"], amount != 0.0);
+            assert_eq!(report["channels"], reference["channels"]);
+            for format in [Format::Png, Format::Jpeg, Format::Jxl] {
+                let name = format!("natural.{}", format.extension());
+                let original = decode_color(&plain.join(&name), format);
+                let corrected = decode_color(&out.join(&name), format);
+                let balance = if format == Format::Jpeg {
+                    "natural_jpeg_balance"
+                } else {
+                    "natural_balance"
+                };
+                let scales: [f64; 3] =
+                    serde_json::from_value(reference[balance]["scale_factors"].clone()).unwrap();
+                assert!(scales.iter().any(|&value| value < 0.99));
+                let expected_scales = scales.map(|value| value.powf(amount));
+                if amount == 0.0 {
+                    assert!(report[balance].is_null());
+                } else {
+                    let actual: [f64; 3] =
+                        serde_json::from_value(report[balance]["scale_factors"].clone()).unwrap();
+                    for (actual, expected) in actual.into_iter().zip(expected_scales) {
+                        assert!((actual - expected).abs() < 1e-14);
+                    }
+                    assert_eq!(
+                        report[balance]["reference_levels"],
+                        reference[balance]["reference_levels"]
+                    );
+                    assert_eq!(report[balance]["method"], reference[balance]["method"]);
+                }
+                let expected: Vec<_> = original
+                    .pixels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &value)| {
+                        (f64::from(value) * expected_scales[index % 3]).round() as u16
+                    })
+                    .collect();
+                if format == Format::Jpeg {
+                    let error: u64 = corrected
+                        .pixels
+                        .iter()
+                        .zip(&expected)
+                        .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                        .sum();
+                    assert!(error < expected.len() as u64 * 2);
+                } else {
+                    assert_eq!(corrected.pixels, expected, "{transfer} {level} {format}");
+                }
+                if amount == 0.0 || amount == 1.0 {
+                    let baseline = if amount == 0.0 { &plain } else { &standard };
+                    assert_eq!(
+                        fs::read(out.join(&name)).unwrap(),
+                        fs::read(baseline.join(&name)).unwrap()
+                    );
+                }
+                for channel in ["R", "G1", "G2", "B"] {
+                    let name = format!("natural{channel}.{}", format.extension());
+                    assert_eq!(
+                        fs::read(out.join(&name)).unwrap(),
+                        fs::read(plain.join(name)).unwrap()
+                    );
+                }
+            }
+            for channel in ["R", "G1", "G2", "B"] {
+                let name = format!("natural{channel}.json");
+                assert_eq!(
+                    fs::read(out.join(&name)).unwrap(),
+                    fs::read(plain.join(name)).unwrap()
+                );
+            }
+            if amount == 1.0 {
+                let mut report = report;
+                report
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("natural_color_level");
+                assert_eq!(report, reference);
+            }
+        }
+    }
+    for level in ["0", "2"] {
+        let out = dir.path().join(format!("unavailable-{level}"));
+        let result = success(run(
+            &input,
+            &out,
+            &["-c", "-ncl", level, "-func", "0", "-report"],
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&result.stderr).contains("no unclipped RGB reference samples"),
+            level == "2"
+        );
+        assert!(
+            png(&out.join("natural.png"))
+                .3
+                .iter()
+                .all(|&value| value == 0)
+        );
+    }
+    assert_eq!(fs::read(input).unwrap(), original_file);
+}
+
+#[test]
+fn color_controls_compose_in_order_at_all_codec_depths_and_preserve_companions() {
+    use dng_monochrome::tone::Transfer;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("controls.DNG");
+    let matrix = [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.2, 0.1, 0.7]];
+    for (case, balance, green, transfer, dr, bits, selector, order) in [
+        (
+            "eight",
+            [].as_slice(),
+            "-g1",
+            "linear",
+            [5.2, 6.2, 7.2],
+            8,
+            "-bgr",
+            [2, 1, 0],
+        ),
+        (
+            "ten",
+            ["-wb"].as_slice(),
+            "-g2",
+            "srgb",
+            [8.2, 9.2, 7.2],
+            10,
+            "-ggr",
+            [1, 1, 0],
+        ),
+        (
+            "twelve",
+            ["-kcr"].as_slice(),
+            "-ga",
+            "linear",
+            [10.2, 11.2, 9.2],
+            12,
+            "-rbb",
+            [0, 2, 2],
+        ),
+        (
+            "sixteen",
+            ["-ncl", "1.5"].as_slice(),
+            "-ga",
+            "srgb",
+            [13.2, 15.2, 14.2],
+            16,
+            "-rbg",
+            [0, 2, 1],
+        ),
+    ] {
+        let mut dng = codec_fixture(70, 54, dr);
+        dng.as_shot_neutral = Some([[1, 5], [1, 3], [1, 2]]);
+        dng.write(&input);
+        let baseline = dir.path().join(format!("{case}-baseline"));
+        let out = dir.path().join(case);
+        let identity = dir.path().join(format!("{case}-identity"));
+        let mut flags = vec![
+            "-c",
+            "-4",
+            green,
+            "-all",
+            "-report",
+            "-silent",
+            "-no-optimize",
+            "-dark",
+            "0",
+            "-light",
+            "0",
+            "-png-transfer",
+            transfer,
+            "-jpeg-transfer",
+            if transfer == "linear" {
+                "srgb"
+            } else {
+                "linear"
+            },
+            "-jpeg-quality",
+            "100",
+        ];
+        flags.extend(balance.iter().copied());
+        success(run(&input, &baseline, &flags));
+        let mut arguments = flags.clone();
+        arguments.extend([
+            "-cm",
+            "7,2,1,1,8,1,2,1,7",
+            "-hue",
+            "-10",
+            "-mc",
+            "-mcl",
+            "0.5",
+            selector,
+        ]);
+        success(run(&input, &out, &arguments));
+        let mut arguments = flags.clone();
+        arguments.extend(["-cm", "3,0,0,0,2,0,0,0,4", "-hue", "720"]);
+        success(run(&input, &identity, &arguments));
+        let original_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(baseline.join("controls.json")).unwrap()).unwrap();
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("controls.json")).unwrap()).unwrap();
+        assert_eq!(report["hue_degrees"], -10.0);
+        assert_eq!(report["max_color_level"], 0.5);
+        for field in [
+            "channel_mix",
+            "hue_degrees",
+            "max_color_level",
+            "channel_order",
+        ] {
+            report.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(report, original_report);
+        let bw = dir.path().join(format!("{case}-bw"));
+        let mut arguments = flags;
+        arguments.extend(["-bw", "-hue", "10", "-mc", "-bgr"]);
+        success(run(&input, &bw, &arguments));
+        for format in [
+            Format::Png,
+            Format::Jpeg,
+            Format::Heic,
+            Format::Avif,
+            Format::J2k,
+            Format::Jxl,
+        ] {
+            let name = format!("controls.{}", format.extension());
+            let original = decode_color(&baseline.join(&name), format);
+            let adjusted = decode_color(&out.join(&name), format);
+            let monochrome = decode_color(&bw.join(&name), format);
+            assert_eq!(
+                adjusted.bits,
+                match format {
+                    Format::Png => 16,
+                    Format::Jpeg => 8,
+                    Format::Heic | Format::Avif => bits.min(12),
+                    Format::J2k | Format::Jxl => bits,
+                }
+            );
+            assert_eq!(
+                (adjusted.width, adjusted.height, adjusted.transfer),
+                (original.width, original.height, original.transfer)
+            );
+            assert_color_exif(&adjusted);
+            let mut expected: Vec<_> = original
+                .pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|pixel| {
+                    let mixed = matrix.map(|row| {
+                        pixel
+                            .iter()
+                            .zip(row)
+                            .map(|(&value, weight)| f64::from(value) * weight)
+                            .sum()
+                    });
+                    reference_hue(mixed, -10.0).map(|value| value.round() as u16)
+                })
+                .collect();
+            let srgb = (transfer == "srgb") != (format == Format::Jpeg);
+            color::maximize_color(
+                &mut expected,
+                adjusted.bits,
+                0.5,
+                if srgb {
+                    Transfer::Srgb
+                } else {
+                    Transfer::Linear
+                },
+            )
+            .unwrap();
+            let expected: Vec<_> = expected
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|pixel| order.map(|component| pixel[component]))
+                .collect();
+            if format == Format::Jpeg {
+                let error: u64 = adjusted
+                    .pixels
+                    .iter()
+                    .zip(&expected)
+                    .map(|(&actual, &expected)| u64::from(actual.abs_diff(expected)))
+                    .sum();
+                assert!(error < expected.len() as u64 * 4, "{case} JPEG");
+            } else {
+                for (&actual, &expected) in adjusted.pixels.iter().zip(&expected) {
+                    assert!(
+                        actual.abs_diff(expected) <= 3,
+                        "{case} {format}: {actual} != {expected}"
+                    );
+                }
+            }
+            assert_ne!(adjusted.pixels, original.pixels);
+            for (before, after) in original
+                .pixels
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(monochrome.pixels.as_chunks::<3>().0)
+            {
+                let expected = (0.299 * f64::from(before[0])
+                    + 0.587 * f64::from(before[1])
+                    + 0.114 * f64::from(before[2]))
+                .round() as u16;
+                for &value in after {
+                    assert!(
+                        value.abs_diff(expected) <= if format == Format::Jpeg { 4 } else { 1 },
+                        "{case} {format} BW"
+                    );
+                }
+                assert_eq!(after[0], after[1]);
+                assert_eq!(after[1], after[2]);
+            }
+            assert_eq!(
+                fs::read(identity.join(&name)).unwrap(),
+                fs::read(baseline.join(&name)).unwrap()
+            );
+            for channel in ["R", "G1", "G2", "B"] {
+                let name = format!("controls{channel}.{}", format.extension());
+                for directory in [&out, &bw, &identity] {
+                    assert_eq!(
+                        fs::read(directory.join(&name)).unwrap(),
+                        fs::read(baseline.join(&name)).unwrap()
+                    );
+                }
+            }
+        }
+        for channel in ["R", "G1", "G2", "B"] {
+            let name = format!("controls{channel}.json");
+            assert_eq!(
+                fs::read(out.join(&name)).unwrap(),
+                fs::read(baseline.join(&name)).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn max_color_flags_levels_and_argument_boundaries() {
     let parse = |flags: &[&str]| {
         Cli::try_parse_compat(

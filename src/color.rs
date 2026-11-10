@@ -115,6 +115,18 @@ pub struct NaturalColor {
 }
 
 impl NaturalColor {
+    pub fn with_level(mut self, level: f64) -> Result<Self> {
+        ensure!(
+            level.is_finite() && (0.0..=2.0).contains(&level),
+            "natural-color level must be finite and in [0, 2]"
+        );
+        validate_scales(&self.scale_factors)?;
+        if level != 1.0 {
+            self.scale_factors = self.scale_factors.map(|factor| factor.powf(level));
+        }
+        Ok(self)
+    }
+
     pub fn raw_neutral_mask(
         channels: [&MonoImage; 3],
         second_green: Option<&MonoImage>,
@@ -372,6 +384,107 @@ pub(crate) fn combine_jpeg(
             }
         });
     Ok(pixels)
+}
+
+pub fn adjust_color(
+    pixels: &mut [u16],
+    bits: u8,
+    matrix: Option<&[[f64; 3]; 3]>,
+    hue: f64,
+) -> Result<()> {
+    ensure!((1..=16).contains(&bits), "RGB precision must be 1-16 bits");
+    adjust_samples(pixels, f64::from((1u32 << bits) - 1), matrix, hue, |code| {
+        code as u16
+    })
+}
+
+pub(crate) fn adjust_jpeg_color(
+    pixels: &mut [u8],
+    matrix: Option<&[[f64; 3]; 3]>,
+    hue: f64,
+) -> Result<()> {
+    adjust_samples(pixels, 255.0, matrix, hue, |code| code as u8)
+}
+
+fn adjust_samples<T: Copy + Send + Into<f64>>(
+    pixels: &mut [T],
+    maximum: f64,
+    matrix: Option<&[[f64; 3]; 3]>,
+    hue: f64,
+    from_code: fn(f64) -> T,
+) -> Result<()> {
+    ensure!(hue.is_finite(), "hue rotation must be finite");
+    ensure!(
+        pixels.len().is_multiple_of(3),
+        "RGB samples must form complete pixels"
+    );
+    if let Some(matrix) = matrix {
+        ensure!(
+            matrix.iter().all(|row| row
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                && (row.iter().sum::<f64>() - 1.0).abs() <= 8.0 * f64::EPSILON),
+            "channel-mix rows must contain finite nonnegative weights normalized to 1"
+        );
+    }
+    let matrix =
+        matrix.filter(|rows| **rows != [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    let shift = (hue % 360.0) / 60.0;
+    if matrix.is_none() && shift == 0.0 {
+        return Ok(());
+    }
+    pixels
+        .as_chunks_mut::<3>()
+        .0
+        .par_iter_mut()
+        .try_for_each(|pixel| {
+            let codes: [f64; 3] = (*pixel).map(Into::into);
+            ensure!(
+                codes.iter().all(|value| (0.0..=maximum).contains(value)),
+                "RGB sample exceeds declared precision"
+            );
+            if codes[0] == codes[1] && codes[1] == codes[2] {
+                return Ok(());
+            }
+            let mut rgb = matrix.map_or(codes, |rows| {
+                rows.map(|row| {
+                    codes
+                        .iter()
+                        .zip(row)
+                        .map(|(&value, weight)| value * weight)
+                        .sum::<f64>()
+                })
+            });
+            if shift != 0.0 {
+                let high = rgb.into_iter().fold(0.0, f64::max);
+                let low = rgb.into_iter().fold(f64::INFINITY, f64::min);
+                let chroma = high - low;
+                if chroma > 0.0 {
+                    let hue = if high == rgb[0] {
+                        (rgb[1] - rgb[2]) / chroma
+                    } else if high == rgb[1] {
+                        2.0 + (rgb[2] - rgb[0]) / chroma
+                    } else {
+                        4.0 + (rgb[0] - rgb[1]) / chroma
+                    };
+                    let hue = (hue + shift).rem_euclid(6.0);
+                    let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+                    rgb = match hue as u8 {
+                        0 => [chroma, secondary, 0.0],
+                        1 => [secondary, chroma, 0.0],
+                        2 => [0.0, chroma, secondary],
+                        3 => [0.0, secondary, chroma],
+                        4 => [secondary, 0.0, chroma],
+                        _ => [chroma, 0.0, secondary],
+                    }
+                    .map(|value| value + low);
+                }
+            }
+            for (sample, value) in pixel.iter_mut().zip(rgb) {
+                *sample = from_code(value.clamp(0.0, maximum).round());
+            }
+            Ok(())
+        })
 }
 
 pub fn maximize_color(pixels: &mut [u16], bits: u8, level: f64, transfer: Transfer) -> Result<()> {

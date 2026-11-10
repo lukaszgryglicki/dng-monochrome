@@ -49,6 +49,8 @@ mod color;
         --fix-dirty/-fd completes all RAW analysis before development; --no-optimize skips optimization.\n\
         --noise-reduction/-nr defaults to level 1; --noise-reduction-level/-nrl accepts 0..2 and also enables it.\n\
         Noise/range/DR and tone fitting use the original pre-denoising samples.\n\
+        Final RGB: color scaling -> --channel-mix/-cm or --bw-from-color/-bw -> --hue -> max-color -> channel selection.\n\
+        --natural-color-level/-ncl accepts 0..2: 0 off, 1 current correction, 2 stronger correction.\n\
         --max-color/-mc enhances final RGB only; --max-color-level/-mcl: 0 off, 1 gamut-safe vivid, 2 extreme.\n\
         x is normalized LINEAR light in [0,1], before the final display transfer.\n\
         Examples:\n  \
@@ -108,6 +110,26 @@ pub struct Cli {
         help = "Select final RGB channels with three r/g/b letters (default rgb); shortcuts include -bgr, -ggr and -rbb; companions unchanged")]
     pub channel_order: Option<[usize; 3]>,
 
+    #[arg(long, visible_alias = "cm", requires = "color",
+        conflicts_with_all = ["bw_from_color", "analyze"],
+        value_parser = parse_channel_mix, allow_hyphen_values = true, value_name = "RR,RG,RB,GR,GG,GB,BR,BG,BB",
+        help = "Mix final RGB with nine nonnegative weights, normalized separately per output R/G/B row; every row needs positive total weight")]
+    pub channel_mix: Option<[[f64; 3]; 3]>,
+
+    #[arg(
+        long,
+        visible_alias = "bw",
+        requires = "color",
+        conflicts_with = "analyze",
+        help = "Make final RGB black-and-white using 0.299 R + 0.587 G + 0.114 B in all three outputs; shortcut for --channel-mix"
+    )]
+    pub bw_from_color: bool,
+
+    #[arg(long, requires = "color", conflicts_with = "analyze",
+        value_parser = parse_hue, allow_hyphen_values = true, value_name = "DEGREES",
+        help = "Rotate final RGB hue in HSV after mixing; positive clockwise (red -> yellow), negative counterclockwise; wraps at 360 degrees")]
+    pub hue: Option<f64>,
+
     #[arg(long, visible_aliases = ["kc", "kcr"], requires = "color",
         help = "Scale final RGB by black-subtracted RAW mean ratios; keep the strongest channel and separate channel files unchanged")]
     pub keep_color_ratios: bool,
@@ -129,6 +151,18 @@ pub struct Cli {
         help = "Estimate white balance from developed final RGB, without changing separate channels; use --report for factors"
     )]
     pub natural_color: bool,
+
+    #[arg(
+        long,
+        visible_alias = "ncl",
+        requires = "color",
+        conflicts_with_all = ["keep_color_ratios", "white_balance", "analyze"],
+        value_parser = parse_natural_color_level,
+        allow_hyphen_values = true,
+        value_name = "LEVEL",
+        help = "Natural-color strength 0..2 (default 1 with --natural-color); also enables it. 0 bypasses correction, 1 is unchanged behavior, 2 squares the estimated factors"
+    )]
+    pub natural_color_level: Option<f64>,
 
     #[arg(
         long,
@@ -354,6 +388,11 @@ pub struct Cli {
 }
 
 impl Cli {
+    fn natural_level(&self) -> f64 {
+        self.natural_color_level
+            .unwrap_or(if self.natural_color { 1.0 } else { 0.0 })
+    }
+
     fn color_level(&self) -> f64 {
         self.max_color_level
             .unwrap_or(if self.max_color { 1.0 } else { 0.0 })
@@ -458,6 +497,56 @@ fn parse_channel_order(input: &str) -> Result<[usize; 3], String> {
     Ok(order)
 }
 
+fn parse_channel_mix(input: &str) -> Result<[[f64; 3]; 3], String> {
+    let error = "channel mix requires nine finite nonnegative numbers separated by commas";
+    let mut fields = input.split(',');
+    let mut rows = [[0.0; 3]; 3];
+    for value in rows.iter_mut().flatten() {
+        *value = fields
+            .next()
+            .ok_or(error)?
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| error)?;
+        if !value.is_finite() || *value < 0.0 {
+            return Err(error.into());
+        }
+    }
+    if fields.next().is_some() {
+        return Err(error.into());
+    }
+    for row in &mut rows {
+        let maximum = row.iter().copied().fold(0.0, f64::max);
+        if maximum == 0.0 {
+            return Err("every channel-mix output row must have positive total weight".into());
+        }
+        let mut total = row.iter().sum::<f64>();
+        if !total.is_finite() {
+            for value in row.iter_mut() {
+                *value /= maximum;
+            }
+            total = row.iter().sum();
+        }
+        if maximum > 1.0 || (total - 1.0).abs() > 4.0 * f64::EPSILON {
+            for value in row {
+                *value /= total;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_hue(input: &str) -> Result<f64, String> {
+    let value: f64 = input
+        .parse()
+        .map_err(|_| "expected a hue rotation in degrees, e.g. 10 or -10".to_string())?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("hue rotation must be finite".into())
+    }
+}
+
 fn parse_dust_strength(input: &str) -> Result<f64, String> {
     let value: f64 = input
         .parse()
@@ -491,11 +580,25 @@ fn parse_color_level(input: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_natural_color_level(input: &str) -> Result<f64, String> {
+    let value: f64 = input
+        .parse()
+        .map_err(|_| "expected a natural-color level such as 0.5 or 1.25".to_string())?;
+    if value.is_finite() && (0.0..=2.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("natural-color level must be finite and in [0, 2]".into())
+    }
+}
+
 fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     const VALUES: &[&str] = &[
         "output",
         "output-dir",
         "channel-order",
+        "channel-mix",
+        "cm",
+        "hue",
         "dark",
         "light",
         "clip-strength",
@@ -525,6 +628,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "nrl",
         "max-color-level",
         "mcl",
+        "natural-color-level",
+        "ncl",
     ];
     const FLAGS: &[&str] = &[
         "color",
@@ -532,6 +637,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "g1",
         "g2",
         "ga",
+        "bw-from-color",
+        "bw",
         "keep-color-ratios",
         "kc",
         "kcr",

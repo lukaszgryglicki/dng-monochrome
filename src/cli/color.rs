@@ -75,6 +75,12 @@ pub(super) fn process(
     let start = Instant::now();
     let green = cli.green();
     let color_level = cli.color_level();
+    let natural_level = cli.natural_level();
+    let natural_color = natural_level != 0.0;
+    let channel_mix = cli
+        .channel_mix
+        .or(cli.bw_from_color.then_some([[0.299, 0.587, 0.114]; 3]));
+    let hue = cli.hue.unwrap_or(0.0);
     let channel_order_name = cli
         .channel_order
         .map(|order| order.map(|component| ["r", "g", "b"][component]).concat());
@@ -159,7 +165,7 @@ pub(super) fn process(
             .fold(1.0, f64::max);
         report
     });
-    let natural_reference_mask = if cli.natural_color {
+    let natural_reference_mask = if natural_color {
         decoded
             .recorded_white_balance
             .map(|wb| {
@@ -191,7 +197,7 @@ pub(super) fn process(
         "cfa_assumed": decoded.cfa_assumed,
         "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
         "white_balance": decoded.white_balance,
-        "natural_color": cli.natural_color,
+        "natural_color": natural_color,
         "width": first.metadata.width, "height": first.metadata.height,
         "channels": analysis_channels, "parameters": cli.parameters,
         "threads": threads, "jobs": jobs, "file_threads": file_threads,
@@ -278,7 +284,7 @@ pub(super) fn process(
             let rgb = selected.map(|index| &rendered[index]);
             let other = second_green.map(|index| &rendered[index]);
             let enabled = cli.formats.enabled();
-            let natural_balance = if cli.natural_color {
+            let natural_balance = if natural_color {
                 let (pixels, _) = color::combine(
                     rgb.map(|rendered| (rendered.png.as_slice(), 16)),
                     other.map(|rendered| (rendered.png.as_slice(), 16)),
@@ -287,10 +293,12 @@ pub(super) fn process(
                     &pixels,
                     natural_reference_mask.as_deref(),
                 )?
+                .map(|balance| balance.with_level(natural_level))
+                .transpose()?
             } else {
                 None
             };
-            let natural_jpeg_balance = if cli.natural_color && enabled.contains(&Format::Jpeg) {
+            let natural_jpeg_balance = if natural_color && enabled.contains(&Format::Jpeg) {
                 if transfers.png == transfers.jpeg {
                     natural_balance
                 } else {
@@ -307,21 +315,23 @@ pub(super) fn process(
                         &pixels,
                         natural_reference_mask.as_deref(),
                     )?
+                    .map(|balance| balance.with_level(natural_level))
+                    .transpose()?
                 }
             } else {
                 None
             };
-            let scales = if cli.natural_color {
+            let scales = if natural_color {
                 natural_balance.map(|balance| balance.scale_factors)
             } else {
                 scales
             };
-            let jpeg_scales = if cli.natural_color {
+            let jpeg_scales = if natural_color {
                 natural_jpeg_balance.map(|balance| balance.scale_factors)
             } else {
                 scales
             };
-            if cli.natural_color && !cli.silent {
+            if natural_color && !cli.silent {
                 if natural_balance.is_none() {
                     eprintln!(
                         "WARNING {}: no unclipped RGB reference samples for natural white balance; RGB is unchanged",
@@ -374,9 +384,9 @@ pub(super) fn process(
                 "cfa_assumed": decoded.cfa_assumed,
                 "keep_color_ratios": cli.keep_color_ratios, "color_ratios": decoded.color_ratios,
                 "white_balance": decoded.white_balance,
-                "natural_color": cli.natural_color, "natural_balance": natural_balance,
+                "natural_color": natural_color, "natural_balance": natural_balance,
                 "natural_jpeg_balance": natural_jpeg_balance,
-                "natural_reference_white_balance": cli.natural_color.then_some(decoded.recorded_white_balance).flatten(),
+                "natural_reference_white_balance": natural_color.then_some(decoded.recorded_white_balance).flatten(),
                 "width": first.metadata.width, "height": first.metadata.height,
                 "precision_alignment": "left_shift", "channels": channel_reports,
                 "parameters": cli.parameters, "png_transfer": transfers.png, "jpeg_transfer": transfers.jpeg,
@@ -388,6 +398,15 @@ pub(super) fn process(
             }
             if cli.max_color || cli.max_color_level.is_some() {
                 report["max_color_level"] = serde_json::json!(color_level);
+            }
+            if cli.natural_color_level.is_some() {
+                report["natural_color_level"] = serde_json::json!(natural_level);
+            }
+            if let Some(matrix) = channel_mix {
+                report["channel_mix"] = serde_json::json!(matrix);
+            }
+            if let Some(hue) = cli.hue {
+                report["hue_degrees"] = serde_json::json!(hue);
             }
             if let Some(dirty) = &dirty_report {
                 report["dirty_correction"] = serde_json::to_value(dirty)?;
@@ -411,6 +430,8 @@ pub(super) fn process(
             } else {
                 Vec::new()
             };
+            color::adjust_color(&mut png, 16, channel_mix.as_ref(), hue)?;
+            color::adjust_jpeg_color(&mut jpeg, channel_mix.as_ref(), hue)?;
             color::maximize_color(&mut png, 16, color_level, transfers.png)?;
             color::maximize_jpeg_color(&mut jpeg, color_level, transfers.jpeg)?;
             reorder_rgb(&mut png, cli.channel_order);
@@ -451,6 +472,7 @@ pub(super) fn process(
                         bits == encoding.bits,
                         "RGB precision must equal the maximum selected channel precision"
                     );
+                    color::adjust_color(&mut pixels, bits, channel_mix.as_ref(), hue)?;
                     color::maximize_color(&mut pixels, bits, color_level, transfers.png)?;
                     reorder_rgb(&mut pixels, cli.channel_order);
                     Ok(Cow::Owned(pixels))
@@ -490,7 +512,7 @@ pub(super) fn process(
                 if let Some(scales) = scales {
                     progress.push_str(&format!(
                         "\n  {} color scale R {:.6}, G {:.6}, B {:.6}",
-                        if cli.natural_color {
+                        if natural_color {
                             "natural"
                         } else if cli.white_balance {
                             "WB"
@@ -502,7 +524,7 @@ pub(super) fn process(
                         scales[2]
                     ));
                 }
-                if cli.natural_color
+                if natural_color
                     && transfers.jpeg != transfers.png
                     && let Some(scales) = jpeg_scales
                 {
