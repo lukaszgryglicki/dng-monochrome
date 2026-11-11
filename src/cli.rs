@@ -77,7 +77,7 @@ mod color;
 )]
 pub struct Cli {
     #[arg(
-        required = true,
+        required_unless_present = "fix_dirty_save",
         num_args = 1..,
         value_name = "RAW_OR_DIRECTORY",
         help = "Input RAW files, recursive directories or quoted globs"
@@ -200,7 +200,7 @@ pub struct Cli {
     #[arg(
         long,
         visible_aliases = ["fdx", "fix-dust-extra"],
-        help = "Also detect enclosed irregular dirt/curved fibers; implies --fix-dirty; default off; requires recurring shape evidence and a smooth surrounding ring"
+        help = "Also detect enclosed irregular dirt/curved fibers, stack the nearest references to find shadows a single frame hides, and refine confirmed shadows at full resolution; implies --fix-dirty; default off"
     )]
     pub fix_dirty_extra: bool,
 
@@ -213,6 +213,24 @@ pub struct Cli {
         help = "Separate dirt-reference files/directories/quoted globs, including multiple directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
     )]
     pub fix_dirty_list: Vec<PathBuf>,
+
+    #[arg(
+        long,
+        visible_alias = "fdl-save",
+        conflicts_with = "fix_dirty_load",
+        value_name = "FILE",
+        help = "Save the dirt data analyzed from the reference RAWs to FILE for --fix-dirty-load; implies --fix-dirty; inputs become optional"
+    )]
+    pub fix_dirty_save: Option<PathBuf>,
+
+    #[arg(
+        long,
+        visible_alias = "fdl-load",
+        conflicts_with = "fix_dirty_list",
+        value_name = "FILE",
+        help = "Use dirt data saved by --fix-dirty-save instead of analyzing reference RAWs; implies --fix-dirty; needs the --fix-dirty-extra setting it was saved with"
+    )]
+    pub fix_dirty_load: Option<PathBuf>,
 
     #[arg(
         long,
@@ -634,6 +652,10 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "jobs",
         "fix-dirty-list",
         "fdl",
+        "fix-dirty-save",
+        "fdl-save",
+        "fix-dirty-load",
+        "fdl-load",
         "fix-dust-strength",
         "fds",
         "noise-reduction-level",
@@ -919,13 +941,30 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
     if !cli.fix_dirty
         && !cli.fix_dirty_extra
         && cli.fix_dirty_list.is_empty()
+        && cli.fix_dirty_save.is_none()
+        && cli.fix_dirty_load.is_none()
         && cli.fix_dust_strength.is_none()
     {
         return Ok(None);
     }
+    if let Some(file) = &cli.fix_dirty_load {
+        return load_dirty(cli, inputs, threads, file).map(Some);
+    }
+    if let Some(file) = &cli.fix_dirty_save {
+        // Found out before the references are analyzed rather than after.
+        ensure!(
+            cli.overwrite || !file.exists(),
+            "refusing to overwrite {}; use --overwrite",
+            file.display()
+        );
+    }
     let separate = (!cli.fix_dirty_list.is_empty())
         .then(|| discover(&cli.fix_dirty_list))
         .transpose()?;
+    ensure!(
+        separate.is_some() || !inputs.is_empty(),
+        "--fix-dirty-save without inputs needs --fix-dirty-list"
+    );
     let references = separate.as_deref().unwrap_or(inputs);
     if separate.is_none() {
         let parent = references[0].path.parent();
@@ -950,10 +989,31 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
             paths.len()
         );
     }
+    // References arrive sorted by path, which follows capture order. Extra detection stacks
+    // those nearest to each target, so only they keep their stack data.
+    let position = |path: &Path| {
+        references
+            .partition_point(|reference| reference.path.as_path() < path)
+            .min(references.len() - 1)
+    };
+    let mut stacked = vec![false; paths.len()];
+    for input in inputs {
+        let center = position(&input.path);
+        let last = (center + dirty::STACK_REACH).min(references.len() - 1);
+        stacked[center.saturating_sub(dirty::STACK_REACH)..=last].fill(true);
+        stacked[indices[&input.path]] = true;
+    }
     let completed = AtomicUsize::new(0);
+    // Saved data serves any later target, so every reference keeps its stack data for it.
+    let saving = cli.fix_dirty_save.is_some();
     let results = process_files(paths.len(), threads, usize::from(cli.jobs), |index| {
-        let result = raw::decode(paths[index], cli.no_crop)
-            .and_then(|image| dirty::analyze_with_extra(&image, cli.fix_dirty_extra));
+        let result = raw::decode(paths[index], cli.no_crop).and_then(|image| {
+            dirty::analyze_with_stack(
+                &image,
+                cli.fix_dirty_extra,
+                cli.fix_dirty_extra && (stacked[index] || saving && index < references.len()),
+            )
+        });
         if !cli.silent {
             let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
@@ -979,11 +1039,50 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
         failures == 0,
         "sensor-dirt prepass failed for {failures} RAW(s); no output files were written"
     );
-    let calibration = dirty::Calibration::new(&evidence[..references.len()])?;
-    let plans = inputs
-        .iter()
-        .map(|input| calibration.plan(&evidence[indices[&input.path]]))
-        .collect();
+    let mut calibration = dirty::Calibration::new(&evidence[..references.len()])?;
+    if let Some(file) = &cli.fix_dirty_save {
+        let saved: Vec<&Path> = references
+            .iter()
+            .map(|reference| reference.path.as_path())
+            .collect();
+        let parent = file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".dng-monochrome-")
+            .tempfile_in(parent)
+            .with_context(|| format!("creating temporary output in {}", parent.display()))?;
+        calibration.save(
+            io::BufWriter::new(temporary.as_file_mut()),
+            cli.fix_dirty_extra,
+            &saved,
+        )?;
+        temporary.as_file().sync_all()?;
+        if cli.overwrite {
+            temporary.persist(file)
+        } else {
+            temporary.persist_noclobber(file)
+        }
+        .map_err(|error| error.error)
+        .with_context(|| format!("publishing {}", file.display()))?;
+        if !cli.silent {
+            eprintln!(
+                "Sensor-dirt data of {} reference(s) saved to {}",
+                references.len(),
+                file.display()
+            );
+        }
+        // Planning then sees what a run that does not save sees.
+        calibration.keep_stacks(|index| stacked[index]);
+        if inputs.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+    }
+    let plans = process_files(inputs.len(), threads, usize::from(cli.jobs), |index| {
+        let path = inputs[index].path.as_path();
+        calibration.plan_near(&evidence[indices[path]], Some(position(path)))
+    })?;
     if !cli.silent {
         eprintln!(
             "Sensor-dirt analysis complete for all {} RAWs; starting target processing",
@@ -991,6 +1090,99 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
         );
     }
     Ok(Some(plans))
+}
+
+// The prepass of a run that reads saved reference data: only the targets are analyzed.
+fn load_dirty(
+    cli: &Cli,
+    inputs: &[Input],
+    threads: usize,
+    file: &Path,
+) -> Result<Vec<dirty::Plan>> {
+    let saved = std::fs::File::open(file)
+        .map_err(anyhow::Error::from)
+        .and_then(|file| dirty::Saved::open(io::BufReader::new(file)))
+        .with_context(|| format!("loading sensor-dirt data from {}", file.display()))?;
+    ensure!(
+        saved.extra == cli.fix_dirty_extra,
+        "{} was saved {} --fix-dirty-extra; use the same setting or save it again",
+        file.display(),
+        if saved.extra { "with" } else { "without" }
+    );
+    ensure!(
+        !saved.references.is_empty(),
+        "{} holds no references",
+        file.display()
+    );
+    let references = saved.references.clone();
+    if !cli.silent {
+        eprintln!(
+            "Sensor-dirt prepass: {} saved reference(s) from {}; analyzing {} target RAW(s) before conversion",
+            references.len(),
+            file.display(),
+            inputs.len()
+        );
+    }
+    // As in a run that analyzes the references: they are sorted by path, and each target
+    // stacks those nearest to it.
+    let position = |path: &Path| {
+        references
+            .partition_point(|reference| reference.as_path() < path)
+            .min(references.len() - 1)
+    };
+    let mut stacked = vec![false; references.len()];
+    for input in inputs {
+        let center = position(&input.path);
+        let last = (center + dirty::STACK_REACH).min(references.len() - 1);
+        stacked[center.saturating_sub(dirty::STACK_REACH)..=last].fill(true);
+    }
+    let calibration = saved
+        .calibration(|index| stacked[index])
+        .with_context(|| format!("loading sensor-dirt data from {}", file.display()))?;
+    let completed = AtomicUsize::new(0);
+    let results = process_files(inputs.len(), threads, usize::from(cli.jobs), |index| {
+        let path = inputs[index].path.as_path();
+        let result = raw::decode(path, cli.no_crop).and_then(|image| {
+            dirty::analyze_with_stack(&image, cli.fix_dirty_extra, cli.fix_dirty_extra)
+        });
+        if !cli.silent {
+            let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "  dirt analysis [{count}/{}] {}",
+                inputs.len(),
+                path.display()
+            );
+        }
+        result
+    })?;
+    let mut evidence = Vec::with_capacity(results.len());
+    let mut failures = 0;
+    for (input, result) in inputs.iter().zip(results) {
+        match result {
+            Ok(frame) => evidence.push(frame),
+            Err(error) => {
+                failures += 1;
+                eprintln!(
+                    "ERROR sensor-dirt analysis {}: {error:#}",
+                    input.path.display()
+                );
+            }
+        }
+    }
+    ensure!(
+        failures == 0,
+        "sensor-dirt prepass failed for {failures} RAW(s); no output files were written"
+    );
+    let plans = process_files(inputs.len(), threads, usize::from(cli.jobs), |index| {
+        calibration.plan_near(&evidence[index], Some(position(&inputs[index].path)))
+    })?;
+    if !cli.silent {
+        eprintln!(
+            "Sensor-dirt analysis complete for all {} target RAW(s); starting target processing",
+            inputs.len()
+        );
+    }
+    Ok(plans)
 }
 
 fn dirty_progress(report: &dirty::Report, path: &Path) {
@@ -1038,6 +1230,19 @@ pub fn run(cli: Cli) -> Result<()> {
         .as_deref()
         .map(|source| Expression::parse_with_parameters(source, &cli.parameters))
         .transpose()?;
+    let threads = if cli.threads == 0 {
+        std::thread::available_parallelism()
+            .context("detecting available CPU threads; alternatively set --threads")?
+            .get()
+    } else {
+        usize::from(cli.threads)
+    };
+    if cli.inputs.is_empty() {
+        // Only --fix-dirty-save admits a run without inputs: its references are analyzed
+        // and saved, and nothing is converted.
+        prepare_dirty(&cli, &[], threads)?;
+        return Ok(());
+    }
     let inputs = discover(&cli.inputs)?;
     let transfers = cli.transfers();
     let modes = if cli.both {
@@ -1062,13 +1267,6 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
     }
-    let threads = if cli.threads == 0 {
-        std::thread::available_parallelism()
-            .context("detecting available CPU threads; alternatively set --threads")?
-            .get()
-    } else {
-        usize::from(cli.threads)
-    };
     let jobs = usize::from(cli.jobs).min(threads).min(inputs.len());
     let dirty_plans = prepare_dirty(&cli, &inputs, threads)?;
     let results = process_files(

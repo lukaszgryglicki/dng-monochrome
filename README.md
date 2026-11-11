@@ -391,6 +391,8 @@ Color reports and analysis JSON contain separate channel metadata/DR results.
 dng-monochrome /path/to/one/DNG-directory -fd -o cleaned --report
 dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory /path/to/older-ARWs -o cleaned
 dng-monochrome /path/to/one/DNG-directory -fds 1.25 -o stronger --report
+dng-monochrome -c -fdx -fdl '/path/to/photos/*/*/*.ARW' -fdl-save sony.fdl
+dng-monochrome shot.ARW -c -fdx -fdl-load sony.fdl -o cleaned
 ```
 
 `--fix-dirty` (`-fd`) first decodes and analyzes **every** reference and target
@@ -401,12 +403,60 @@ discovery; it implies `--fix-dirty` and can be repeated. Put target inputs befor
 this variadic option. Overlapping inputs are analyzed once; reference-only files
 produce no outputs and target-only files do not contribute detection votes.
 
+`--fix-dirty-save FILE` (`-fdl-save`) writes what the reference analysis found to
+FILE, and `--fix-dirty-load FILE` (`-fdl-load`) uses such a file in place of the
+reference RAWs, so that only the targets are analyzed: the same references then
+serve many runs. Both imply `--fix-dirty`. A run that saves may convert inputs as
+usual or have none at all; it refuses to replace an existing FILE without
+`--overwrite`. A run that loads writes exactly what the run analyzing the same
+references would write, and takes no `-fdl`. The file holds the confirmed spots,
+the reference paths in their sorted order (a target still stacks the references
+next to its own path) and, with `-fdx`, about 4 MB of residual map per reference,
+of which a run reads only those within 128 files of a target. It is bound to the
+`-fdx` setting it was saved with and to this version's analysis; save it again
+after adding references or updating the program.
+
 `--fix-dirty-extra` (`-fdx`, also `--fix-dust-extra`) additionally detects enclosed
 irregular shadows such as curved fibers, in both mono and color modes. It implies
 `--fix-dirty`; ordinary `-fd` remains unchanged. Extra shapes need independent
 recurrence and a smooth surrounding ring. Overlapping extra estimates do not
 multiply corrections already supplied by compact spots. Extra correction is
-also limited by local shape agreement in three independent reference views.
+also limited by local shape agreement in three independent reference views,
+except for the stopped-down shapes of compact spots described below.
+
+Extra mode also stacks, for every target, the high-passed analysis previews of
+up to 24 nearest distinct reference views in path order, and the closest 12 on
+their own so that a long reference list cannot dilute a short session. Views
+whose shadows are as deep as the target's are preferred (an aperture proxy
+needing no metadata). A stacked shadow counts only when it is small, isolated on
+an otherwise flat stack and seen by at least three views with plain, unrelated
+surroundings; a faint speck needs six. Broad soft shadows stay with the fitted
+correction above. Where the target is evenly smooth around it, the target
+measures its own shadow and the stack merely locates it, so dust too faint or
+too irregular for a single-frame fit is still repaired. Over uneven but smooth
+surroundings such as cloud bands, the stacked shape is scaled to the target
+instead, and left out when it is hardly deeper than that unevenness. In textured
+surroundings only a compact shadow from an aperture-matched stack is applied,
+and only if the target shows it at a similar depth. Dark scene structure running
+through a shadow, such as a wire, leaves that shadow uncorrected rather than
+erased.
+
+The same dirt is small, dark and sharp stopped down and broad and soft wide
+open, so a target may show a confirmed spot in a shape that its references never
+saw. Extra mode therefore also accepts a target's enclosed shape on a spot
+confirmed only as a compact shadow when the shape balances on that spot, stays
+within its reach and takes at most three times its light. Where a target
+proposes nothing at a confirmed spot, the target is measured there directly: a
+shadow is repaired only if it is significant and isolated on plain surroundings.
+
+Every shadow confirmed in extra mode is finally refined on the developed
+samples themselves, once for all Bayer planes: the error shared along each
+contour of the shadow and significant local detail inside it are removed. This
+is what clears the dark core and the bright ring that an analysis-resolution
+gain leaves on sharp dust and fibers, and it may darken diffraction fringes by
+up to 22%; ordinary `-fd` only ever brightens. Until planning ends, the prepass
+keeps a residual map of about 4 MB for each target and for each reference within
+128 files of a target in path order; references further away only vote.
 
 `--fix-dust-strength` (`-fix-dust-strength`, `-fds`) accepts a finite value from
 0 to 2 and implies `--fix-dirty`. The default is 1, preserving the normal
@@ -439,7 +489,8 @@ gain field, including optional channel files. Final RGB color-factor modes are
 unchanged. Without these flags, the existing pipeline is unchanged.
 
 `--report`, `--verbose` and `--analyze` include `dirty_correction`: reference/view
-counts, accepted sensor positions, strength, gains, changed/clipped samples and warnings.
+counts, accepted sensor positions, strength, gains, changed/clipped samples and warnings;
+`stacked_regions` counts the shadows that only extra-mode stacking supplied.
 Insufficient or ambiguous evidence means unchanged pixels, not guessed repairs.
 This is an estimate, not flat-field calibration or a healing brush: opaque dirt,
 shadows hidden by texture and edge-truncated spots may remain, and recurring
@@ -497,8 +548,10 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--max-color`, `-mc` | Make final RGB more vivid at gamut-safe level 1; default off; requires `--color`; before channel selection, companions unchanged |
 | `--max-color-level N`, `-mcl N` | Vivid-color level 0..2; implies `--max-color`; 0 is unchanged, >1 exaggerates channel separation; conflicts with `--analyze` |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
-| `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers; opt-in; implies `--fix-dirty`; mono and color |
+| `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers, stack nearby references and refine confirmed shadows at full resolution; opt-in; implies `--fix-dirty`; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
+| `--fix-dirty-save FILE`, `-fdl-save FILE` | Save the analyzed reference data for later runs; implies `--fix-dirty`; inputs optional; needs `--overwrite` to replace FILE |
+| `--fix-dirty-load FILE`, `-fdl-load FILE` | Use saved reference data instead of analyzing references; implies `--fix-dirty`; same `-fdx` setting as when saved; conflicts with `-fdl` and `-fdl-save` |
 | `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |
 | `--noise-reduction`, `-nr` | Enable measured-noise, edge-preserving RAW denoising at level 1; default off; mono and color |
 | `--noise-reduction-level N`, `-nrl N` | Denoising level 0..2; implies `--noise-reduction`; 0 is unchanged, >1 can soften more detail |

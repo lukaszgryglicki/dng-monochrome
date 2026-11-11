@@ -69,6 +69,36 @@ fn curved_scene(index: usize, center: Option<(f64, f64)>) -> Dng {
     image
 }
 
+// A clean scene attenuated by `shadow(x, y)`, the log gain at each sample center.
+fn shaded(index: usize, shadow: impl Fn(f64, f64) -> f64) -> Dng {
+    let mut image = scene(index, false);
+    let black = f64::from(image.black);
+    let width = image.width as usize;
+    for (i, pixel) in image.pixels.iter_mut().enumerate() {
+        let gain = shadow((i % width) as f64 + 0.5, (i / width) as f64 + 0.5).exp();
+        *pixel = (black + (f64::from(*pixel) - black) * gain).round() as u16;
+    }
+    image
+}
+
+// Largest relative error against `clean` within `radius` of a point.
+fn worst_error(image: &[u16], clean: &Dng, center: (f64, f64), radius: f64) -> f64 {
+    let black = f64::from(clean.black);
+    let width = clean.width as usize;
+    image
+        .iter()
+        .zip(&clean.pixels)
+        .enumerate()
+        .filter(|(i, _)| {
+            ((i % width) as f64 + 0.5 - center.0).hypot((i / width) as f64 + 0.5 - center.1)
+                <= radius
+        })
+        .map(|(_, (&value, &clean))| {
+            ((f64::from(value) - black) / (f64::from(clean) - black) - 1.0).abs()
+        })
+        .fold(0.0, f64::max)
+}
+
 fn decode(root: &Path, name: &str, image: &Dng) -> MonoImage {
     let path = root.join(name);
     image.write(&path);
@@ -193,7 +223,8 @@ fn curved_recurring_shadows_are_repaired_in_mono_and_bayer_planes() {
                 before += u64::from(original.abs_diff(clean));
                 after += u64::from(corrected.abs_diff(clean));
             }
-            assert!(corrected >= original);
+            // Full-resolution refinement may only trim its own overshoot.
+            assert!(f64::from(corrected) >= f64::from(original) * 0.995);
             changed += usize::from(original != corrected);
         }
         assert!(before > 5_000);
@@ -441,24 +472,31 @@ fn extra_correction_preserves_one_view_details_joined_to_recurring_dirt() {
 #[test]
 fn unconfirmed_extra_shapes_neither_hide_compact_dirt_nor_borrow_its_confirmation() {
     let dir = tempfile::tempdir().unwrap();
+    let build = |index: usize, dust: bool| {
+        let mut source = scene(index, dust);
+        if index == 0 {
+            let clean = scene(index, false);
+            let curved = curved_scene(index, Some((215.5, 160.5)));
+            let black = f64::from(source.black);
+            for ((pixel, &curved), &clean) in source
+                .pixels
+                .iter_mut()
+                .zip(&curved.pixels)
+                .zip(&clean.pixels)
+            {
+                let gain = ((f64::from(curved) - black) / (f64::from(clean) - black)).powf(0.4);
+                *pixel = (black + (f64::from(*pixel) - black) * gain).round() as u16;
+            }
+        }
+        source
+    };
     let images: Vec<_> = (0..3)
         .map(|index| {
-            let mut source = scene(index, true);
-            if index == 0 {
-                let clean = scene(index, false);
-                let curved = curved_scene(index, Some((215.5, 160.5)));
-                let black = f64::from(source.black);
-                for ((pixel, &curved), &clean) in source
-                    .pixels
-                    .iter_mut()
-                    .zip(&curved.pixels)
-                    .zip(&clean.pixels)
-                {
-                    let gain = ((f64::from(curved) - black) / (f64::from(clean) - black)).powf(0.4);
-                    *pixel = (black + (f64::from(*pixel) - black) * gain).round() as u16;
-                }
-            }
-            decode(dir.path(), &format!("nearby{index}.DNG"), &source)
+            decode(
+                dir.path(),
+                &format!("nearby{index}.DNG"),
+                &build(index, true),
+            )
         })
         .collect();
     let ordinary: Vec<_> = images
@@ -482,11 +520,453 @@ fn unconfirmed_extra_shapes_neither_hide_compact_dirt_nor_borrow_its_confirmatio
         let mut actual = raw::decode(&input, false).unwrap();
         let extra_report = extra_calibration.plan(extra).apply(&mut actual).unwrap();
         assert_eq!(extra_report.spots.len(), 2, "{extra_report:?}");
+        // Extra mode only refines the confirmed compact shadows at full resolution: beyond
+        // them nothing may differ, and at them the repair may not get worse.
+        let clean = decode(
+            dir.path(),
+            &format!("clean{index}.DNG"),
+            &build(index, false),
+        );
+        let (mut plain, mut refined) = (0u64, 0u64);
+        for (i, (&actual, &expected)) in actual.pixels.iter().zip(&expected.pixels).enumerate() {
+            let (x, y) = ((i % 640) as f64, (i / 640) as f64);
+            let distance = CENTERS
+                .iter()
+                .map(|&(cx, cy)| (x - cx).hypot(y - cy))
+                .fold(f64::INFINITY, f64::min);
+            if distance > 65.0 {
+                assert_eq!(
+                    actual, expected,
+                    "extra mode changed sample {i} away from confirmed dirt in frame {index}: {extra_report:?}"
+                );
+            } else if distance <= 8.0 {
+                plain += u64::from(expected.abs_diff(clean.pixels[i]));
+                refined += u64::from(actual.abs_diff(clean.pixels[i]));
+            }
+        }
         assert!(
-            actual.pixels == expected.pixels,
-            "extra mode changed unconfirmed shape or lost compact correction in frame {index}: {extra_report:?}"
+            refined <= plain,
+            "extra mode lost compact correction in frame {index}: {refined} vs {plain}; {extra_report:?}"
         );
     }
+}
+
+#[test]
+fn extra_refinement_clears_the_core_and_bright_fringe_of_sharp_dust() {
+    let dir = tempfile::tempdir().unwrap();
+    // Stopped-down dust: a hard-edged shadow inside a bright diffraction fringe, which an
+    // analysis-resolution, brightening-only gain cannot follow.
+    let center = (300.5, 200.5);
+    let sharp = |x: f64, y: f64| {
+        let radius = (x - center.0).hypot(y - center.1);
+        -0.3 * ((7.5 - radius) / 1.5).clamp(0.0, 1.0)
+            + 0.06 * (1.0 - (radius - 9.5).abs() / 1.5).clamp(0.0, 1.0)
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("sharp{index}.DNG"),
+                &shaded(index, sharp),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let clean = scene(0, false);
+    let original = shaded(0, sharp);
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert!(report.warning.is_none(), "{report:?}");
+    let before = worst_error(&original.pixels, &clean, center, 16.0);
+    let after = worst_error(&image.pixels, &clean, center, 16.0);
+    assert!(
+        before > 0.25 && after < 0.35 * before,
+        "{after} of {before}; {report:?}"
+    );
+    // The core is flat again and the fringe, which only darkening can remove, is halved.
+    assert!(
+        worst_error(&image.pixels, &clean, center, 4.0) < 0.01,
+        "{report:?}"
+    );
+    let width = clean.width as usize;
+    for (i, (&value, &clean)) in image.pixels.iter().zip(&clean.pixels).enumerate() {
+        let radius =
+            ((i % width) as f64 + 0.5 - center.0).hypot((i / width) as f64 + 0.5 - center.1);
+        if (8.5..=10.5).contains(&radius) {
+            let error = (f64::from(value) - 1023.0) / (f64::from(clean) - 1023.0) - 1.0;
+            assert!(
+                error < 0.035,
+                "bright fringe {error} left at radius {radius}; {report:?}"
+            );
+        } else if radius > 40.0 {
+            assert_eq!(
+                value, original.pixels[i],
+                "sample {i} changed away from the dust"
+            );
+        }
+    }
+}
+
+#[test]
+fn extra_repairs_the_sharp_shape_of_dirt_confirmed_only_as_a_soft_disc() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // Wide open a fibre is a soft disc; stopped down it is a dark L of its own shape.
+    let soft = |x: f64, y: f64| {
+        -0.07 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 144.0).exp()
+    };
+    let bar = |along: f64, across: f64| {
+        ((17.0 - along.abs()) / 2.0).clamp(0.0, 1.0) * ((4.5 - across.abs()) / 2.0).clamp(0.0, 1.0)
+    };
+    let sharp = |x: f64, y: f64| {
+        // Two legs balanced on the center of the soft disc.
+        let (dx, dy) = (x - center.0 - 2.5, y - center.1 + 4.5);
+        -0.2 * bar(dy + 3.0, dx + 10.0).max(bar(dx - 5.0, dy - 12.0))
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("soft{index}.DNG"),
+                &shaded(index, soft),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let clean = scene(0, false);
+    let original = shaded(0, sharp);
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(report.spots.len(), 1, "{report:?}");
+    let width = clean.width as usize;
+    let (mut before, mut after) = (0.0, 0.0);
+    for (i, ((&value, &original), &clean)) in image
+        .pixels
+        .iter()
+        .zip(&original.pixels)
+        .zip(&clean.pixels)
+        .enumerate()
+    {
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        let error = |value: u16| (f64::from(value) - 1023.0) / (f64::from(clean) - 1023.0) - 1.0;
+        if sharp(x, y) < -0.01 {
+            before += error(original).abs();
+            after += error(value).abs();
+        } else {
+            // What lies beside the legs is not dirt.
+            assert!(
+                error(value) < 0.1,
+                "clean sample brightened by {} at {x},{y}; {report:?}",
+                error(value)
+            );
+            assert!(
+                (x - center.0).hypot(y - center.1) <= 60.0 || value == original,
+                "sample {i} changed away from the dirt"
+            );
+        }
+    }
+    assert!(
+        before > 50.0 && after < 0.15 * before,
+        "{after} of {before}; {report:?}"
+    );
+    // The same shape away from every confirmed spot stays what it is: scenery.
+    let moved = |x: f64, y: f64| sharp(x - 60.0, y + 30.0);
+    let original = shaded(0, moved);
+    let mut image = decode(dir.path(), "moved.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert!(image.pixels == original.pixels, "{report:?}");
+}
+
+#[test]
+fn extra_measures_confirmed_dirt_too_faint_for_the_target_to_propose() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    let dust = |depth: f64| {
+        move |x: f64, y: f64| {
+            -depth * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 64.0).exp()
+        }
+    };
+    let analyze = |extra: bool| -> Vec<_> {
+        (0..4)
+            .map(|index| {
+                let image = decode(
+                    dir.path(),
+                    &format!("deep{index}.DNG"),
+                    &shaded(index, dust(0.08)),
+                );
+                dirty::analyze_with_extra(&image, extra).unwrap()
+            })
+            .collect()
+    };
+    let clean = scene(0, false);
+    let width = clean.width as usize;
+    // Stopped up, the target's own shadow is below what a single frame may propose.
+    let original = shaded(0, dust(0.011));
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let plain = Calibration::new(&analyze(false)).unwrap();
+    let report = plain
+        .plan(&dirty::analyze(&image).unwrap())
+        .apply(&mut image)
+        .unwrap();
+    assert_eq!(report.confirmed_sensor_spots, 1, "{report:?}");
+    assert_eq!(image.pixels, original.pixels);
+    let extra = Calibration::new(&analyze(true)).unwrap();
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = extra.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(report.spots.len(), 1, "{report:?}");
+    let before = worst_error(&original.pixels, &clean, center, 30.0);
+    let after = worst_error(&image.pixels, &clean, center, 30.0);
+    assert!(
+        before > 0.01 && after < 0.3 * before,
+        "{after} of {before}; {report:?}"
+    );
+    for (i, (&value, &original)) in image.pixels.iter().zip(&original.pixels).enumerate() {
+        let radius =
+            ((i % width) as f64 + 0.5 - center.0).hypot((i / width) as f64 + 0.5 - center.1);
+        assert!(
+            radius <= 48.0 || value == original,
+            "sample {i} changed away from the dirt"
+        );
+    }
+    // Scenery at the confirmed spot is not measured as dirt: a wire through it, a dark
+    // object over it, or nothing at all.
+    let wire = |x: f64, y: f64| {
+        -0.06 * (-0.5 * ((y - center.1 - 0.2 * (x - center.0)) / 1.2).powi(2)).exp()
+    };
+    let wired = shaded(0, wire);
+    let mut image = decode(
+        dir.path(),
+        "wired.DNG",
+        &shaded(0, |x, y| dust(0.011)(x, y) + wire(x, y)),
+    );
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = extra.plan(&target).apply(&mut image).unwrap();
+    for (i, (&value, &wired)) in image.pixels.iter().zip(&wired.pixels).enumerate() {
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        if wire(x, y) < -0.03 {
+            let ratio = (f64::from(value) - 1023.0) / (f64::from(wired) - 1023.0);
+            assert!(
+                ratio < 1.005,
+                "wire brightened x{ratio} at {x},{y}; {report:?}"
+            );
+        }
+    }
+    let object = |x: f64, y: f64| {
+        -0.3 * ((26.0 - (x - center.0 - 12.0).hypot(y - center.1 + 6.0)) / 2.0).clamp(0.0, 1.0)
+    };
+    for (name, source) in [
+        ("object.DNG", shaded(0, object)),
+        ("clean.DNG", scene(1, false)),
+    ] {
+        let mut image = decode(dir.path(), name, &source);
+        let target = dirty::analyze_with_extra(&image, true).unwrap();
+        let report = extra.plan(&target).apply(&mut image).unwrap();
+        assert!(image.pixels == source.pixels, "{name}: {report:?}");
+    }
+}
+
+#[test]
+fn stacking_repairs_dust_too_faint_for_any_single_frame_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    let faint = |x: f64, y: f64| {
+        -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+    };
+    let analyze = |extra: bool| -> Vec<_> {
+        (0..4)
+            .map(|index| {
+                let image = decode(
+                    dir.path(),
+                    &format!("faint{index}.DNG"),
+                    &shaded(index, faint),
+                );
+                dirty::analyze_with_extra(&image, extra).unwrap()
+            })
+            .collect()
+    };
+    let clean = scene(0, false);
+    let original = shaded(0, faint);
+    // No single frame yields a confirmed fit, so ordinary correction leaves it alone.
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let plain = Calibration::new(&analyze(false)).unwrap();
+    let report = plain
+        .plan(&dirty::analyze(&image).unwrap())
+        .apply(&mut image)
+        .unwrap();
+    assert_eq!(report.confirmed_sensor_spots, 0, "{report:?}");
+    assert_eq!(image.pixels, original.pixels);
+    // The stack of the other views finds it and the target measures it.
+    let extra = Calibration::new(&analyze(true)).unwrap();
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = extra.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(report.confirmed_sensor_spots, 0, "{report:?}");
+    assert_eq!(
+        (report.stacked_regions, report.spots.len()),
+        (1, 1),
+        "{report:?}"
+    );
+    assert!(report.warning.is_none());
+    let before = worst_error(&original.pixels, &clean, center, 12.0);
+    let after = worst_error(&image.pixels, &clean, center, 12.0);
+    assert!(
+        before > 0.01 && after < 0.2 * before,
+        "{after} of {before}; {report:?}"
+    );
+    let width = clean.width as usize;
+    for (i, (&value, &original)) in image.pixels.iter().zip(&original.pixels).enumerate() {
+        let radius =
+            ((i % width) as f64 + 0.5 - center.0).hypot((i / width) as f64 + 0.5 - center.1);
+        assert!(
+            radius <= 40.0 || value == original,
+            "sample {i} changed away from the dust"
+        );
+    }
+    // A clean target of another view has nothing to confirm and stays untouched.
+    let mut other = decode(dir.path(), "clean.DNG", &scene(1, false));
+    let untouched = other.pixels.clone();
+    let target = dirty::analyze_with_extra(&other, true).unwrap();
+    let report = extra.plan(&target).apply(&mut other).unwrap();
+    assert_eq!(
+        (report.stacked_regions, &other.pixels),
+        (0, &untouched),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn scenery_running_through_stacked_dust_is_not_erased() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // Dust only the stack can find, so nothing but the stack decides here.
+    let dust = |x: f64, y: f64| {
+        -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+    };
+    // A thin dark wire through the middle of the dust, only in the target's scene.
+    let wire = |x: f64, y: f64| {
+        -0.06 * (-0.5 * ((y - center.1 - 0.2 * (x - center.0)) / 1.2).powi(2)).exp()
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("dust{index}.DNG"),
+                &shaded(index, dust),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let wired = shaded(0, wire);
+    let mut image = decode(
+        dir.path(),
+        "target.DNG",
+        &shaded(0, |x, y| dust(x, y) + wire(x, y)),
+    );
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    let width = wired.width as usize;
+    for (i, (&value, &wired)) in image.pixels.iter().zip(&wired.pixels).enumerate() {
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        // On the wire, even inside the dust, at most the dust itself may be taken back.
+        if wire(x, y) < -0.03 {
+            let ratio = (f64::from(value) - 1023.0) / (f64::from(wired) - 1023.0);
+            assert!(
+                ratio < 1.005,
+                "wire brightened x{ratio} at {x},{y}; {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stacked_dust_among_cloud_bands_is_scaled_from_the_stack_or_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    let bands = |amount: f64| move |_: f64, y: f64| amount * (y / 9.0).sin();
+    for (depth, amount) in [(0.011, 0.004), (0.08, 0.02)] {
+        let dust = move |x: f64, y: f64| {
+            -depth * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+        };
+        let evidence: Vec<_> = (0..4)
+            .map(|index| {
+                let image = decode(
+                    dir.path(),
+                    &format!("band{index}.DNG"),
+                    &shaded(index, dust),
+                );
+                dirty::analyze_with_extra(&image, true).unwrap()
+            })
+            .collect();
+        let calibration = Calibration::new(&evidence).unwrap();
+        // Only the target's sky is banded.
+        let banded = shaded(0, bands(amount));
+        let original = shaded(0, |x, y| dust(x, y) + bands(amount)(x, y));
+        let mut image = decode(dir.path(), "target.DNG", &original);
+        let target = dirty::analyze_with_extra(&image, true).unwrap();
+        let report = calibration.plan(&target).apply(&mut image).unwrap();
+        if depth < 4.0 * amount {
+            // Hardly deeper than the bands: any correction would follow them instead.
+            assert!(
+                image.pixels == original.pixels,
+                "banded sky changed: {report:?}"
+            );
+        } else {
+            // Clearly deeper: the stack's shape removes the dust and the bands remain.
+            let before = worst_error(&original.pixels, &banded, center, 16.0);
+            let after = worst_error(&image.pixels, &banded, center, 16.0);
+            assert!(
+                before > 0.07 && after < 0.25 * before,
+                "{after} of {before}; {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn extra_refinement_treats_a_color_mosaic_developed_as_monochrome_evenly() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (300.5, 200.5);
+    let dust = |x: f64, y: f64| {
+        let radius = (x - center.0).hypot(y - center.1);
+        -0.3 * ((7.5 - radius) / 1.5).clamp(0.0, 1.0)
+    };
+    // Four very different site responses, as a Bayer mosaic of a tinted scene has.
+    let mosaic = |index: usize, dust: &dyn Fn(f64, f64) -> f64| {
+        let site = |x: f64, y: f64| [0.0, -0.7, -0.5, -1.4][(y as usize % 2) * 2 + x as usize % 2];
+        shaded(index, |x, y| dust(x, y) + site(x, y))
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("mosaic{index}.DNG"),
+                &mosaic(index, &dust),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let clean = mosaic(0, &|_, _| 0.0);
+    let original = mosaic(0, &dust);
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert!(report.warning.is_none(), "{report:?}");
+    let before = worst_error(&original.pixels, &clean, center, 16.0);
+    let after = worst_error(&image.pixels, &clean, center, 16.0);
+    assert!(
+        before > 0.25 && after < 0.4 * before,
+        "{after} of {before}; {report:?}"
+    );
+    assert!(
+        worst_error(&image.pixels, &clean, center, 4.0) < 0.02,
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -1048,7 +1528,7 @@ fn analysis_and_application_are_deterministic_across_thread_counts() {
     let images: Vec<_> = (0..4)
         .map(|i| decode(dir.path(), &format!("{i}.DNG"), &scene(i, true)))
         .collect();
-    let run = |threads| {
+    let run = |threads, extra| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -1056,7 +1536,7 @@ fn analysis_and_application_are_deterministic_across_thread_counts() {
             .install(|| {
                 let evidence: Vec<_> = images
                     .iter()
-                    .map(|image| dirty::analyze(image).unwrap())
+                    .map(|image| dirty::analyze_with_extra(image, extra).unwrap())
                     .collect();
                 let plan = Calibration::new(&evidence).unwrap().plan(&evidence[0]);
                 let mut target = decode(dir.path(), "target.DNG", &scene(0, true));
@@ -1064,7 +1544,9 @@ fn analysis_and_application_are_deterministic_across_thread_counts() {
                 (target.pixels, serde_json::to_value(report).unwrap())
             })
     };
-    assert_eq!(run(1), run(2));
+    for extra in [false, true] {
+        assert_eq!(run(1, extra), run(2, extra), "extra {extra}");
+    }
 }
 
 #[test]
@@ -1116,6 +1598,36 @@ fn cli_aliases_and_separate_reference_lists_parse_without_changing_other_flags()
         );
         assert!(parse(&[flag]).is_err());
     }
+    for (save, load) in [
+        ("-fdl-save", "-fdl-load"),
+        ("--fdl-save", "--fdl-load"),
+        ("-fix-dirty-save", "-fix-dirty-load"),
+        ("--fix-dirty-save", "--fix-dirty-load"),
+    ] {
+        let cli = parse(&[save, "dirt.fdl", "-fdl", "ref1.DNG", "-c"]).unwrap();
+        assert_eq!(cli.fix_dirty_save.as_deref(), Some(Path::new("dirt.fdl")));
+        assert_eq!(cli.fix_dirty_list, [PathBuf::from("ref1.DNG")]);
+        assert!(cli.color && cli.fix_dirty_load.is_none());
+        let cli = parse(&[load, "dirt.fdl", "-fdx"]).unwrap();
+        assert_eq!(cli.fix_dirty_load.as_deref(), Some(Path::new("dirt.fdl")));
+        assert!(cli.fix_dirty_extra && cli.fix_dirty_save.is_none());
+        assert_eq!(cli.inputs, [PathBuf::from("target.ARW")]);
+        assert!(parse(&[load, "dirt.fdl", "-fdl", "ref1.DNG"]).is_err());
+        assert!(parse(&[load, "dirt.fdl", save, "other.fdl"]).is_err());
+        assert!(parse(&[save]).is_err() && parse(&[load]).is_err());
+    }
+    // Only saving admits a run without inputs.
+    let bare = |arguments: &[&str]| {
+        Cli::try_parse_compat(
+            std::iter::once("dng-monochrome")
+                .chain(arguments.iter().copied())
+                .map(OsString::from),
+        )
+    };
+    let cli = bare(&["-fdl", "ref1.DNG", "-fdl-save", "dirt.fdl"]).unwrap();
+    assert!(cli.inputs.is_empty());
+    assert!(bare(&["-fdl", "ref1.DNG"]).is_err());
+    assert!(bare(&["-fdl-load", "dirt.fdl"]).is_err());
     assert!(parse(&["--fix-dirty=true"]).is_err());
     assert!(parse(&["--fix-dirty-extra=true"]).is_err());
     assert!(parse(&["-func", "-fd"]).unwrap().function.as_deref() == Some("-fd"));
@@ -1197,6 +1709,265 @@ fn strength_aliases_accept_finite_fractional_values_and_reject_invalid_values() 
     let positional = parse(&["--", "-fds"]).unwrap();
     assert!(positional.fix_dust_strength.is_none());
     assert_eq!(positional.inputs.last().unwrap(), &PathBuf::from("-fds"));
+}
+
+#[test]
+fn extra_stacking_uses_the_references_nearest_to_a_separate_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // Fifteen distinct views; only the newer half of the references carries a shadow too
+    // faint for any single-frame fit, as dust that settled between two sessions.
+    let view = |k: usize, dusty: bool| {
+        let (sin, cos) = (k as f64 * 0.41).sin_cos();
+        shaded(5, move |x, y| {
+            let shadow = if dusty {
+                -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+            } else {
+                0.0
+            };
+            cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow
+        })
+    };
+    let references: Vec<_> = (0..14)
+        .map(|k| {
+            let path = dir.path().join(format!("ref{k:02}.DNG"));
+            view(k, k >= 7).write(&path);
+            path
+        })
+        .collect();
+    // The target sorts after every reference, so its neighbors are the newer frames.
+    let target = dir.path().join("target.DNG");
+    view(14, true).write(&target);
+    let output = dir.path().join("output");
+    success(
+        command(&target, &output)
+            .args(["-fdx", "--report", "-fdl"])
+            .args(&references)
+            .output()
+            .unwrap(),
+    );
+    let report = json(&output.join("target.json"));
+    let dirty = &report["dirty_correction"];
+    assert_eq!(dirty["reference_images"], 14);
+    assert_eq!(dirty["stacked_regions"], 1, "{dirty}");
+    assert!(dirty["changed_samples"].as_u64().unwrap() > 0, "{dirty}");
+}
+
+#[test]
+fn saved_reference_data_reproduces_the_run_that_analyzed_the_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // As above: dust that only stacking finds, in the newer half of fourteen views.
+    let view = |k: usize, dusty: bool| {
+        let (sin, cos) = (k as f64 * 0.41).sin_cos();
+        shaded(5, move |x, y| {
+            let shadow = if dusty {
+                -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+            } else {
+                0.0
+            };
+            cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow
+        })
+    };
+    let references: Vec<_> = (0..14)
+        .map(|k| {
+            let path = dir.path().join(format!("ref{k:02}.DNG"));
+            view(k, k >= 7).write(&path);
+            path
+        })
+        .collect();
+    let target = dir.path().join("target.DNG");
+    view(14, true).write(&target);
+    let saved = dir.path().join("dirt.fdl");
+    let run = |name: &str, arguments: &[&std::ffi::OsStr]| {
+        let output = dir.path().join(name);
+        let result = success(
+            command(&target, &output)
+                .args(["-fdx", "--report"])
+                .args(arguments)
+                .output()
+                .unwrap(),
+        );
+        (
+            fs::read(output.join("target.png")).unwrap(),
+            json(&output.join("target.json"))["dirty_correction"].clone(),
+            String::from_utf8(result.stderr).unwrap(),
+        )
+    };
+    let list: Vec<&std::ffi::OsStr> = std::iter::once("-fdl".as_ref())
+        .chain(references.iter().map(|path| path.as_os_str()))
+        .collect();
+    let (expected, report, _) = run("analyzed", &list);
+    assert_eq!(report["stacked_regions"], 1, "{report}");
+    // Saving changes nothing in the run that saves.
+    let saving: Vec<&std::ffi::OsStr> = list
+        .iter()
+        .copied()
+        .chain(["-fdl-save".as_ref(), saved.as_os_str()])
+        .collect();
+    let (pixels, saving_report, text) = run("saving", &saving);
+    assert!(text.contains("data of 14 reference(s) saved to"), "{text}");
+    assert!(pixels == expected && saving_report == report);
+    // Loading analyzes the target alone and still writes the same bytes.
+    let (pixels, loaded_report, text) = run("loaded", &["-fdl-load".as_ref(), saved.as_os_str()]);
+    assert!(text.contains("14 saved reference(s)"), "{text}");
+    assert!(
+        text.contains("dirt analysis [1/1]") && !text.contains("ref00.DNG"),
+        "{text}"
+    );
+    assert!(pixels == expected, "loaded data changed the output");
+    assert_eq!(loaded_report, report);
+    // References alone can be saved, to the same bytes, without converting anything.
+    let alone = dir.path().join("alone.fdl");
+    let save_alone = || {
+        Command::new(BIN)
+            .args(["--threads", "2", "--jobs", "1", "-fdx", "--fix-dirty-save"])
+            .arg(&alone)
+            .args(&list)
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+    };
+    success(save_alone());
+    assert!(fs::read(&alone).unwrap() == fs::read(&saved).unwrap());
+    assert!(!dir.path().join("dng-mono").exists());
+    let refused = save_alone();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("refusing to overwrite"));
+    // Saved data is for the detection mode it was made in, and damage is noticed.
+    let fails = |name: &str, arguments: &[&std::ffi::OsStr], message: &str| {
+        let result = command(&target, &dir.path().join(name))
+            .args(arguments)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&result.stderr).into_owned();
+        assert!(!result.status.success() && text.contains(message), "{text}");
+        assert!(!dir.path().join(name).exists(), "{name} wrote outputs");
+    };
+    fails(
+        "plain",
+        &["-fd".as_ref(), "--fdl-load".as_ref(), saved.as_os_str()],
+        "was saved with --fix-dirty-extra",
+    );
+    let bytes = fs::read(&saved).unwrap();
+    let damaged = dir.path().join("damaged.fdl");
+    let load: [&std::ffi::OsStr; 3] = ["-fdx".as_ref(), "-fdl-load".as_ref(), damaged.as_os_str()];
+    fs::write(&damaged, &bytes[..bytes.len() - 9]).unwrap();
+    fails("truncated", &load, "ends early");
+    let mut flipped = bytes.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    fs::write(&damaged, &flipped).unwrap();
+    fails("flipped", &load, "is damaged");
+    let mut renamed = bytes.clone();
+    renamed[40] ^= 1;
+    fs::write(&damaged, &renamed).unwrap();
+    fails("renamed", &load, "is damaged");
+    fs::write(&damaged, b"not dirt data at all").unwrap();
+    fails("foreign", &load, "not sensor-dirt data");
+}
+
+#[test]
+fn saved_reference_data_serves_plain_correction_and_targets_among_the_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs = dir.path().join("references");
+    fs::create_dir(&refs).unwrap();
+    references(&refs, None);
+    let saved = dir.path().join("dirt.fdl");
+    // One of the references is itself converted, another target is not a reference.
+    let outside = dir.path().join("outside.DNG");
+    scene(5, true).write(&outside);
+    let run = |name: &str, arguments: &[&std::ffi::OsStr]| {
+        let output = dir.path().join(name);
+        success(
+            command(&refs.join("ref2.DNG"), &output)
+                .arg(&outside)
+                .arg("--report")
+                .args(arguments)
+                .output()
+                .unwrap(),
+        );
+        ["ref2", "outside"].map(|stem| {
+            (
+                fs::read(output.join(format!("{stem}.png"))).unwrap(),
+                json(&output.join(format!("{stem}.json")))["dirty_correction"].clone(),
+            )
+        })
+    };
+    let expected = run(
+        "analyzed",
+        &[
+            "-fdl".as_ref(),
+            refs.as_os_str(),
+            "--fdl-save".as_ref(),
+            saved.as_os_str(),
+        ],
+    );
+    for (_, report) in &expected {
+        assert_eq!(report["spots"].as_array().unwrap().len(), 2, "{report}");
+    }
+    // Without extra detection only the confirmed spots are kept.
+    assert!(fs::metadata(&saved).unwrap().len() < 4096);
+    let loaded = run("loaded", &["--fix-dirty-load".as_ref(), saved.as_os_str()]);
+    assert!(loaded == expected, "loaded data changed the outputs");
+    let result = command(&outside, &dir.path().join("mixed"))
+        .args(["-fdx", "-fdl-load"])
+        .arg(&saved)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("was saved without --fix-dirty-extra")
+    );
+}
+
+#[test]
+fn saved_stack_data_is_read_only_for_the_references_a_target_needs() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    let faint = |x: f64, y: f64| {
+        -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("faint{index}.DNG"),
+                &shaded(index, faint),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let paths: Vec<PathBuf> = (0..4)
+        .map(|index| dir.path().join(format!("faint{index}.DNG")))
+        .collect();
+    let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let mut bytes = Vec::new();
+    calibration.save(&mut bytes, true, &paths).unwrap();
+    assert!(calibration.save(Vec::new(), false, &paths).is_err());
+    assert!(calibration.save(Vec::new(), true, &paths[..3]).is_err());
+    let original = shaded(0, faint);
+    let repaired = |calibration: &Calibration| {
+        let mut image = decode(dir.path(), "target.DNG", &original);
+        let target = dirty::analyze_with_extra(&image, true).unwrap();
+        let report = calibration.plan(&target).apply(&mut image).unwrap();
+        (image.pixels, report.stacked_regions)
+    };
+    let expected = repaired(&calibration);
+    assert_eq!(expected.1, 1);
+    let open = || dirty::Saved::open(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    let saved = open();
+    assert!(saved.extra);
+    assert_eq!(saved.references, paths);
+    assert!(repaired(&saved.calibration(|_| true).unwrap()) == expected);
+    // Fewer than three stacked views cannot confirm the shadow, exactly as when the
+    // other references had not kept their stack data.
+    let mut windowed = Calibration::new(&evidence).unwrap();
+    windowed.keep_stacks(|index| index < 2);
+    let partial = repaired(&open().calibration(|index| index < 2).unwrap());
+    assert!(partial == repaired(&windowed));
+    assert_eq!(partial.1, 0);
+    assert!(partial.0 == original.pixels);
 }
 
 #[test]
@@ -1617,16 +2388,18 @@ fn original_sony_dust_is_not_crowded_out_by_textured_foreground() {
 }
 
 #[test]
-#[ignore = "set DNG_DIRTY_UVFS_SAMPLES to Sony 20261110-UVFS/ARW; optionally DNG_DIRTY_BINARY"]
+#[ignore = "set DNG_DIRTY_UVFS_SAMPLES to Sony 20261110-UVFS, searched recursively; optionally DNG_DIRTY_BINARY"]
 fn original_uvfs_sony_extra_correction_recovers_the_broad_recurring_shadow() {
     let root = PathBuf::from(std::env::var_os("DNG_DIRTY_UVFS_SAMPLES").unwrap());
     let binary = std::env::var_os("DNG_DIRTY_BINARY").unwrap_or_else(|| OsString::from(BIN));
     let inputs = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
-    let targets = [
-        root.join("DSC01990.ARW"),
-        root.join("DSC01991.ARW"),
-        root.join("DSC01992.ARW"),
-    ];
+    // The session may be split into subdirectories; all of it is the reference set.
+    let targets = ["DSC01990.ARW", "DSC01991.ARW", "DSC01992.ARW"].map(|name| {
+        let input = inputs
+            .iter()
+            .find(|input| input.path.file_name().is_some_and(|file| file == name));
+        input.unwrap().path.clone()
+    });
     let output = success(
         Command::new(binary)
             .args(&targets)

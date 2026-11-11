@@ -96,13 +96,21 @@ pub(super) fn process(
         .color_ratios
         .map(|ratios| ratios.scale_factors)
         .or_else(|| decoded.white_balance.map(|wb| wb.scale_factors));
+    // One measurement for all planes: per-plane decisions would leave color ghosts.
+    let refinement = dirty_plan
+        .map(|plan| {
+            let images: Vec<_> = decoded.channels.iter().map(|(_, image)| image).collect();
+            plan.refine(&images)
+        })
+        .transpose()?;
     let planes: Vec<Plane> = decoded
         .channels
         .into_par_iter()
         .map(|(channel, mut image)| -> Result<_> {
             let dirty = dirty_plan
-                .map(|plan| {
-                    plan.apply_with_strength(&mut image, cli.fix_dust_strength.unwrap_or(1.0))
+                .zip(refinement.as_ref())
+                .map(|(plan, refinement)| {
+                    plan.apply_refined(&mut image, cli.fix_dust_strength.unwrap_or(1.0), refinement)
                 })
                 .transpose()?;
             let histogram = Histogram::with_parameters(&image.pixels, &cli.parameters)?;
