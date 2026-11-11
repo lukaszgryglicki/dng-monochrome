@@ -1244,7 +1244,7 @@ fn all_references_are_analyzed_before_only_the_separate_target_is_written() {
 }
 
 #[test]
-fn multi_directory_reference_files_and_recursive_directories_preserve_correction() {
+fn multi_directory_reference_globs_and_recursive_directories_preserve_correction() {
     let dir = tempfile::tempdir().unwrap();
     let refs = dir.path().join("references");
     fs::create_dir(&refs).unwrap();
@@ -1292,6 +1292,12 @@ fn multi_directory_reference_files_and_recursive_directories_preserve_correction
         (
             "recursive-overlap",
             vec![refs.clone(), first.join("ref0.DNG"), second.clone()],
+        ),
+        ("glob-files", vec![refs.join("*/*.DNG")]),
+        ("glob-directories", vec![refs.join("*")]),
+        (
+            "glob-recursive-overlap",
+            vec![refs.join("**/*.DNG"), first.join("ref0.DNG")],
         ),
     ] {
         let output = dir.path().join(name);

@@ -76,7 +76,12 @@ mod color;
     group(ArgGroup::new("curve").args(["function", "tone_bands"]))
 )]
 pub struct Cli {
-    #[arg(required = true, num_args = 1.., value_name = "RAW_OR_DIRECTORY")]
+    #[arg(
+        required = true,
+        num_args = 1..,
+        value_name = "RAW_OR_DIRECTORY",
+        help = "Input RAW files, recursive directories or quoted globs"
+    )]
     pub inputs: Vec<PathBuf>,
 
     #[arg(
@@ -205,7 +210,7 @@ pub struct Cli {
         num_args = 1..,
         action = clap::ArgAction::Append,
         value_name = "RAW_OR_DIRECTORY",
-        help = "Separate dirt-reference files/directories, including multiple directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
+        help = "Separate dirt-reference files/directories/quoted globs, including multiple directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
     )]
     pub fix_dirty_list: Vec<PathBuf>,
 
@@ -772,6 +777,36 @@ pub struct Input {
 }
 
 pub fn discover(paths: &[PathBuf]) -> Result<Vec<Input>> {
+    let mut expanded = Vec::new();
+    for path in paths {
+        if let Some(pattern) = path.to_str().filter(|text| text.contains(['*', '?', '[']))
+            && matches!(path.symlink_metadata(), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        {
+            let before = expanded.len();
+            let matches = glob::glob_with(
+                pattern,
+                glob::MatchOptions {
+                    case_sensitive: true,
+                    require_literal_separator: true,
+                    require_literal_leading_dot: true,
+                },
+            )
+            .with_context(|| format!("invalid input glob {}", path.display()))?;
+            for entry in matches {
+                expanded.push(
+                    entry.with_context(|| format!("expanding input glob {}", path.display()))?,
+                );
+            }
+            ensure!(
+                expanded.len() > before,
+                "input glob {} matched no paths",
+                path.display()
+            );
+        } else {
+            expanded.push(path.clone());
+        }
+    }
+    let paths = &expanded;
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
     let kind = "DNG/ARW";

@@ -1343,6 +1343,117 @@ fn verbosity_aliases_and_silent_keep_errors_visible() {
 }
 
 #[test]
+fn quoted_glob_discovery_preserves_explicit_input_layout_and_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("raw files");
+    let first = root.join("first");
+    let second = root.join("second");
+    fs::create_dir_all(first.join("nested")).unwrap();
+    fs::create_dir(&second).unwrap();
+    let a = first.join("a shot.DNG");
+    let b = second.join("b shot.DNG");
+    let deep = first.join("nested/deep.DNG");
+    for path in [
+        a.clone(),
+        b.clone(),
+        deep.clone(),
+        second.join("lower.dng"),
+        second.join(".hidden.DNG"),
+    ] {
+        fs::write(path, b"discovery fixture").unwrap();
+    }
+    let layout = |paths: &[std::path::PathBuf]| {
+        dng_monochrome::cli::discover(paths)
+            .unwrap()
+            .into_iter()
+            .map(|input| (input.path, input.relative))
+            .collect::<Vec<_>>()
+    };
+    for (pattern, explicit) in [
+        (root.join("*/*.DNG"), vec![a.clone(), b.clone()]),
+        (root.join("*/[ab] ?hot.DNG"), vec![a.clone(), b.clone()]),
+        (root.join("**/*.DNG"), vec![a, b, deep]),
+        (root.join("*"), vec![first, second]),
+    ] {
+        let expected = layout(&explicit);
+        assert_eq!(layout(std::slice::from_ref(&pattern)), expected);
+        let mut overlapping = vec![pattern];
+        overlapping.extend(explicit);
+        assert_eq!(layout(&overlapping), expected);
+    }
+
+    let literal = tmp.path().join("photo[1].DNG");
+    fs::write(&literal, b"literal name").unwrap();
+    fs::write(tmp.path().join("photo1.DNG"), b"not selected").unwrap();
+    assert_eq!(
+        layout(std::slice::from_ref(&literal)),
+        vec![(
+            literal.canonicalize().unwrap(),
+            std::path::PathBuf::from("photo[1].DNG")
+        )]
+    );
+}
+
+#[test]
+fn quoted_globs_process_files_without_shell_expansion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("raw files");
+    fs::create_dir(&input).unwrap();
+    for name in ["a shot", "b shot"] {
+        Dng::ramp(32, 16).write(&input.join(format!("{name}.DNG")));
+    }
+    let literal = tmp.path().join("literal");
+    let glob = tmp.path().join("glob");
+    success(run(&input, &literal, &["--report"]));
+    success(run(&input.join("*.DNG"), &glob, &["--report"]));
+    for name in ["a shot", "b shot"] {
+        for extension in ["png", "jpg", "json"] {
+            let file = format!("{name}.{extension}");
+            assert_eq!(
+                fs::read(literal.join(&file)).unwrap(),
+                fs::read(glob.join(&file)).unwrap()
+            );
+        }
+    }
+    assert_eq!(fs::read_dir(glob).unwrap().count(), 6);
+}
+
+#[test]
+fn quoted_glob_errors_prevent_processing_and_reference_outputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (input, _) = fixture(tmp.path());
+    fs::write(tmp.path().join("notes.txt"), b"not a RAW").unwrap();
+    for references in [false, true] {
+        for (index, (pattern, error)) in [
+            ("missing*.DNG", "matched no paths"),
+            ("bad[.DNG", "invalid input glob"),
+            ("*.txt", "not a DNG/ARW file"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = tmp.path().join(format!("output-{references}-{index}"));
+            let mut command = Command::new(BIN);
+            command.arg(&input);
+            if references {
+                command.arg("-fdl").arg(&input);
+            }
+            let result = command
+                .arg(tmp.path().join(pattern))
+                .arg("-o")
+                .arg(&output)
+                .args(["--threads", "2", "--jobs", "1"])
+                .output()
+                .unwrap();
+            assert!(!result.status.success());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains(error), "{stderr}");
+            assert!(!output.exists());
+        }
+    }
+}
+
+#[test]
 fn output_alias_and_end_of_options_handle_flag_like_filenames() {
     let tmp = tempfile::tempdir().unwrap();
     Dng::ramp(32, 16).write(&tmp.path().join("-best.DNG"));

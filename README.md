@@ -154,9 +154,17 @@ explicit `requirements` target, not as a side effect of ordinary builds.
 
 ## Usage
 
+Processing inputs and `-fdl` accept quoted globs: `*`, `?`, `[...]` and recursive
+`**`. Expansion is internal, case-sensitive and preserves spaces in paths;
+wildcards do not match leading dots unless explicitly specified. Existing literal
+paths take precedence. Invalid or unmatched patterns are errors.
+
 ```sh
-# One PNG per file; the shell expands *.DNG.
-dng-monochrome *.DNG
+# One PNG per file; the converter expands the quoted glob.
+dng-monochrome '*.DNG'
+
+# Quoted globs also work for separate, multi-directory dust references.
+dng-monochrome '*.ARW' -c -fdx -fdl '/path/to/photos/*/*/*.ARW' -o cleaned
 
 # Restore the original PNG/JPEG pair beside each DNG.
 dng-monochrome -jpg -o . *.DNG
@@ -388,7 +396,7 @@ dng-monochrome /path/to/one/DNG-directory -fds 1.25 -o stronger --report
 `--fix-dirty` (`-fd`) first decodes and analyzes **every** reference and target
 RAW, before any development or output. A failed analysis prevents all outputs.
 By default, the processing inputs are also the references. `--fix-dirty-list`
-(`-fix-dirty-list`, `-fdl`) instead accepts files/directories using normal input
+(`-fix-dirty-list`, `-fdl`) instead accepts files/directories/quoted globs using normal input
 discovery; it implies `--fix-dirty` and can be repeated. Put target inputs before
 this variadic option. Overlapping inputs are analyzed once; reference-only files
 produce no outputs and target-only files do not contribute detection votes.

@@ -372,6 +372,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "glob",
  "jpeg-decoder",
  "jpeg-encoder",
  "jpeg2k",

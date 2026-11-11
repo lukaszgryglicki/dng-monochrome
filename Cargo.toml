@@ -14,6 +14,7 @@ bundled-heif = ["libheif-sys/embedded-libheif"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+glob = "0.3.4"
 jpeg-encoder = "0.7"
 jxl-sys = "0.1.12"
 libheif-sys = { version = "5.3", default-features = false, features = ["v1_19"] }
