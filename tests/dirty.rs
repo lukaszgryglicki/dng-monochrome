@@ -1244,18 +1244,96 @@ fn all_references_are_analyzed_before_only_the_separate_target_is_written() {
 }
 
 #[test]
-fn failed_last_reference_prevents_every_output_but_all_inputs_are_attempted() {
+fn multi_directory_reference_files_and_recursive_directories_preserve_correction() {
     let dir = tempfile::tempdir().unwrap();
     let refs = dir.path().join("references");
     fs::create_dir(&refs).unwrap();
+    references(&refs, None);
+    let target = dir.path().join("target.DNG");
+    scene(0, true).write(&target);
+    let single = dir.path().join("single");
+    success(
+        command(&target, &single)
+            .args(["--report", "-fdl"])
+            .arg(&refs)
+            .output()
+            .unwrap(),
+    );
+    let expected = fs::read(single.join("target.png")).unwrap();
+    let report = json(&single.join("target.json"));
+    let expected_dirty = &report["dirty_correction"];
+    assert_eq!(expected_dirty["reference_images"], 4);
+    assert_eq!(expected_dirty["distinct_reference_views"], 4);
+    assert_eq!(expected_dirty["spots"].as_array().unwrap().len(), 2);
+    assert!(expected_dirty["changed_samples"].as_u64().unwrap() > 0);
+
+    let first = refs.join("first");
+    let second = refs.join("second");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    for index in 0..4 {
+        fs::rename(
+            refs.join(format!("ref{index}.DNG")),
+            if index < 2 { &first } else { &second }.join(format!("ref{}.DNG", index % 2)),
+        )
+        .unwrap();
+    }
+    for (name, inputs) in [
+        (
+            "files",
+            vec![
+                first.join("ref0.DNG"),
+                first.join("ref1.DNG"),
+                second.join("ref0.DNG"),
+                second.join("ref1.DNG"),
+            ],
+        ),
+        ("directories", vec![first.clone(), second.clone()]),
+        (
+            "recursive-overlap",
+            vec![refs.clone(), first.join("ref0.DNG"), second.clone()],
+        ),
+    ] {
+        let output = dir.path().join(name);
+        let result = success(
+            command(&target, &output)
+                .args(["--report", "--fdl"])
+                .args(inputs)
+                .output()
+                .unwrap(),
+        );
+        let text = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            text.contains("4 reference(s), 1 additional target(s)"),
+            "{text}"
+        );
+        assert!(text.contains("analysis complete for all 5 RAWs"), "{text}");
+        assert_eq!(fs::read(output.join("target.png")).unwrap(), expected);
+        assert_eq!(
+            json(&output.join("target.json"))["dirty_correction"],
+            *expected_dirty
+        );
+        assert_eq!(fs::read_dir(&output).unwrap().count(), 2);
+    }
+    assert!(!refs.join("dng-mono").exists());
+}
+
+#[test]
+fn failed_last_reference_prevents_every_output_but_all_inputs_are_attempted() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs = dir.path().join("references");
+    let other = dir.path().join("z-other-references");
+    fs::create_dir(&refs).unwrap();
+    fs::create_dir(&other).unwrap();
     Dng::ramp(32, 24).write(&refs.join("a.DNG"));
-    fs::write(refs.join("z-bad.DNG"), b"broken raw").unwrap();
+    fs::write(other.join("z-bad.DNG"), b"broken raw").unwrap();
     let target = dir.path().join("target.DNG");
     Dng::ramp(32, 24).write(&target);
     let output = dir.path().join("output");
     let result = command(&target, &output)
         .arg("-fdl")
         .arg(&refs)
+        .arg(&other)
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -1268,12 +1346,8 @@ fn failed_last_reference_prevents_every_output_but_all_inputs_are_attempted() {
     assert!(!text.contains("starting target processing"));
     assert!(!output.exists());
 
-    fs::remove_file(refs.join("z-bad.DNG")).unwrap();
-    let result = command(&target, &output)
-        .arg("-fdl")
-        .arg(dir.path())
-        .output()
-        .unwrap();
+    fs::remove_file(other.join("z-bad.DNG")).unwrap();
+    let result = command(dir.path(), &output).arg("-fd").output().unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("single directory"));
     assert!(!output.exists());

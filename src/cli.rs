@@ -205,7 +205,7 @@ pub struct Cli {
         num_args = 1..,
         action = clap::ArgAction::Append,
         value_name = "RAW_OR_DIRECTORY",
-        help = "Separate dirt-reference files/directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
+        help = "Separate dirt-reference files/directories, including multiple directories; implies --fix-dirty; default: processing inputs. Put target inputs before this list"
     )]
     pub fix_dirty_list: Vec<PathBuf>,
 
@@ -892,11 +892,13 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
         .then(|| discover(&cli.fix_dirty_list))
         .transpose()?;
     let references = separate.as_deref().unwrap_or(inputs);
-    let parent = references[0].path.parent();
-    ensure!(
-        references.iter().all(|input| input.path.parent() == parent),
-        "--fix-dirty reference RAWs must come from a single directory; run separate directories independently"
-    );
+    if separate.is_none() {
+        let parent = references[0].path.parent();
+        ensure!(
+            references.iter().all(|input| input.path.parent() == parent),
+            "--fix-dirty inputs must come from a single directory unless --fix-dirty-list is supplied"
+        );
+    }
     let mut paths = Vec::new();
     let mut indices = HashMap::new();
     for input in references.iter().chain(inputs) {

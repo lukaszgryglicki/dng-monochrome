@@ -381,7 +381,7 @@ Color reports and analysis JSON contain separate channel metadata/DR results.
 
 ```sh
 dng-monochrome /path/to/one/DNG-directory -fd -o cleaned --report
-dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory -o cleaned
+dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory /path/to/older-ARWs -o cleaned
 dng-monochrome /path/to/one/DNG-directory -fds 1.25 -o stronger --report
 ```
 
@@ -409,10 +409,11 @@ the recorded white level. Stronger settings can create bright patches, clipping
 and amplified noise; they do not relax detection confidence or guarantee that
 every shadow disappears.
 
-Use one camera and **one actual directory of references per invocation**.
-Recursive discovery is supported, but references spanning multiple directories
-are rejected rather than silently pooled. Matching sensor dimensions/crops are
-analyzed separately, in sensor coordinates regardless of EXIF rotation.
+Explicit reference lists may span multiple directories, including recursive
+directory inputs. Without `-fdl`, the implicit references must still come from
+one actual directory. Use compatible photographs from the same camera; different
+makes/models, sensor dimensions and crops are analyzed separately, in sensor
+coordinates regardless of EXIF rotation.
 At least three distinct views must confirm a position; near-duplicate frames
 do not provide independent support. Varied scenes with smooth, adequately exposed
 areas are more useful than repeated shots of the same view. Recorded aperture,
