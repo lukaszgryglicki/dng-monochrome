@@ -180,17 +180,30 @@ impl Preview {
             }
             let center = [(left + right) as f64 * 0.5, (top + bottom) as f64 * 0.5];
             let axes = [(width / extent).max(0.35), (height / extent).max(0.35)];
-            for padding in (8..=24).map(|value| f64::from(value) * 0.5) {
-                let radius = (extent + 2.0 * padding) / 8.0;
-                let axes = [
-                    (width + 2.0 * padding) / (8.0 * radius),
-                    (height + 2.0 * padding) / (8.0 * radius),
-                ];
-                if let Some(fit) = FitGrid::shape(true)
-                    .fit_irregular_axes(self, center[0], center[1], radius, axes)
-                {
-                    found.push((center[0], center[1], radius, fit));
-                    break;
+            'rectangle: for (dx, dy) in [
+                (0.0, 0.0),
+                (-0.5, 0.0),
+                (0.5, 0.0),
+                (0.0, -0.5),
+                (0.0, 0.5),
+                (-0.5, -0.5),
+                (-0.5, 0.5),
+                (0.5, -0.5),
+                (0.5, 0.5),
+            ] {
+                let (x, y) = (center[0] + dx, center[1] + dy);
+                for padding in (8..=24).map(|value| f64::from(value) * 0.5) {
+                    let radius = (extent + 2.0 * padding) / 8.0;
+                    let axes = [
+                        (width + 2.0 * padding) / (8.0 * radius),
+                        (height + 2.0 * padding) / (8.0 * radius),
+                    ];
+                    if let Some(fit) =
+                        FitGrid::shape(true).fit_irregular_axes(self, x, y, radius, axes)
+                    {
+                        found.push((x, y, radius, fit));
+                        break 'rectangle;
+                    }
                 }
             }
             let mut radius = extent * 0.25;
@@ -1044,12 +1057,50 @@ impl Calibration {
         let mut spots = Vec::new();
         if let Some(group) = group {
             for candidate in &target.candidates {
-                if let Some(confirmed) = group.spots.iter().find(|spot| {
-                    spot.irregular == candidate.patch.irregular
-                        && (spot.x - candidate.x).hypot(spot.y - candidate.y)
-                            <= match_radius(spot.sigma, candidate.sigma, spot.irregular)
-                }) {
+                if let Some(confirmed) = group
+                    .spots
+                    .iter()
+                    .find(|spot| {
+                        spot.irregular == candidate.patch.irregular
+                            && (spot.x - candidate.x).hypot(spot.y - candidate.y)
+                                <= match_radius(spot.sigma, candidate.sigma, spot.irregular)
+                    })
+                    .or_else(|| {
+                        if candidate.patch.irregular {
+                            None
+                        } else {
+                            group.spots.iter().find(|spot| {
+                                spot.irregular
+                                    && (spot.x - candidate.x).hypot(spot.y - candidate.y)
+                                        <= match_radius(spot.sigma, candidate.sigma, true)
+                            })
+                        }
+                    })
+                {
                     let mut patch = candidate.patch.clone();
+                    if !patch.irregular
+                        && confirmed.irregular
+                        && patch.spacing > target.step as f64 * 0.5
+                    {
+                        let span = (patch.side - 1) as f64 * patch.spacing;
+                        let side = (span / (target.step as f64 * 0.5)).ceil() as usize + 1;
+                        let scale = (patch.side - 1) as f64 / (side - 1) as f64;
+                        let values = (0..side * side)
+                            .map(|i| {
+                                bilinear(
+                                    &patch.values,
+                                    patch.side,
+                                    patch.side,
+                                    (i % side) as f64 * scale,
+                                    (i / side) as f64 * scale,
+                                ) as f32
+                            })
+                            .collect();
+                        patch.values = values;
+                        patch.spacing = span / (side - 1) as f64;
+                        patch.side = side;
+                    }
+                    patch.irregular = confirmed.irregular;
                     if patch.irregular {
                         let peak = f64::from(patch.values.iter().copied().fold(0.0, f32::max));
                         for (i, gain) in patch.values.iter_mut().enumerate() {
@@ -1106,6 +1157,8 @@ impl Calibration {
                 }
             }
         }
+        // Compact contributions accumulate before extra fields take their maximum.
+        patches.sort_by_key(|patch| patch.irregular);
         let warning = if group.is_none() {
             Some("no matching reference sensor geometry/crop; pixels are unchanged")
         } else if group.is_some_and(|group| group.distinct_views < 3) {

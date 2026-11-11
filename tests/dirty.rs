@@ -645,6 +645,157 @@ fn extra_correction_recovers_annular_dust_without_losing_its_separate_center_dot
 }
 
 #[test]
+fn confirmed_irregular_dirt_repairs_compact_targets_without_borrowing_reference_votes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = |index: usize, compact: bool| {
+        let mut source = scene(index, false);
+        for y in 0..source.height {
+            for x in 0..source.width {
+                let px = f64::from(x / 2 * 2) + 0.5;
+                let py = f64::from(y / 2 * 2) + 0.5;
+                let radius = (px - 320.5).hypot(py - 160.5);
+                let shadow = if compact {
+                    0.24 * (-0.5 * (radius / 8.0).powi(2)).exp()
+                } else {
+                    0.6 / (1.0 + (radius - 20.0).exp())
+                };
+                let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                *pixel = (f64::from(source.black)
+                    + (f64::from(*pixel) - f64::from(source.black)) * (-shadow).exp())
+                .round() as u16;
+            }
+        }
+        source
+    };
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("flat{index}.DNG"),
+                &fixture(index, false),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let mixed: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("mixed{index}.DNG"),
+                &fixture(index, index >= 2),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let mut target = decode(dir.path(), "target.DNG", &fixture(0, true));
+    let original = target.pixels.clone();
+    let measured = dirty::analyze_with_extra(&target, true).unwrap();
+    let insufficient = Calibration::new(&mixed).unwrap().plan(&measured);
+    assert_eq!(insufficient.apply(&mut target).unwrap().changed_samples, 0);
+    assert_eq!(target.pixels, original);
+
+    let report = Calibration::new(&evidence)
+        .unwrap()
+        .plan(&measured)
+        .apply(&mut target)
+        .unwrap();
+    assert!(
+        report.spots.iter().any(|spot| {
+            (spot.sensor_x - 320.5).hypot(spot.sensor_y - 160.5) < 3.0 && spot.distinct_views >= 3
+        }),
+        "{report:?}"
+    );
+    let clean = decode(dir.path(), "clean.DNG", &scene(0, false));
+    let (mut before, mut after) = (0u64, 0u64);
+    for (i, ((&original, &corrected), &clean)) in original
+        .iter()
+        .zip(&target.pixels)
+        .zip(&clean.pixels)
+        .enumerate()
+    {
+        if original.abs_diff(clean) > 20 {
+            before += u64::from(original.abs_diff(clean));
+            after += u64::from(corrected.abs_diff(clean));
+        }
+        let x = (i % target.metadata.width) as f64;
+        let y = (i / target.metadata.width) as f64;
+        if (x - 320.5).hypot(y - 160.5) > 64.0 {
+            assert_eq!(corrected, original);
+        }
+    }
+    assert!(before > 5_000);
+    assert!(
+        (after as f64) < before as f64 * 0.2,
+        "{after}/{before}; {report:?}"
+    );
+    assert_eq!(report.clipped_samples, 0);
+}
+
+#[test]
+fn compact_target_support_preserves_small_unshadowed_scene_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let mut source = scene(index, false);
+            for y in 0..source.height {
+                for x in 0..source.width {
+                    let px = f64::from(x / 2 * 2) + 0.5;
+                    let py = f64::from(y / 2 * 2) + 0.5;
+                    let radius = (px - 320.5).hypot(py - 160.5);
+                    let shadow = if (px - 331.5).abs() <= 4.0 && (py - 171.5).abs() <= 4.0 {
+                        0.0
+                    } else {
+                        0.6 / (1.0 + ((radius - 80.0) / 4.0).exp())
+                    };
+                    let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                    *pixel = (f64::from(source.black)
+                        + (f64::from(*pixel) - f64::from(source.black)) * (-shadow).exp())
+                    .round() as u16;
+                }
+            }
+            dirty::analyze_with_extra(
+                &decode(dir.path(), &format!("hollow{index}.DNG"), &source),
+                true,
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut source = scene(0, false);
+    for y in 0..source.height {
+        for x in 0..source.width {
+            let px = f64::from(x / 2 * 2) + 0.5;
+            let py = f64::from(y / 2 * 2) + 0.5;
+            let radius = (px - 320.5).hypot(py - 160.5);
+            let shadow = 0.24 * (-0.5 * (radius / 32.0).powi(2)).exp();
+            let pixel = &mut source.pixels[(y * source.width + x) as usize];
+            *pixel = (f64::from(source.black)
+                + (f64::from(*pixel) - f64::from(source.black)) * (-shadow).exp())
+            .round() as u16;
+        }
+    }
+    let mut target = decode(dir.path(), "compact.DNG", &source);
+    let original = target.pixels.clone();
+    let report = Calibration::new(&evidence)
+        .unwrap()
+        .plan(&dirty::analyze_with_extra(&target, true).unwrap())
+        .apply(&mut target)
+        .unwrap();
+    assert!(report.changed_samples > 1_000, "{report:?}");
+    for y in 171..=172 {
+        for x in 331..=332 {
+            let i = y * target.metadata.width + x;
+            assert!(
+                target.pixels[i].abs_diff(original[i]) <= 2,
+                "unsupported detail at {x},{y} brightened: {} vs {}",
+                target.pixels[i],
+                original[i]
+            );
+        }
+    }
+    assert_eq!(report.clipped_samples, 0);
+}
+
+#[test]
 fn broader_shadows_allow_their_measured_centroid_to_move_slightly() {
     let dir = tempfile::tempdir().unwrap();
     let evidence = references(dir.path(), None);
@@ -1391,7 +1542,11 @@ fn original_uvfs_sony_extra_correction_recovers_the_broad_recurring_shadow() {
     let root = PathBuf::from(std::env::var_os("DNG_DIRTY_UVFS_SAMPLES").unwrap());
     let binary = std::env::var_os("DNG_DIRTY_BINARY").unwrap_or_else(|| OsString::from(BIN));
     let inputs = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
-    let targets = [root.join("DSC01990.ARW"), root.join("DSC01992.ARW")];
+    let targets = [
+        root.join("DSC01990.ARW"),
+        root.join("DSC01991.ARW"),
+        root.join("DSC01992.ARW"),
+    ];
     let output = success(
         Command::new(binary)
             .args(&targets)
@@ -1435,6 +1590,37 @@ fn original_uvfs_sony_extra_correction_recovers_the_broad_recurring_shadow() {
         );
         assert_eq!(dirty["clipped_samples"], 0);
     }
+}
+
+#[test]
+#[ignore = "set DNG_DIRTY_UVFS_LEICA_SAMPLES to Leica 20261110-UVFS/DNG; optionally DNG_DIRTY_BINARY"]
+fn original_uvfs_leica_extra_correction_recovers_the_near_edge_hair() {
+    let root = PathBuf::from(std::env::var_os("DNG_DIRTY_UVFS_LEICA_SAMPLES").unwrap());
+    let binary = std::env::var_os("DNG_DIRTY_BINARY").unwrap_or_else(|| OsString::from(BIN));
+    let inputs = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
+    let target = root.join("M1101022.DNG");
+    let output = success(
+        Command::new(binary)
+            .arg(&target)
+            .args(["-fdx", "--analyze", "--threads", "2", "--jobs", "1", "-fdl"])
+            .args(inputs.iter().map(|input| &input.path))
+            .output()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dirty = &report["dirty_correction"];
+    assert!(
+        dirty["spots"].as_array().unwrap().iter().any(|spot| {
+            (spot["sensor_x"].as_f64().unwrap() - 3859.0)
+                .hypot(spot["sensor_y"].as_f64().unwrap() - 2599.0)
+                < 60.0
+                && spot["radius_sigma"].as_f64().unwrap() >= 15.0
+                && spot["maximum_gain"].as_f64().unwrap() > 1.04
+                && spot["distinct_views"].as_u64().unwrap() >= 3
+        }),
+        "M1101022: confirmed near-edge hair has no locally measured correction"
+    );
+    assert_eq!(dirty["clipped_samples"], 0);
 }
 
 #[test]
