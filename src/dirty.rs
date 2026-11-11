@@ -137,7 +137,98 @@ impl Preview {
         values
     }
 
-    fn candidates(&self) -> Vec<Candidate> {
+    fn irregular_proposals(
+        &self,
+        scores: &[f32],
+        peaks: &[(f32, usize, usize)],
+    ) -> Vec<(f64, f64, f64, Fit)> {
+        let mut visited = vec![false; scores.len()];
+        let mut found = Vec::new();
+        let grid = FitGrid::get();
+        for &(peak, x, y) in peaks {
+            let seed = y * self.width + x;
+            if visited[seed] {
+                continue;
+            }
+            let threshold = (peak * 0.25).max(0.002);
+            let mut pending = vec![seed];
+            visited[seed] = true;
+            let (mut left, mut right, mut top, mut bottom) = (x, x, y, y);
+            let mut count = 0;
+            while let Some(i) = pending.pop() {
+                let (x, y) = (i % self.width, i / self.width);
+                left = left.min(x);
+                right = right.max(x);
+                top = top.min(y);
+                bottom = bottom.max(y);
+                count += 1;
+                for sy in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
+                    for sx in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
+                        let next = sy * self.width + sx;
+                        if !visited[next] && scores[next] > threshold {
+                            visited[next] = true;
+                            pending.push(next);
+                        }
+                    }
+                }
+            }
+            let width = (right - left + 1) as f64;
+            let height = (bottom - top + 1) as f64;
+            let extent = width.max(height);
+            if count < 4 || !(8.0..=90.0).contains(&extent) {
+                continue;
+            }
+            let center = [(left + right) as f64 * 0.5, (top + bottom) as f64 * 0.5];
+            let axes = [(width / extent).max(0.35), (height / extent).max(0.35)];
+            for padding in (8..=24).map(|value| f64::from(value) * 0.5) {
+                let radius = (extent + 2.0 * padding) / 8.0;
+                let axes = [
+                    (width + 2.0 * padding) / (8.0 * radius),
+                    (height + 2.0 * padding) / (8.0 * radius),
+                ];
+                if let Some(fit) = FitGrid::shape(true)
+                    .fit_irregular_axes(self, center[0], center[1], radius, axes)
+                {
+                    found.push((center[0], center[1], radius, fit));
+                    break;
+                }
+            }
+            let mut radius = extent * 0.25;
+            let limit = (extent * 0.5).min(18.0);
+            if radius > limit {
+                continue;
+            }
+            loop {
+                let mut best: Option<(f64, f64, f64, Fit)> = None;
+                for axes in [axes, [1.0, 0.5], [0.5, 1.0], [1.0, 1.0]] {
+                    for dy in [0.0, -0.75, 0.75] {
+                        for dx in [0.0, -0.75, 0.75] {
+                            let x = center[0] + dx * radius * axes[0];
+                            let y = center[1] + dy * radius * axes[1];
+                            if let Some(fit) = grid.fit_irregular_axes(self, x, y, radius, axes)
+                                && best
+                                    .as_ref()
+                                    .is_none_or(|old| fit.quality() > old.3.quality())
+                            {
+                                best = Some((x, y, radius, fit));
+                            }
+                        }
+                    }
+                }
+                if let Some(best) = best {
+                    found.push(best);
+                    break;
+                }
+                if radius >= limit {
+                    break;
+                }
+                radius = (radius * 1.125).min(limit);
+            }
+        }
+        found
+    }
+
+    fn candidates(&self, extra: bool) -> Vec<Candidate> {
         let stride = self.width + 1;
         let mut integral = vec![0.0; stride * (self.height + 1)];
         for y in 0..self.height {
@@ -218,27 +309,46 @@ impl Preview {
                 rank += 1;
                 keep
             });
+            if extra && (sigma == 1.2 || sigma == 5.0) {
+                found.extend(self.irregular_proposals(&scores, &peaks));
+            }
             let fitted: Vec<_> = peaks
                 .par_iter()
-                .filter_map(|&(_, x, y)| {
-                    grid.fit(self, x as f64, y as f64, sigma)
-                        .map(|fit| (x as f64, y as f64, sigma, fit))
+                .flat_map_iter(|&(_, x, y)| {
+                    let (x, y) = (x as f64, y as f64);
+                    let compact = grid.fit(self, x, y, sigma).map(|fit| (x, y, sigma, fit));
+                    let mut radius = sigma;
+                    let irregular = loop {
+                        if !extra {
+                            break None;
+                        }
+                        if let Some(fit) = grid.fit_irregular(self, x, y, radius) {
+                            break Some((x, y, radius, fit));
+                        }
+                        if radius >= 18.0 {
+                            break None;
+                        }
+                        radius = (radius * 2.0).min(18.0);
+                    };
+                    [compact, irregular].into_iter().flatten()
                 })
                 .collect();
             found.extend(fitted);
         }
         found.sort_by(|a, b| {
-            b.3.quality()
-                .total_cmp(&a.3.quality())
+            a.3.irregular
+                .cmp(&b.3.irregular)
+                .then_with(|| b.3.quality().total_cmp(&a.3.quality()))
                 .then_with(|| a.1.total_cmp(&b.1))
                 .then_with(|| a.0.total_cmp(&b.0))
                 .then_with(|| a.2.total_cmp(&b.2))
         });
         let mut selected: Vec<Candidate> = Vec::new();
         for (mut x, mut y, mut sigma, mut fit) in found {
-            if selected
-                .iter()
-                .any(|other| (x - other.x).hypot(y - other.y) <= 2.0 * sigma.max(other.sigma))
+            if !fit.irregular
+                && selected
+                    .iter()
+                    .any(|other| (x - other.x).hypot(y - other.y) <= 2.0 * sigma.max(other.sigma))
             {
                 continue;
             }
@@ -251,19 +361,66 @@ impl Preview {
                     (x, y, sigma * (1.0 - fraction)),
                     (x, y, sigma * (1.0 + fraction)),
                 ] {
-                    if let Some(refined) = grid.fit(self, px, py, radius)
+                    let refined = if fit.irregular {
+                        FitGrid::shape(fit.rectangular)
+                            .fit_irregular_axes(self, px, py, radius, fit.axes)
+                    } else {
+                        grid.fit(self, px, py, radius)
+                    };
+                    if let Some(refined) = refined
                         && refined.quality() > fit.quality()
                     {
                         (x, y, sigma, fit) = (px, py, radius, refined);
                     }
                 }
             }
+            let patch = fit.patch(self, x, y, sigma);
+            if fit.irregular {
+                let reach = if fit.rectangular {
+                    4.0 * 2.0f64.sqrt()
+                } else {
+                    3.5
+                };
+                let nearby: Vec<_> = selected
+                    .iter()
+                    .filter(|other| {
+                        (x - other.x).hypot(y - other.y) < reach * sigma + 3.0 * other.sigma
+                    })
+                    .collect();
+                let threshold = patch.values.iter().copied().fold(0.0, f32::max) * 0.1;
+                let (mut total, mut outside, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0);
+                for (i, &gain) in patch.values.iter().enumerate() {
+                    if gain <= threshold {
+                        continue;
+                    }
+                    let px = (patch.origin[0] + (i % patch.side) as f64 * patch.spacing + 0.5)
+                        / self.step as f64
+                        - 0.5;
+                    let py = (patch.origin[1] + (i / patch.side) as f64 * patch.spacing + 0.5)
+                        / self.step as f64
+                        - 0.5;
+                    let gain = f64::from(gain);
+                    total += gain;
+                    sx += px * gain;
+                    sy += py * gain;
+                    if nearby
+                        .iter()
+                        .all(|other| (px - other.x).hypot(py - other.y) > 3.0 * other.sigma)
+                    {
+                        outside += gain;
+                    }
+                }
+                if total <= 0.0 || outside < total * 0.2 {
+                    continue;
+                }
+                (x, y) = (sx / total, sy / total);
+            }
             selected.push(Candidate {
                 x,
                 y,
                 sigma,
                 fit_error: fit.rms,
-                patch: fit.patch(self, x, y, sigma),
+                patch,
             });
             if selected.len() == 400 {
                 break;
@@ -284,12 +441,19 @@ struct FitPoint {
 
 struct FitGrid {
     points: Vec<FitPoint>,
+    rectangular: bool,
 }
 
 impl FitGrid {
     fn get() -> &'static Self {
+        Self::shape(false)
+    }
+
+    fn shape(rectangular: bool) -> &'static Self {
         static GRID: OnceLock<FitGrid> = OnceLock::new();
-        GRID.get_or_init(|| {
+        static RECTANGULAR: OnceLock<FitGrid> = OnceLock::new();
+        let grid = if rectangular { &RECTANGULAR } else { &GRID };
+        grid.get_or_init(|| {
             let mut points = Vec::new();
             let mut full = [[0.0; 7]; 7];
             let mut ring = [[0.0; 6]; 6];
@@ -297,11 +461,15 @@ impl FitGrid {
                 for ix in -8..=8 {
                     let (x, y) = (f64::from(ix) * 0.5, f64::from(iy) * 0.5);
                     let r2 = x * x + y * y;
-                    if r2 > 16.0 {
+                    if !rectangular && r2 > 16.0 {
                         continue;
                     }
                     let basis = [1.0, x, y, x * x, x * y, y * y, -(-0.5 * r2).exp()];
-                    let in_ring = r2 >= 6.25;
+                    let in_ring = if rectangular {
+                        x.abs().max(y.abs()) >= 3.5
+                    } else {
+                        r2 >= 6.25
+                    };
                     for i in 0..7 {
                         for j in 0..7 {
                             full[i][j] += basis[i] * basis[j];
@@ -330,7 +498,10 @@ impl FitGrid {
                         ring.map(|row| row.iter().zip(point.basis).map(|(a, b)| a * b).sum());
                 }
             }
-            Self { points }
+            Self {
+                points,
+                rectangular,
+            }
         })
     }
 
@@ -389,7 +560,96 @@ impl FitGrid {
                 rms,
                 ring_rms,
                 background,
+                irregular: false,
+                axes: [1.0, 1.0],
+                rectangular: false,
             })
+    }
+
+    fn fit_irregular(&self, image: &Preview, x: f64, y: f64, sigma: f64) -> Option<Fit> {
+        self.fit_irregular_axes(image, x, y, sigma, [1.0, 1.0])
+    }
+
+    fn fit_irregular_axes(
+        &self,
+        image: &Preview,
+        x: f64,
+        y: f64,
+        sigma: f64,
+        axes: [f64; 2],
+    ) -> Option<Fit> {
+        let rx = 4.0 * sigma * axes[0];
+        let ry = 4.0 * sigma * axes[1];
+        if x < rx || y < ry || x + rx >= image.width as f64 || y + ry >= image.height as f64 {
+            return None;
+        }
+        let mut background = [0.0; 6];
+        let mut values = Vec::with_capacity(self.points.len());
+        for point in &self.points {
+            let signal = image.sample(x + point.x * sigma * axes[0], y + point.y * sigma * axes[1]);
+            if !(0.0007..0.97).contains(&signal) {
+                return None;
+            }
+            let value = signal.ln();
+            values.push(value);
+            for (sum, weight) in background.iter_mut().zip(point.ring_weights) {
+                *sum += weight * value;
+            }
+        }
+        let shadows: Vec<_> = self
+            .points
+            .iter()
+            .zip(values)
+            .map(|(point, value)| {
+                background
+                    .iter()
+                    .zip(point.basis)
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>()
+                    - value
+            })
+            .collect();
+        let amplitude = shadows.iter().copied().fold(0.0, f64::max);
+        if !(0.02..MAX_LOG_GAIN).contains(&amplitude) {
+            return None;
+        }
+        let mut ring_error = 0.0;
+        let mut ring_count = 0;
+        let mut bright_error = 0.0;
+        for (point, &shadow) in self.points.iter().zip(&shadows) {
+            if point.ring {
+                ring_error += shadow * shadow;
+                ring_count += 1;
+            }
+            bright_error += shadow.min(0.0).powi(2);
+        }
+        let ring_rms = (ring_error / f64::from(ring_count)).sqrt();
+        let bright_rms = (bright_error / self.points.len() as f64).sqrt();
+        let threshold = (4.0 * ring_rms).max(0.004);
+        if ring_rms >= MAX_FIT_ERROR.min(amplitude * 0.1)
+            || bright_rms > 1.5 * ring_rms.max(0.0005)
+            || self
+                .points
+                .iter()
+                .zip(&shadows)
+                .any(|(point, &shadow)| point.ring && shadow > threshold)
+            || shadows
+                .iter()
+                .filter(|&&shadow| shadow > threshold.max(amplitude * 0.15))
+                .count()
+                < 4
+        {
+            return None;
+        }
+        Some(Fit {
+            amplitude,
+            rms: ring_rms.max(bright_rms),
+            ring_rms,
+            background,
+            irregular: true,
+            axes,
+            rectangular: self.rectangular,
+        })
     }
 }
 
@@ -432,6 +692,9 @@ struct Fit {
     rms: f64,
     ring_rms: f64,
     background: [f64; 6],
+    irregular: bool,
+    axes: [f64; 2],
+    rectangular: bool,
 }
 
 impl Fit {
@@ -440,24 +703,35 @@ impl Fit {
     }
 
     fn patch(&self, image: &Preview, x: f64, y: f64, sigma: f64) -> Patch {
-        let spacing = 7.0 * sigma / (PATCH_SIDE - 1) as f64;
-        let origin = [x - 3.5 * sigma, y - 3.5 * sigma];
-        let mut values = Vec::with_capacity(PATCH_SIDE * PATCH_SIDE);
-        for gy in 0..PATCH_SIDE {
-            for gx in 0..PATCH_SIDE {
+        let reach = if self.rectangular { 4.0 } else { 3.5 };
+        let side = if self.irregular {
+            ((4.0 * reach * sigma).ceil() as usize + 1).max(PATCH_SIDE)
+        } else {
+            PATCH_SIDE
+        };
+        let spacing = 2.0 * reach * sigma / (side - 1) as f64;
+        let smoothing = (sigma * 0.2).min(if self.irregular { 0.5 } else { 1.0 });
+        let origin = [x - reach * sigma, y - reach * sigma];
+        let mut values = Vec::with_capacity(side * side);
+        for gy in 0..side {
+            for gx in 0..side {
                 let (px, py) = (
                     origin[0] + gx as f64 * spacing,
                     origin[1] + gy as f64 * spacing,
                 );
-                let (u, v) = ((px - x) / sigma, (py - y) / sigma);
+                let (u, v) = (
+                    (px - x) / (sigma * self.axes[0]),
+                    (py - y) / (sigma * self.axes[1]),
+                );
                 let basis = [1.0, u, v, u * u, u * v, v * v];
                 let background: f64 = self.background.iter().zip(basis).map(|(a, b)| a * b).sum();
-                let shadow = background
-                    - image
-                        .smooth_sample(px, py, (sigma * 0.2).min(1.0))
-                        .max(0.0007)
-                        .ln();
-                let taper = (3.5 - u.hypot(v)).clamp(0.0, 1.0);
+                let shadow = background - image.smooth_sample(px, py, smoothing).max(0.0007).ln();
+                let radius = if self.rectangular {
+                    u.abs().max(v.abs())
+                } else {
+                    u.hypot(v)
+                };
+                let taper = (reach - radius).clamp(0.0, 1.0);
                 let taper = taper * taper * (3.0 - 2.0 * taper);
                 values.push(
                     ((shadow - 0.5 * self.ring_rms)
@@ -466,9 +740,50 @@ impl Fit {
                 );
             }
         }
+        if self.irregular {
+            let threshold = (3.0 * self.ring_rms).max(self.amplitude * 0.05) as f32;
+            let middle = side / 2;
+            let seed = values
+                .iter()
+                .enumerate()
+                .filter(|&(_, &value)| value > threshold)
+                .min_by_key(|&(i, _)| {
+                    (i % side).abs_diff(middle).pow(2) + (i / side).abs_diff(middle).pow(2)
+                })
+                .map(|(i, _)| i);
+            let mut covered = vec![false; side * side];
+            let mut pending: Vec<_> = seed.into_iter().collect();
+            while let Some(i) = pending.pop() {
+                if covered[i] || values[i] <= threshold {
+                    continue;
+                }
+                covered[i] = true;
+                let (x, y) = (i % side, i / side);
+                for sy in y.saturating_sub(1)..=(y + 1).min(side - 1) {
+                    for sx in x.saturating_sub(1)..=(x + 1).min(side - 1) {
+                        pending.push(sy * side + sx);
+                    }
+                }
+            }
+            for (i, value) in values.iter_mut().enumerate() {
+                let (x, y) = (i % side, i / side);
+                let mut weight = 0.0f32;
+                for sy in y.saturating_sub(2)..=(y + 2).min(side - 1) {
+                    for sx in x.saturating_sub(2)..=(x + 2).min(side - 1) {
+                        if covered[sy * side + sx] {
+                            let distance = x.abs_diff(sx).max(y.abs_diff(sy));
+                            weight = weight.max(if distance < 2 { 1.0 } else { 0.5 });
+                        }
+                    }
+                }
+                *value *= weight;
+            }
+        }
         Patch {
             origin: origin.map(|value| (value + 0.5) * image.step as f64 - 0.5),
             spacing: spacing * image.step as f64,
+            side,
+            irregular: self.irregular,
             values,
         }
     }
@@ -478,6 +793,8 @@ impl Fit {
 struct Patch {
     origin: [f64; 2],
     spacing: f64,
+    side: usize,
+    irregular: bool,
     values: Vec<f32>,
 }
 
@@ -499,6 +816,10 @@ pub struct Evidence {
 }
 
 pub fn analyze(image: &MonoImage) -> Result<Evidence> {
+    analyze_with_extra(image, false)
+}
+
+pub fn analyze_with_extra(image: &MonoImage, extra: bool) -> Result<Evidence> {
     let preview = Preview::new(image)?;
     Ok(Evidence {
         geometry: Geometry::new(&image.metadata),
@@ -506,7 +827,7 @@ pub fn analyze(image: &MonoImage) -> Result<Evidence> {
         height: preview.height,
         step: preview.step,
         signature: preview.signature(),
-        candidates: preview.candidates(),
+        candidates: preview.candidates(extra),
     })
 }
 
@@ -514,8 +835,10 @@ struct ConfirmedSpot {
     x: f64,
     y: f64,
     sigma: f64,
+    irregular: bool,
     supporting_images: usize,
     distinct_views: usize,
+    support: Vec<Patch>,
 }
 
 struct Group {
@@ -530,8 +853,10 @@ pub struct Calibration {
     groups: Vec<Group>,
 }
 
-fn match_radius(a: f64, b: f64) -> f64 {
-    (0.375 * (a + b)).max(0.75)
+fn match_radius(a: f64, b: f64, irregular: bool) -> f64 {
+    // Extra radii enclose entire shapes rather than their compact cores.
+    let fraction = if irregular { 0.25 } else { 0.375 };
+    (fraction * (a + b)).max(0.75)
 }
 
 impl Calibration {
@@ -589,7 +914,13 @@ impl Calibration {
                     .then_with(|| a.1.y.total_cmp(&b.1.y))
                     .then_with(|| a.1.x.total_cmp(&b.1.x))
             });
-            let trials = observations.len().max(1);
+            let trials = [false, true].map(|irregular| {
+                observations
+                    .iter()
+                    .filter(|(_, candidate)| candidate.patch.irregular == irregular)
+                    .count()
+                    .max(1)
+            });
             let mut clusters: Vec<Vec<(usize, &Candidate)>> = Vec::new();
             for observation in observations {
                 let candidate = observation.1;
@@ -599,8 +930,14 @@ impl Calibration {
                     .filter_map(|(i, cluster)| {
                         let center = cluster[0].1;
                         let distance = (center.x - candidate.x).hypot(center.y - candidate.y);
-                        (distance <= match_radius(center.sigma, candidate.sigma))
-                            .then_some((i, distance))
+                        (center.patch.irregular == candidate.patch.irregular
+                            && distance
+                                <= match_radius(
+                                    center.sigma,
+                                    candidate.sigma,
+                                    center.patch.irregular,
+                                ))
+                        .then_some((i, distance))
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1));
                 if let Some((index, _)) = nearest {
@@ -630,18 +967,21 @@ impl Calibration {
                     .iter()
                     .flat_map(|&i| &frames[i].candidates)
                     .filter(|candidate| {
-                        (candidate.x - center.x).abs() <= half_width
+                        candidate.patch.irregular == center.patch.irregular
+                            && (candidate.x - center.x).abs() <= half_width
                             && (candidate.y - center.y).abs() <= half_height
                     })
                     .map(|candidate| {
-                        std::f64::consts::PI * match_radius(center.sigma, candidate.sigma).powi(2)
+                        std::f64::consts::PI
+                            * match_radius(center.sigma, candidate.sigma, center.patch.irregular)
+                                .powi(2)
                     })
                     .sum();
                 let probability =
                     (coincidence_area / (group.images as f64 * area)).clamp(f64::MIN_POSITIVE, 1.0);
                 let k = distinct.len() - 1;
                 let n = group.distinct_views - 1;
-                let log_chance = (trials as f64).ln()
+                let log_chance = (trials[usize::from(center.patch.irregular)] as f64).ln()
                     + (0..k)
                         .map(|i| ((n - i) as f64 / (i + 1) as f64).ln())
                         .sum::<f64>()
@@ -649,12 +989,43 @@ impl Calibration {
                 if log_chance > 0.01f64.ln() {
                     continue;
                 }
+                let support = if center.patch.irregular {
+                    distinct
+                        .iter()
+                        .map(|&view| {
+                            let mut patch = cluster
+                                .iter()
+                                .find(|(i, _)| views[*i] == view)
+                                .unwrap()
+                                .1
+                                .patch
+                                .clone();
+                            let peak = patch.values.iter().copied().fold(0.0, f32::max);
+                            // One grid neighbor is at most half a preview pixel per axis.
+                            let values = patch.values.clone();
+                            for (i, value) in patch.values.iter_mut().enumerate() {
+                                let (x, y) = (i % patch.side, i / patch.side);
+                                for sy in y.saturating_sub(1)..=(y + 1).min(patch.side - 1) {
+                                    for sx in x.saturating_sub(1)..=(x + 1).min(patch.side - 1) {
+                                        *value = value.max(values[sy * patch.side + sx]);
+                                    }
+                                }
+                                *value /= peak;
+                            }
+                            patch
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 group.spots.push(ConfirmedSpot {
                     x: cluster.iter().map(|(_, c)| c.x).sum::<f64>() / cluster.len() as f64,
                     y: cluster.iter().map(|(_, c)| c.y).sum::<f64>() / cluster.len() as f64,
                     sigma: center.sigma,
+                    irregular: center.patch.irregular,
                     supporting_images: cluster.len(),
                     distinct_views: distinct.len(),
+                    support,
                 });
             }
         }
@@ -674,10 +1045,47 @@ impl Calibration {
         if let Some(group) = group {
             for candidate in &target.candidates {
                 if let Some(confirmed) = group.spots.iter().find(|spot| {
-                    (spot.x - candidate.x).hypot(spot.y - candidate.y)
-                        <= match_radius(spot.sigma, candidate.sigma)
+                    spot.irregular == candidate.patch.irregular
+                        && (spot.x - candidate.x).hypot(spot.y - candidate.y)
+                            <= match_radius(spot.sigma, candidate.sigma, spot.irregular)
                 }) {
                     let mut patch = candidate.patch.clone();
+                    if patch.irregular {
+                        let peak = f64::from(patch.values.iter().copied().fold(0.0, f32::max));
+                        for (i, gain) in patch.values.iter_mut().enumerate() {
+                            if *gain <= 0.0 {
+                                continue;
+                            }
+                            let x = patch.origin[0] + (i % patch.side) as f64 * patch.spacing;
+                            let y = patch.origin[1] + (i / patch.side) as f64 * patch.spacing;
+                            let mut strongest = [0.0f64; 3];
+                            for reference in &confirmed.support {
+                                let rx = (x - reference.origin[0]) / reference.spacing;
+                                let ry = (y - reference.origin[1]) / reference.spacing;
+                                let bounds = 0.0..=(reference.side - 1) as f64;
+                                if !bounds.contains(&rx) || !bounds.contains(&ry) {
+                                    continue;
+                                }
+                                let mut value = bilinear(
+                                    &reference.values,
+                                    reference.side,
+                                    reference.side,
+                                    rx,
+                                    ry,
+                                );
+                                for largest in &mut strongest {
+                                    if value > *largest {
+                                        std::mem::swap(&mut value, largest);
+                                    }
+                                }
+                            }
+                            let agreement = strongest[2] * peak / f64::from(*gain);
+                            *gain *= ((agreement - 0.25) * 4.0).clamp(0.0, 1.0) as f32;
+                        }
+                        if patch.values.iter().all(|&value| value <= 0.0) {
+                            continue;
+                        }
+                    }
                     patch.origin[0] += target.geometry.crop[0] as f64;
                     patch.origin[1] += target.geometry.crop[1] as f64;
                     spots.push(Spot {
@@ -818,7 +1226,7 @@ impl Plan {
             .patches
             .iter()
             .map(|patch| {
-                let size = (PATCH_SIDE - 1) as f64 * patch.spacing;
+                let size = (patch.side - 1) as f64 * patch.spacing;
                 let a = to_output(patch.origin[0], patch.origin[1]);
                 let b = to_output(patch.origin[0] + size, patch.origin[1] + size);
                 (
@@ -860,13 +1268,19 @@ impl Plan {
                         }
                         let raw_x = metadata.crop[0] as f64 + (sx as f64 + 0.5) * scale_x - 0.5;
                         let raw_y = metadata.crop[1] as f64 + (sy as f64 + 0.5) * scale_y - 0.5;
-                        *gain += bilinear(
+                        let measured = bilinear(
                             &patch.values,
-                            PATCH_SIDE,
-                            PATCH_SIDE,
+                            patch.side,
+                            patch.side,
                             (raw_x - patch.origin[0]) / patch.spacing,
                             (raw_y - patch.origin[1]) / patch.spacing,
                         );
+                        // Extra estimates may include compact shadows already covered above.
+                        if patch.irregular {
+                            *gain = gain.max(measured);
+                        } else {
+                            *gain += measured;
+                        }
                     }
                 }
                 let (mut changed, mut clipped, mut maximum) = (0usize, 0usize, 1.0f64);

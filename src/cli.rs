@@ -194,6 +194,13 @@ pub struct Cli {
 
     #[arg(
         long,
+        visible_aliases = ["fdx", "fix-dust-extra"],
+        help = "Also detect enclosed irregular dirt/curved fibers; implies --fix-dirty; default off; requires recurring shape evidence and a smooth surrounding ring"
+    )]
+    pub fix_dirty_extra: bool,
+
+    #[arg(
+        long,
         visible_alias = "fdl",
         num_args = 1..,
         action = clap::ArgAction::Append,
@@ -650,6 +657,9 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "mc",
         "fix-dirty",
         "fd",
+        "fix-dirty-extra",
+        "fix-dust-extra",
+        "fdx",
         "noise-reduction",
         "nr",
         "func-clip",
@@ -871,7 +881,11 @@ struct FileOutcome {
 }
 
 fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<Vec<dirty::Plan>>> {
-    if !cli.fix_dirty && cli.fix_dirty_list.is_empty() && cli.fix_dust_strength.is_none() {
+    if !cli.fix_dirty
+        && !cli.fix_dirty_extra
+        && cli.fix_dirty_list.is_empty()
+        && cli.fix_dust_strength.is_none()
+    {
         return Ok(None);
     }
     let separate = (!cli.fix_dirty_list.is_empty())
@@ -901,8 +915,8 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
     }
     let completed = AtomicUsize::new(0);
     let results = process_files(paths.len(), threads, usize::from(cli.jobs), |index| {
-        let result =
-            raw::decode(paths[index], cli.no_crop).and_then(|image| dirty::analyze(&image));
+        let result = raw::decode(paths[index], cli.no_crop)
+            .and_then(|image| dirty::analyze_with_extra(&image, cli.fix_dirty_extra));
         if !cli.silent {
             let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(

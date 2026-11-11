@@ -393,6 +393,13 @@ discovery; it implies `--fix-dirty` and can be repeated. Put target inputs befor
 this variadic option. Overlapping inputs are analyzed once; reference-only files
 produce no outputs and target-only files do not contribute detection votes.
 
+`--fix-dirty-extra` (`-fdx`, also `--fix-dust-extra`) additionally detects enclosed
+irregular shadows such as curved fibers, in both mono and color modes. It implies
+`--fix-dirty`; ordinary `-fd` remains unchanged. Extra shapes need independent
+recurrence and a smooth surrounding ring. Overlapping extra estimates do not
+multiply corrections already supplied by compact spots. Extra correction is
+also limited by local shape agreement in three independent reference views.
+
 `--fix-dust-strength` (`-fix-dust-strength`, `-fds`) accepts a finite value from
 0 to 2 and implies `--fix-dirty`. The default is 1, preserving the normal
 correction amount; 0 still analyzes the batch but leaves pixels unchanged.
@@ -411,9 +418,9 @@ do not provide independent support. Varied scenes with smooth, adequately expose
 areas are more useful than repeated shots of the same view. Recorded aperture,
 APEX aperture and lens identifiers do not determine the correction.
 
-The detector looks for compact, recurring dark shadows, rejecting textured
-patches and chance positional matches. Spatially distributed proposals keep
-strong foreground texture from crowding out faint sky shadows. Each target
+The detector looks for compact, recurring dark shadows, rejecting textured patches
+and chance positional matches. Spatially distributed proposals keep strong foreground
+texture from crowding out faint sky shadows. Each target
 supplies its own measured shadow shape and strength; confirmed positions without
 a reliable local estimate are left alone. A smooth, feathered local illumination
 correction brightens black-subtracted samples before histogram, clipping and tone processing. Gains
@@ -481,6 +488,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--max-color`, `-mc` | Make final RGB more vivid at gamut-safe level 1; default off; requires `--color`; before channel selection, companions unchanged |
 | `--max-color-level N`, `-mcl N` | Vivid-color level 0..2; implies `--max-color`; 0 is unchanged, >1 exaggerates channel separation; conflicts with `--analyze` |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
+| `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers; opt-in; implies `--fix-dirty`; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |
 | `--noise-reduction`, `-nr` | Enable measured-noise, edge-preserving RAW denoising at level 1; default off; mono and color |

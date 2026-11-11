@@ -45,6 +45,30 @@ fn scene(index: usize, dust: bool) -> Dng {
     image
 }
 
+fn curved_scene(index: usize, center: Option<(f64, f64)>) -> Dng {
+    let mut image = scene(index, false);
+    image.crop = Some([12, 8, 601, 451]);
+    if let Some((cx, cy)) = center {
+        let (sin, cos) = 0.55f64.sin_cos();
+        let sigma = 2.8 + (index % 3) as f64 * 0.3;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let dx = f64::from(x / 2 * 2) + 0.5 - cx;
+                let dy = f64::from(y / 2 * 2) + 0.5 - cy;
+                let (u, v) = (cos * dx + sin * dy, -sin * dx + cos * dy);
+                let t = u.clamp(-28.0, 28.0);
+                let r2 = ((u - t).powi(2) + (v - 0.018 * (t * t - 250.0)).powi(2)) / sigma.powi(2);
+                let gain = (-(0.18 + index as f64 * 0.02) * (-0.5 * r2).exp()).exp();
+                let pixel = &mut image.pixels[(y * image.width + x) as usize];
+                *pixel = (f64::from(image.black)
+                    + (f64::from(*pixel) - f64::from(image.black)) * gain)
+                    .round() as u16;
+            }
+        }
+    }
+    image
+}
+
 fn decode(root: &Path, name: &str, image: &Dng) -> MonoImage {
     let path = root.join(name);
     image.write(&path);
@@ -148,6 +172,387 @@ fn recurring_shadows_are_repaired_but_moving_scene_details_are_preserved() {
 }
 
 #[test]
+fn curved_recurring_shadows_are_repaired_in_mono_and_bayer_planes() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let mut source = curved_scene(index, Some((320.5, 160.5)));
+            source.orientation = [1, 6, 8, 3][index];
+            dirty::analyze_with_extra(
+                &decode(dir.path(), &format!("ref{index}.DNG"), &source),
+                true,
+            )
+            .unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let check = |original: &[u16], corrected: &[u16], clean: &[u16], report: &dirty::Report| {
+        let (mut before, mut after, mut changed) = (0u64, 0u64, 0usize);
+        for ((&original, &corrected), &clean) in original.iter().zip(corrected).zip(clean) {
+            if original.abs_diff(clean) > 20 {
+                before += u64::from(original.abs_diff(clean));
+                after += u64::from(corrected.abs_diff(clean));
+            }
+            assert!(corrected >= original);
+            changed += usize::from(original != corrected);
+        }
+        assert!(before > 5_000);
+        assert!(
+            (after as f64) < before as f64 * 0.2,
+            "curved shadow residual {after}/{before}; {report:?}"
+        );
+        assert!(changed < original.len() / 5);
+    };
+    for orientation in [1, 6] {
+        let mut source = curved_scene(0, Some((320.5, 160.5)));
+        let mut clean = curved_scene(0, None);
+        source.orientation = orientation;
+        clean.orientation = orientation;
+        let mut image = decode(dir.path(), "target.DNG", &source);
+        let expected = decode(dir.path(), "clean.DNG", &clean);
+        let original = image.pixels.clone();
+        let plan = calibration.plan(&dirty::analyze_with_extra(&image, true).unwrap());
+        plan.apply_with_strength(&mut image, 0.0).unwrap();
+        assert_eq!(image.pixels, original);
+        let report = plan.apply(&mut image).unwrap();
+        assert_eq!(report.clipped_samples, 0);
+        check(&original, &image.pixels, &expected.pixels, &report);
+
+        let channels = color::decode(&dir.path().join("target.DNG"), false, Green::Average, true)
+            .unwrap()
+            .channels;
+        let clean_channels =
+            color::decode(&dir.path().join("clean.DNG"), false, Green::Average, true)
+                .unwrap()
+                .channels;
+        for ((_, mut channel), (_, clean)) in channels.into_iter().zip(clean_channels) {
+            let original = channel.pixels.clone();
+            let report = plan.apply(&mut channel).unwrap();
+            assert_eq!(report.clipped_samples, 0);
+            check(&original, &channel.pixels, &clean.pixels, &report);
+        }
+    }
+}
+
+#[test]
+fn faint_curved_shadows_are_not_lost_when_large_proposals_dilute_their_contrast() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = Vec::new();
+    let mut clean_images = Vec::new();
+    for index in 0..4 {
+        let clean = curved_scene(index, None);
+        let mut source = curved_scene(index, Some((320.5, 160.5)));
+        let black = f64::from(source.black);
+        for (pixel, &clean) in source.pixels.iter_mut().zip(&clean.pixels) {
+            let light = f64::from(clean) - black;
+            let ratio = (f64::from(*pixel) - black) / light;
+            *pixel = (black + light * ratio.powf(0.2)).round() as u16;
+        }
+        images.push(decode(dir.path(), &format!("faint{index}.DNG"), &source));
+        clean_images.push(decode(dir.path(), &format!("clean{index}.DNG"), &clean));
+    }
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze_with_extra(image, true).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for ((image, clean), evidence) in images.iter_mut().zip(clean_images).zip(&evidence) {
+        let original = image.pixels.clone();
+        let report = calibration.plan(evidence).apply(image).unwrap();
+        let (mut before, mut after) = (0u64, 0u64);
+        for ((&original, &corrected), &clean) in
+            original.iter().zip(&image.pixels).zip(&clean.pixels)
+        {
+            if original.abs_diff(clean) > 20 {
+                before += u64::from(original.abs_diff(clean));
+                after += u64::from(corrected.abs_diff(clean));
+            }
+        }
+        assert!(before > 5_000);
+        assert!(
+            (after as f64) < before as f64 * 0.2,
+            "faint curved shadow residual {after}/{before}; {report:?}"
+        );
+    }
+}
+
+#[test]
+fn curved_shadow_confirmation_does_not_repair_clean_targets_or_moving_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixed: Vec<_> = (0..4)
+        .map(|index| {
+            dirty::analyze_with_extra(
+                &decode(
+                    dir.path(),
+                    &format!("fixed{index}.DNG"),
+                    &curved_scene(index, Some((320.5, 160.5))),
+                ),
+                true,
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut clean = decode(dir.path(), "clean.DNG", &curved_scene(0, None));
+    let before = clean.pixels.clone();
+    let report = Calibration::new(&fixed)
+        .unwrap()
+        .plan(&dirty::analyze_with_extra(&clean, true).unwrap())
+        .apply(&mut clean)
+        .unwrap();
+    assert_eq!(report.changed_samples, 0);
+    assert_eq!(clean.pixels, before);
+
+    let moving: Vec<_> = (0..4)
+        .map(|index| {
+            dirty::analyze_with_extra(
+                &decode(
+                    dir.path(),
+                    &format!("moving{index}.DNG"),
+                    &curved_scene(index, Some((170.5 + index as f64 * 90.0, 160.5))),
+                ),
+                true,
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut target = decode(
+        dir.path(),
+        "target.DNG",
+        &curved_scene(0, Some((170.5, 160.5))),
+    );
+    let before = target.pixels.clone();
+    let report = Calibration::new(&moving)
+        .unwrap()
+        .plan(&moving[0])
+        .apply(&mut target)
+        .unwrap();
+    assert_eq!(report.changed_samples, 0);
+    assert_eq!(target.pixels, before);
+}
+
+#[test]
+fn long_unenclosed_scene_lines_are_not_treated_as_curved_dirt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images: Vec<_> = (0..4)
+        .map(|index| {
+            let mut source = curved_scene(index, None);
+            for y in 0..source.height {
+                for x in 0..source.width {
+                    let px = f64::from(x / 2 * 2) + 0.5;
+                    let py = f64::from(y / 2 * 2) + 0.5;
+                    let distance = (py - 160.5 - 0.7 * (px - 320.5)) / 2.8;
+                    let gain = (-0.2 * (-0.5 * distance * distance).exp()).exp();
+                    let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                    *pixel = (f64::from(source.black)
+                        + (f64::from(*pixel) - f64::from(source.black)) * gain)
+                        .round() as u16;
+                }
+            }
+            decode(dir.path(), &format!("line{index}.DNG"), &source)
+        })
+        .collect();
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze_with_extra(image, true).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for (image, evidence) in images.iter_mut().zip(&evidence) {
+        let before = image.pixels.clone();
+        let report = calibration.plan(evidence).apply(image).unwrap();
+        assert_eq!(report.changed_samples, 0, "{report:?}");
+        assert_eq!(image.pixels, before);
+    }
+}
+
+#[test]
+fn extra_correction_preserves_one_view_details_joined_to_recurring_dirt() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = |index: usize, dust: bool| {
+        let mut source = curved_scene(index, dust.then_some((320.5, 160.5)));
+        if index == 0 {
+            for y in 0..source.height {
+                for x in 0..source.width {
+                    let px = f64::from(x / 2 * 2) + 0.5;
+                    let py = f64::from(y / 2 * 2) + 0.5;
+                    let r2 = ((px - 338.5).powi(2) + (py - 157.5).powi(2)) / 2.5f64.powi(2);
+                    let gain = (-0.12 * (-0.5 * r2).exp()).exp();
+                    let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                    *pixel = (f64::from(source.black)
+                        + (f64::from(*pixel) - f64::from(source.black)) * gain)
+                        .round() as u16;
+                }
+            }
+        }
+        source
+    };
+    let images: Vec<_> = (0..4)
+        .map(|index| {
+            decode(
+                dir.path(),
+                &format!("joined{index}.DNG"),
+                &fixture(index, true),
+            )
+        })
+        .collect();
+    let clean = decode(dir.path(), "clean.DNG", &fixture(0, false));
+    let evidence: Vec<_> = [0, 1, 2, 3, 0, 0, 0]
+        .into_iter()
+        .map(|index| dirty::analyze_with_extra(&images[index], true).unwrap())
+        .collect();
+    for references in [&evidence[..4], &evidence[..]] {
+        let mut target = raw::decode(&dir.path().join("joined0.DNG"), false).unwrap();
+        let original = target.pixels.clone();
+        let report = Calibration::new(references)
+            .unwrap()
+            .plan(&evidence[0])
+            .apply(&mut target)
+            .unwrap();
+        let (mut before, mut after, mut detail_samples) = (0u64, 0u64, 0usize);
+        for (i, ((&original, &corrected), &clean)) in original
+            .iter()
+            .zip(&target.pixels)
+            .zip(&clean.pixels)
+            .enumerate()
+        {
+            if original.abs_diff(clean) > 20 {
+                before += u64::from(original.abs_diff(clean));
+                after += u64::from(corrected.abs_diff(clean));
+            }
+            let x = i % target.metadata.width + target.metadata.crop[0];
+            let y = i / target.metadata.width + target.metadata.crop[1];
+            if (337..=341).contains(&x) && (155..=159).contains(&y) {
+                detail_samples += 1;
+                assert!(
+                    corrected.abs_diff(clean) <= 20,
+                    "one-view scene detail was brightened at {x},{y}: {corrected} vs {clean}; {report:?}"
+                );
+            }
+        }
+        assert_eq!(detail_samples, 25);
+        assert!(before > 5_000);
+        assert!(
+            (after as f64) < before as f64 * 0.2,
+            "recurring curve residual {after}/{before}; {report:?}"
+        );
+        assert_eq!(report.clipped_samples, 0);
+    }
+}
+
+#[test]
+fn unconfirmed_extra_shapes_neither_hide_compact_dirt_nor_borrow_its_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let images: Vec<_> = (0..3)
+        .map(|index| {
+            let mut source = scene(index, true);
+            if index == 0 {
+                let clean = scene(index, false);
+                let curved = curved_scene(index, Some((215.5, 160.5)));
+                let black = f64::from(source.black);
+                for ((pixel, &curved), &clean) in source
+                    .pixels
+                    .iter_mut()
+                    .zip(&curved.pixels)
+                    .zip(&clean.pixels)
+                {
+                    let gain = ((f64::from(curved) - black) / (f64::from(clean) - black)).powf(0.4);
+                    *pixel = (black + (f64::from(*pixel) - black) * gain).round() as u16;
+                }
+            }
+            decode(dir.path(), &format!("nearby{index}.DNG"), &source)
+        })
+        .collect();
+    let ordinary: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze(image).unwrap())
+        .collect();
+    let extra: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze_with_extra(image, true).unwrap())
+        .collect();
+    let ordinary_calibration = Calibration::new(&ordinary).unwrap();
+    let extra_calibration = Calibration::new(&extra).unwrap();
+    for (index, (ordinary, extra)) in ordinary.iter().zip(&extra).enumerate() {
+        let input = dir.path().join(format!("nearby{index}.DNG"));
+        let mut expected = raw::decode(&input, false).unwrap();
+        let ordinary_report = ordinary_calibration
+            .plan(ordinary)
+            .apply(&mut expected)
+            .unwrap();
+        assert_eq!(ordinary_report.spots.len(), 2, "{ordinary_report:?}");
+        let mut actual = raw::decode(&input, false).unwrap();
+        let extra_report = extra_calibration.plan(extra).apply(&mut actual).unwrap();
+        assert_eq!(extra_report.spots.len(), 2, "{extra_report:?}");
+        assert!(
+            actual.pixels == expected.pixels,
+            "extra mode changed unconfirmed shape or lost compact correction in frame {index}: {extra_report:?}"
+        );
+    }
+}
+
+#[test]
+fn curved_dirt_near_a_scene_edge_uses_its_enclosing_shape_not_a_large_circle() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = |index: usize, dust: bool| {
+        let mut source = curved_scene(index, dust.then_some((320.5, 160.5)));
+        for y in 202..source.height {
+            for x in 0..source.width {
+                let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                *pixel = (f64::from(source.black)
+                    + (f64::from(*pixel) - f64::from(source.black)) * 0.45)
+                    .round() as u16;
+            }
+        }
+        source
+    };
+    let mut images: Vec<_> = (0..4)
+        .map(|index| {
+            decode(
+                dir.path(),
+                &format!("edge{index}.DNG"),
+                &fixture(index, true),
+            )
+        })
+        .collect();
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze_with_extra(image, true).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for (index, (image, evidence)) in images.iter_mut().zip(&evidence).enumerate() {
+        let clean = decode(
+            dir.path(),
+            &format!("clean{index}.DNG"),
+            &fixture(index, false),
+        );
+        let original = image.pixels.clone();
+        let report = calibration.plan(evidence).apply(image).unwrap();
+        let (mut before, mut after) = (0u64, 0u64);
+        for (i, ((&original, &corrected), &clean)) in original
+            .iter()
+            .zip(&image.pixels)
+            .zip(&clean.pixels)
+            .enumerate()
+        {
+            if original.abs_diff(clean) > 20 {
+                before += u64::from(original.abs_diff(clean));
+                after += u64::from(corrected.abs_diff(clean));
+            }
+            let x = (i % image.metadata.width) as f64 + image.metadata.crop[0] as f64;
+            let y = (i / image.metadata.width) as f64 + image.metadata.crop[1] as f64;
+            if (x - 320.5).hypot(y - 160.5) > 75.0 {
+                assert_eq!(corrected, original, "scene changed away from hair");
+            }
+        }
+        assert!(before > 5_000);
+        assert!(
+            (after as f64) < before as f64 * 0.2,
+            "near-edge curve {index} residual {after}/{before}; {report:?}"
+        );
+        assert_eq!(report.clipped_samples, 0);
+    }
+}
+
+#[test]
 fn clean_targets_duplicates_and_insufficient_evidence_are_noops() {
     let dir = tempfile::tempdir().unwrap();
     let evidence = references(dir.path(), None);
@@ -187,6 +592,56 @@ fn clean_targets_duplicates_and_insufficient_evidence_are_noops() {
         assert_eq!(target.pixels, before);
     }
     assert!(Calibration::new(&[]).is_err());
+}
+
+#[test]
+fn extra_correction_recovers_annular_dust_without_losing_its_separate_center_dot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = Vec::new();
+    let mut clean_images = Vec::new();
+    for index in 0..4 {
+        let clean = scene(index, false);
+        let mut source = scene(index, false);
+        for y in 0..source.height {
+            for x in 0..source.width {
+                let px = f64::from(x / 2 * 2) + 0.5;
+                let py = f64::from(y / 2 * 2) + 0.5;
+                let radius = (px - 320.5).hypot(py - 160.5);
+                let shadow = 0.25 * (-0.5 * ((radius - 20.0) / 2.8).powi(2)).exp()
+                    + 0.18 * (-0.5 * (radius / 2.0).powi(2)).exp();
+                let pixel = &mut source.pixels[(y * source.width + x) as usize];
+                *pixel = (f64::from(source.black)
+                    + (f64::from(*pixel) - f64::from(source.black)) * (-shadow).exp())
+                .round() as u16;
+            }
+        }
+        images.push(decode(dir.path(), &format!("ring{index}.DNG"), &source));
+        clean_images.push(decode(dir.path(), &format!("clean{index}.DNG"), &clean));
+    }
+    let evidence: Vec<_> = images
+        .iter()
+        .map(|image| dirty::analyze_with_extra(image, true).unwrap())
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    for ((image, clean), evidence) in images.iter_mut().zip(clean_images).zip(&evidence) {
+        let original = image.pixels.clone();
+        let report = calibration.plan(evidence).apply(image).unwrap();
+        let (mut before, mut after) = (0u64, 0u64);
+        for ((&original, &corrected), &clean) in
+            original.iter().zip(&image.pixels).zip(&clean.pixels)
+        {
+            if original.abs_diff(clean) > 20 {
+                before += u64::from(original.abs_diff(clean));
+                after += u64::from(corrected.abs_diff(clean));
+            }
+        }
+        assert!(before > 5_000);
+        assert!(
+            (after as f64) < before as f64 * 0.2,
+            "annular shadow residual {after}/{before}; {report:?}"
+        );
+        assert_eq!(report.clipped_samples, 0);
+    }
 }
 
 #[test]
@@ -474,7 +929,21 @@ fn cli_aliases_and_separate_reference_lists_parse_without_changing_other_flags()
     for flag in ["-fd", "--fd", "-fix-dirty", "--fix-dirty"] {
         let cli = parse(&[flag]).unwrap();
         assert!(cli.fix_dirty);
+        assert!(!cli.fix_dirty_extra);
         assert!(cli.fix_dirty_list.is_empty());
+        assert_eq!(cli.inputs, [PathBuf::from("target.ARW")]);
+    }
+    for flag in [
+        "-fdx",
+        "--fdx",
+        "-fix-dirty-extra",
+        "--fix-dirty-extra",
+        "-fix-dust-extra",
+        "--fix-dust-extra",
+    ] {
+        let cli = parse(&[flag, "-c", "-nc", "-nr", "-fds", "1.25"]).unwrap();
+        assert!(cli.fix_dirty_extra && cli.color && cli.natural_color && cli.noise_reduction);
+        assert_eq!(cli.fix_dust_strength, Some(1.25));
         assert_eq!(cli.inputs, [PathBuf::from("target.ARW")]);
     }
     for flag in ["-fdl", "--fdl", "-fix-dirty-list", "--fix-dirty-list"] {
@@ -497,9 +966,52 @@ fn cli_aliases_and_separate_reference_lists_parse_without_changing_other_flags()
         assert!(parse(&[flag]).is_err());
     }
     assert!(parse(&["--fix-dirty=true"]).is_err());
+    assert!(parse(&["--fix-dirty-extra=true"]).is_err());
     assert!(parse(&["-func", "-fd"]).unwrap().function.as_deref() == Some("-fd"));
-    let cli = parse(&["--", "-fd", "-fdl"]).unwrap();
-    assert!(!cli.fix_dirty && cli.fix_dirty_list.is_empty());
+    let cli = parse(&["-func", "-fdx"]).unwrap();
+    assert_eq!(cli.function.as_deref(), Some("-fdx"));
+    assert!(!cli.fix_dirty_extra);
+    let cli = parse(&["--", "-fd", "-fdl", "-fdx"]).unwrap();
+    assert!(!cli.fix_dirty && !cli.fix_dirty_extra && cli.fix_dirty_list.is_empty());
+}
+
+#[test]
+fn extra_cli_is_opt_in_and_enables_correction_for_mono_and_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs = dir.path().join("references");
+    fs::create_dir(&refs).unwrap();
+    for index in 0..4 {
+        curved_scene(index, Some((320.5, 160.5))).write(&refs.join(format!("curve{index}.DNG")));
+    }
+    let output = dir.path().join("output");
+    for color in [false, true] {
+        for flags in [&["-fd"][..], &["-fdx"], &["-fdx", "-fds", "0"]] {
+            let mut invocation = command(&refs, &output);
+            invocation.args(["--analyze", "--silent"]).args(flags);
+            if color {
+                invocation.args(["-c", "-4"]);
+            }
+            let result = success(invocation.output().unwrap());
+            let reports: Vec<serde_json::Value> = String::from_utf8(result.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(reports.len(), 4);
+            for report in reports {
+                let dirt = &report["dirty_correction"];
+                assert_eq!(dirt["reference_images"], 4);
+                assert_eq!(dirt["clipped_samples"], 0);
+                let changed = dirt["changed_samples"].as_u64().unwrap();
+                if flags == ["-fdx"] {
+                    assert!(changed > 100, "{report}");
+                } else {
+                    assert_eq!(changed, 0, "{report}");
+                }
+            }
+        }
+    }
+    assert!(!output.exists());
 }
 
 #[test]
@@ -870,6 +1382,58 @@ fn original_sony_dust_is_not_crowded_out_by_textured_foreground() {
             plan.report
         );
         assert!(plan.apply(&mut image).unwrap().changed_samples > 0);
+    }
+}
+
+#[test]
+#[ignore = "set DNG_DIRTY_UVFS_SAMPLES to Sony 20261110-UVFS/ARW; optionally DNG_DIRTY_BINARY"]
+fn original_uvfs_sony_extra_correction_recovers_the_broad_recurring_shadow() {
+    let root = PathBuf::from(std::env::var_os("DNG_DIRTY_UVFS_SAMPLES").unwrap());
+    let binary = std::env::var_os("DNG_DIRTY_BINARY").unwrap_or_else(|| OsString::from(BIN));
+    let inputs = dng_monochrome::cli::discover(std::slice::from_ref(&root)).unwrap();
+    let targets = [root.join("DSC01990.ARW"), root.join("DSC01992.ARW")];
+    let output = success(
+        Command::new(binary)
+            .args(&targets)
+            .args([
+                "-c",
+                "-fdx",
+                "--analyze",
+                "--threads",
+                "2",
+                "--jobs",
+                "1",
+                "-fdl",
+            ])
+            .args(inputs.iter().map(|input| &input.path))
+            .output()
+            .unwrap(),
+    );
+    let reports: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(reports.len(), targets.len());
+    for target in targets {
+        let report = reports
+            .iter()
+            .find(|report| report["source"].as_str() == target.to_str())
+            .unwrap();
+        let dirty = &report["dirty_correction"];
+        assert!(
+            dirty["spots"].as_array().unwrap().iter().any(|spot| {
+                (spot["sensor_x"].as_f64().unwrap() - 1570.0)
+                    .hypot(spot["sensor_y"].as_f64().unwrap() - 1230.0)
+                    < 60.0
+                    && spot["radius_sigma"].as_f64().unwrap() >= 25.0
+                    && spot["maximum_gain"].as_f64().unwrap() > 1.05
+                    && spot["distinct_views"].as_u64().unwrap() >= 3
+            }),
+            "{}: broad recurring shadow has no confirmed correction",
+            target.display()
+        );
+        assert_eq!(dirty["clipped_samples"], 0);
     }
 }
 
