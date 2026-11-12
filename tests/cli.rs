@@ -250,6 +250,7 @@ fn help_version_and_missing_arguments() {
             "--fix-dirty",
             "--fix-dirty-list",
             "--fix-dirty-save",
+            "--fix-dirty-compression",
             "--fix-dirty-load",
             "--fix-dust-strength",
             "--noise-reduction",

@@ -1265,10 +1265,10 @@ impl Calibration {
             .iter()
             .find(|group| group.geometry == target.geometry);
         // Stacked shadows need the same three independent views as every other one.
-        let fields = if group.is_some_and(|group| group.distinct_views >= 3) {
+        let (fields, further) = if group.is_some_and(|group| group.distinct_views >= 3) {
             self.stack_fields(target, position)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let sensor = |x: f64, y: f64| {
             (
@@ -1282,7 +1282,14 @@ impl Calibration {
         if let Some(group) = group {
             for candidate in &target.candidates {
                 let (x, y) = sensor(candidate.x, candidate.y);
-                if fields.iter().any(|field| field.covers(x, y)) {
+                // A stacked field replaces the fitted shadow it covers, unless it accounts
+                // for less than half of it: such a field came from views that render this
+                // dirt far more faintly than the target does.
+                let fitted = candidate.patch.values.iter().copied().fold(0.0, f32::max);
+                if fields.iter().any(|field| {
+                    field.covers(x, y)
+                        && field.gain.iter().copied().fold(0.0, f32::max) >= 0.5 * fitted
+                }) {
                     continue;
                 }
                 if let Some(confirmed) = group
@@ -1401,23 +1408,10 @@ impl Calibration {
         // resolution.
         let step = target.step as f64;
         let mut fields = fields;
-        for field in &mut fields {
-            field.spot = Some(spots.len());
-            let (sensor_x, sensor_y) = sensor(field.center[0], field.center[1]);
-            spots.push(Spot {
-                sensor_x,
-                sensor_y,
-                radius_sigma: (field.area as f64 / std::f64::consts::PI).sqrt() * step,
-                supporting_images: field.views,
-                distinct_views: field.views,
-                fit_error: field.error,
-                maximum_gain: f64::from(field.gain.iter().copied().fold(0.0, f32::max)).exp(),
-            });
-        }
-        let stacked_regions = fields.len();
         // The same dirt is small and sharp stopped down and broad and soft wide open, so a
         // target may show confirmed dirt in a shape none of its candidates matched: there
         // the target is measured where the references place the dirt.
+        let mut measured: Vec<Field> = Vec::new();
         if let (Some(group), Some(own)) = (group, &target.stack) {
             let planned = |x: f64, y: f64| -> f64 {
                 let mut gain = 0.0;
@@ -1436,51 +1430,73 @@ impl Calibration {
                 }
                 gain
             };
-            let measured: Vec<Field> = group
+            let found: Vec<Field> = group
                 .spots
                 .par_iter()
                 .filter(|spot| !matched.iter().any(|other| std::ptr::eq(*other, *spot)))
                 .filter_map(|spot| Field::at_spot(spot, target, own, &planned).ok())
                 .collect();
-            for mut field in measured {
+            for field in found {
                 let (sensor_x, sensor_y) = sensor(field.center[0], field.center[1]);
                 // Several confirmed shapes of one piece of dirt measure the same shadow.
-                if fields[stacked_regions..]
+                if !measured
                     .iter()
                     .any(|other| other.covers(sensor_x, sensor_y))
                 {
-                    continue;
+                    measured.push(field);
                 }
-                field.spot = Some(spots.len());
-                spots.push(Spot {
-                    sensor_x,
-                    sensor_y,
-                    radius_sigma: (field.area as f64 / std::f64::consts::PI).sqrt() * step,
-                    supporting_images: field.views,
-                    distinct_views: field.views,
-                    fit_error: field.error,
-                    maximum_gain: f64::from(field.gain.iter().copied().fold(0.0, f32::max)).exp(),
-                });
-                fields.push(field);
             }
         }
         let mut compact = Vec::new();
+        let mut fitted = Vec::new();
         for (spot, patch) in patches.into_iter().enumerate() {
             if patch.irregular {
-                fields.push(Field::from_patch(patch, step, Some(spot)));
+                fitted.push(Field::from_patch(patch, step, Some(spot)));
             } else {
                 compact.push(patch);
             }
         }
         let patches = compact;
-        if target.stack.is_some() {
+        if let Some(own) = &target.stack {
             // Extra mode also refines compact shadows, which stay additive patches.
-            fields.extend(
+            fitted.extend(
                 patches
                     .iter()
                     .map(|patch| Field::from_patch(patch.clone(), step, None)),
             );
+            // The further stacks rest on fewer views or on one side of the target only.
+            // They fill what nothing above corrects and never replace a shadow fitted or
+            // measured on the target itself.
+            for (frames, regions, similar) in &further {
+                let found: Vec<Field> = regions
+                    .par_iter()
+                    .filter(|region| {
+                        ![&fields, &measured, &fitted]
+                            .iter()
+                            .any(|fields| region.covered(target, fields))
+                    })
+                    .filter_map(|region| Field::new(region, frames, target, own, *similar).ok())
+                    .collect();
+                fields.extend(found);
+            }
         }
+        // Stacked fields lead the plan; the report counts them.
+        let stacked_regions = fields.len();
+        fields.extend(measured);
+        for field in &mut fields {
+            field.spot = Some(spots.len());
+            let (sensor_x, sensor_y) = sensor(field.center[0], field.center[1]);
+            spots.push(Spot {
+                sensor_x,
+                sensor_y,
+                radius_sigma: (field.area as f64 / std::f64::consts::PI).sqrt() * step,
+                supporting_images: field.views,
+                distinct_views: field.views,
+                fit_error: field.error,
+                maximum_gain: f64::from(field.gain.iter().copied().fold(0.0, f32::max)).exp(),
+            });
+        }
+        fields.extend(fitted);
         let warning = if group.is_none() {
             Some("no matching reference sensor geometry/crop; pixels are unchanged")
         } else if group.is_some_and(|group| group.distinct_views < 3) {
@@ -2275,6 +2291,17 @@ impl Region {
             .collect()
     }
 
+    // Whether one of the fields already corrects part of the shadow's core on the target.
+    fn covered(&self, target: &Evidence, fields: &[Field]) -> bool {
+        let [x0, y0, w, _] = self.window;
+        let step = target.step as f64;
+        (0..self.core.len()).any(|i| {
+            let raw_x = target.geometry.crop[0] as f64 + ((x0 + i % w) as f64 + 0.5) * step - 0.5;
+            let raw_y = target.geometry.crop[1] as f64 + ((y0 + i / w) as f64 + 0.5) * step - 0.5;
+            self.core[i] && fields.iter().any(|field| field.covers(raw_x, raw_y))
+        })
+    }
+
     fn template(&self, median: &[f32]) -> Vec<f32> {
         median
             .iter()
@@ -2947,12 +2974,21 @@ impl Field {
     }
 }
 
+// Views of a further stack, the isolated shadows of that stack and whether the views were
+// matched to the target's dust rendering.
+type Further<'a> = (Vec<&'a [i16]>, Vec<Region>, bool);
+
 impl Calibration {
     // Stack the nearest distinct reference views with the target's dust rendering and keep
-    // the isolated shadows that the target itself confirms.
-    fn stack_fields(&self, target: &Evidence, position: Option<usize>) -> Vec<Field> {
+    // the isolated shadows that the target itself confirms. The further stacks come back
+    // unjudged: they may only fill what the whole plan leaves uncorrected.
+    fn stack_fields(
+        &self,
+        target: &Evidence,
+        position: Option<usize>,
+    ) -> (Vec<Field>, Vec<Further<'_>>) {
         let Some(own) = &target.stack else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let width = target.width;
         let position = position
@@ -2989,75 +3025,124 @@ impl Calibration {
             }
         }
         if pool.len() < STACK_MIN_VIEWS {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let nearest: Vec<&[i16]> = pool
             .iter()
             .take(STACK_VIEWS)
             .map(|frame| frame.data.as_slice())
             .collect();
+        // A session may border on one shot through another aperture or filter, which shares
+        // none of its shadows, so the nearest views of either side are stacked alone too.
+        let side = |earlier: bool| -> Vec<&[i16]> {
+            pool.iter()
+                .filter(|frame| (frame.index < position) == earlier)
+                .take(STACK_VIEWS)
+                .map(|frame| frame.data.as_slice())
+                .collect()
+        };
+        let (before, after) = (side(true), side(false));
+        let same = |a: &[&[i16]], b: &[&[i16]]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| std::ptr::eq(a.as_ptr(), b.as_ptr()))
+        };
         // A long reference list surrounds a short session with frames of other apertures
-        // that dilute its shadows, so the closest half is stacked on its own as well.
-        let closest = &nearest[..nearest.len().min(STACK_VIEWS / 2)];
-        let stacks: Vec<(&[&[i16]], Vec<Region>)> = [nearest.as_slice(), closest]
+        // that dilute its shadows, so the closest half of each is stacked on its own as well.
+        let mut sets: Vec<&[&[i16]]> = Vec::new();
+        let mut around = 0;
+        for (side, frames) in [&nearest, &before, &after].into_iter().enumerate() {
+            for frames in [
+                frames.as_slice(),
+                &frames[..frames.len().min(STACK_VIEWS / 2)],
+            ] {
+                if frames.len() >= STACK_MIN_VIEWS && !sets.iter().any(|set| same(set, frames)) {
+                    sets.push(frames);
+                }
+            }
+            if side == 0 {
+                around = sets.len();
+            }
+        }
+        let mut stacks: Vec<(&[&[i16]], Vec<Region>)> = sets
             .into_iter()
-            .take(if closest.len() < nearest.len() { 2 } else { 1 })
             .map(|frames| {
                 let regions = StackMap::new(frames, width).regions(width, target.height);
                 (frames, regions)
             })
             .collect();
-        // The stack that shows more shadows also judges their depth best.
-        let guide = stacks
-            .iter()
-            .map(|(_, regions)| regions)
-            .max_by_key(|regions| regions.len())
-            .expect("at least one stack");
-        let mut fields: Vec<Field> = Vec::new();
-        if let Some(reference) = stack_contrast(own, guide, width).filter(|value| *value > 0.2) {
+        // The views whose shadows are as deep as the target's, judged on the stack of a
+        // group that shows the most shadows.
+        let similar = |stacks: &[(&[&[i16]], Vec<Region>)]| -> Vec<&[i16]> {
+            let Some(guide) = stacks
+                .iter()
+                .map(|(_, regions)| regions)
+                .max_by_key(|regions| regions.len())
+            else {
+                return Vec::new();
+            };
+            let Some(reference) = stack_contrast(own, guide, width).filter(|value| *value > 0.2)
+            else {
+                return Vec::new();
+            };
             let contrasts: Vec<Option<f64>> = pool
                 .par_iter()
                 .map(|frame| stack_contrast(&frame.data, guide, width))
                 .collect();
-            let similar: Vec<&[i16]> = pool
-                .iter()
+            pool.iter()
                 .zip(contrasts)
                 .filter(|(_, contrast)| {
                     contrast.is_some_and(|value| (0.7..=1.43).contains(&(value / reference)))
                 })
                 .take(STACK_VIEWS)
                 .map(|(frame, _)| frame.data.as_slice())
-                .collect();
-            if similar.len() >= STACK_MIN_VIEWS {
-                fields = StackMap::new(&similar, width)
-                    .regions(width, target.height)
-                    .par_iter()
-                    .filter_map(|region| Field::new(region, &similar, target, own, true).ok())
-                    .collect();
-            }
-        }
-        // Shadows seen by too few aperture-matched views may still be measurable directly.
-        let step = target.step as f64;
-        for (frames, regions) in &stacks {
+                .collect()
+        };
+        let mut fields: Vec<Field> = Vec::new();
+        let mut keep = |frames: &[&[i16]], regions: &[Region], matched: bool| {
+            // A later stack only adds shadows that no earlier field covers.
             let rest: Vec<Field> = regions
                 .par_iter()
-                .filter(|region| {
-                    let [x0, y0, w, _] = region.window;
-                    !(0..region.core.len()).any(|i| {
-                        let raw_x = target.geometry.crop[0] as f64
-                            + ((x0 + i % w) as f64 + 0.5) * step
-                            - 0.5;
-                        let raw_y = target.geometry.crop[1] as f64
-                            + ((y0 + i / w) as f64 + 0.5) * step
-                            - 0.5;
-                        region.core[i] && fields.iter().any(|field| field.covers(raw_x, raw_y))
-                    })
-                })
-                .filter_map(|region| Field::new(region, frames, target, own, false).ok())
+                .filter(|region| !region.covered(target, &fields))
+                .filter_map(|region| Field::new(region, frames, target, own, matched).ok())
                 .collect();
             fields.extend(rest);
+        };
+        let regions = |frames: &[&[i16]]| -> Vec<Region> {
+            if frames.len() < STACK_MIN_VIEWS {
+                Vec::new()
+            } else {
+                StackMap::new(frames, width).regions(width, target.height)
+            }
+        };
+        let both = similar(&stacks[..around]);
+        keep(&both, &regions(&both), true);
+        // Shadows seen by too few aperture-matched views may still be measurable directly.
+        for (frames, regions) in &stacks[..around] {
+            keep(frames, regions, false);
         }
-        fields
+        // The proxy also admits views of other apertures, and a neighboring session may
+        // dilute every stack around the target. What is still missing then may come from
+        // the nearer half of the matched views, from the views matched on a one-sided stack
+        // and from the one-sided stacks themselves.
+        let one = similar(&stacks[around..]);
+        let mut tried: Vec<&[&[i16]]> = vec![&both];
+        let mut further: Vec<Further> = Vec::new();
+        for frames in [
+            &both[..both.len().div_ceil(2)],
+            one.as_slice(),
+            &one[..one.len().div_ceil(2)],
+        ] {
+            if !tried.iter().any(|other| same(other, frames)) {
+                tried.push(frames);
+                further.push((frames.to_vec(), regions(frames), true));
+            }
+        }
+        for (frames, regions) in stacks.drain(around..) {
+            further.push((frames.to_vec(), regions, false));
+        }
+        (fields, further)
     }
 }
 
@@ -3244,12 +3329,88 @@ const SAVED_MAGIC: &[u8; 8] = b"DNGMFDL\0";
 const SAVED_VERSION: u32 = 1;
 const SAVED_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const SAVED_DAMAGED: &str = "saved sensor-dirt data is damaged";
+const SAVED_EARLY: &str = "saved sensor-dirt data ends early or cannot be read";
 
 // FNV-1a.
 fn saved_hash(hash: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(hash, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+fn residual_hash(data: &[i16]) -> u64 {
+    data.iter().fold(SAVED_SEED, |hash, value| {
+        saved_hash(hash, &value.to_le_bytes())
+    })
+}
+
+// What a residual map is predicted to hold at cell `i`: the mean of the cells to its left
+// and above, zero beyond the edges.
+fn predicted(values: impl Fn(usize) -> i32, i: usize, width: usize) -> i32 {
+    let left = if i.is_multiple_of(width) {
+        0
+    } else {
+        values(i - 1)
+    };
+    let above = if i >= width { values(i - width) } else { 0 };
+    (left + above) >> 1
+}
+
+// Residual maps are scene texture and grain, which xz barely shortens as they are. With
+// each cell predicted from its neighbors, and the tile flags and the two byte planes of
+// the prediction errors kept apart, it nearly halves them.
+fn pack(data: &[i16], width: usize, level: u32) -> Result<Vec<u8>> {
+    let count = data.len();
+    let mut payload = vec![0u8; count.div_ceil(8) + 2 * count];
+    let (flags, planes) = payload.split_at_mut(count.div_ceil(8));
+    let (high, low) = planes.split_at_mut(count);
+    let value = |i: usize| i32::from(data[i] >> 1);
+    for i in 0..count {
+        flags[i / 8] |= (data[i] as u8 & 1) << (i % 8);
+        let error = value(i) - predicted(value, i, width);
+        let folded = ((error << 1) ^ (error >> 31)) as u16;
+        high[i] = (folded >> 8) as u8;
+        low[i] = folded as u8;
+    }
+    let mut options = xz2::stream::LzmaOptions::new_preset(level)
+        .ok()
+        .context("unsupported sensor-dirt compression level")?;
+    if level > 6 {
+        // A map is a few megabytes: the larger dictionaries of the highest presets would
+        // only cost each thread hundreds of megabytes.
+        options.dict_size(8 << 20);
+    }
+    let mut filters = xz2::stream::Filters::new();
+    filters.lzma2(&options);
+    let stream = xz2::stream::Stream::new_stream_encoder(&filters, xz2::stream::Check::Crc64)
+        .ok()
+        .context("unsupported sensor-dirt compression level")?;
+    let mut encoder = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    encoder
+        .write_all(&payload)
+        .and_then(|()| encoder.finish())
+        .context("compressing sensor-dirt data")
+}
+
+fn unpack(packed: &[u8], width: usize, count: usize) -> Result<Vec<i16>> {
+    let length = count.div_ceil(8) + 2 * count;
+    let mut payload = Vec::with_capacity(length);
+    xz2::read::XzDecoder::new(packed)
+        .take(length as u64 + 1)
+        .read_to_end(&mut payload)
+        .ok()
+        .context(SAVED_DAMAGED)?;
+    ensure!(payload.len() == length, SAVED_DAMAGED);
+    let (flags, planes) = payload.split_at(count.div_ceil(8));
+    let (high, low) = planes.split_at(count);
+    let mut data = vec![0i16; count];
+    for i in 0..count {
+        let folded = i32::from(u16::from_be_bytes([high[i], low[i]]));
+        let error = (folded >> 1) ^ -(folded & 1);
+        let value = error + predicted(|i| i32::from(data[i] >> 1), i, width);
+        data[i] = ((value << 1) | i32::from(flags[i / 8] >> (i % 8) & 1)) as i16;
+    }
+    Ok(data)
 }
 
 struct Encoder<W> {
@@ -3260,6 +3421,11 @@ struct Encoder<W> {
 impl<W: Write> Encoder<W> {
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.hash = saved_hash(self.hash, bytes);
+        self.raw(bytes)
+    }
+
+    // Bytes that carry their own seal.
+    fn raw(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer
             .write_all(bytes)
             .context("writing sensor-dirt data")
@@ -3372,12 +3538,24 @@ impl<R: Read> Decoder<R> {
 
 impl Calibration {
     // Writes the calibration and the paths of its references, which must be in the order
-    // they were analyzed in. Extra detection needs the residual of every reference.
-    pub fn save(&self, writer: impl Write, extra: bool, references: &[&Path]) -> Result<()> {
+    // they were analyzed in. Extra detection needs the residual of every reference;
+    // `compression` is an xz preset for those residuals, which are otherwise stored as
+    // they are.
+    pub fn save(
+        &self,
+        writer: impl Write,
+        extra: bool,
+        references: &[&Path],
+        compression: Option<u32>,
+    ) -> Result<()> {
         ensure!(
             references.len() == self.reference_images
                 && self.stacks.len() == if extra { references.len() } else { 0 },
             "saving sensor-dirt data needs every analyzed reference"
+        );
+        ensure!(
+            compression.is_none_or(|level| (1..=9).contains(&level)),
+            "sensor-dirt compression level must be 1 to 9"
         );
         let mut encoder = Encoder {
             writer,
@@ -3386,6 +3564,7 @@ impl Calibration {
         encoder.bytes(SAVED_MAGIC)?;
         encoder.bytes(&SAVED_VERSION.to_le_bytes())?;
         encoder.flag(extra)?;
+        encoder.flag(compression.is_some())?;
         encoder.count(references.len())?;
         for path in references {
             encoder.text(path.to_str().with_context(|| {
@@ -3429,28 +3608,40 @@ impl Calibration {
             }
         }
         encoder.seal()?;
-        for frame in &self.stacks {
-            ensure!(
-                frame.data.len() == frame.width * frame.height,
-                "sensor-dirt residual of unexpected size"
-            );
-            encoder.count(frame.index)?;
-            encoder.geometry(&frame.geometry)?;
-            for value in [frame.width, frame.height, frame.step] {
-                encoder.count(value)?;
+        // Compressing is the slow part, so a few residuals at a time take every thread.
+        for frames in self.stacks.chunks(2 * rayon::current_num_threads().max(1)) {
+            let stored = frames
+                .par_iter()
+                .map(|frame| {
+                    ensure!(
+                        frame.data.len() == frame.width * frame.height,
+                        "sensor-dirt residual of unexpected size"
+                    );
+                    match compression {
+                        Some(level) => pack(&frame.data, frame.width, level),
+                        None => Ok(frame
+                            .data
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect()),
+                    }
+                })
+                .collect::<Result<Vec<Vec<u8>>>>()?;
+            for (frame, stored) in frames.iter().zip(stored) {
+                encoder.count(frame.index)?;
+                encoder.geometry(&frame.geometry)?;
+                for value in [frame.width, frame.height, frame.step, stored.len()] {
+                    encoder.count(value)?;
+                }
+                encoder.count(frame.signature.len())?;
+                for value in &frame.signature {
+                    encoder.real(*value)?;
+                }
+                encoder.seal()?;
+                // However it is stored, a residual is sealed as the samples it holds.
+                encoder.raw(&stored)?;
+                encoder.raw(&residual_hash(&frame.data).to_le_bytes())?;
             }
-            encoder.count(frame.signature.len())?;
-            for value in &frame.signature {
-                encoder.real(*value)?;
-            }
-            encoder.seal()?;
-            let bytes: Vec<u8> = frame
-                .data
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            encoder.bytes(&bytes)?;
-            encoder.seal()?;
         }
         encoder.writer.flush().context("writing sensor-dirt data")
     }
@@ -3464,6 +3655,8 @@ impl Calibration {
 // Saved sensor-dirt data whose residuals are still to be read.
 pub struct Saved<R> {
     pub extra: bool,
+    // Whether the residuals are stored compressed.
+    pub compressed: bool,
     // The references in the order they were analyzed in.
     pub references: Vec<PathBuf>,
     calibration: Calibration,
@@ -3486,6 +3679,7 @@ impl<R: Read + Seek> Saved<R> {
             "sensor-dirt data was saved in format {version} but this version reads format {SAVED_VERSION}; save it again"
         );
         let extra = decoder.flag()?;
+        let compressed = decoder.flag()?;
         let references = (0..decoder.count(1 << 24)?)
             .map(|_| decoder.text().map(PathBuf::from))
             .collect::<Result<Vec<_>>>()?;
@@ -3552,6 +3746,7 @@ impl<R: Read + Seek> Saved<R> {
         decoder.seal()?;
         Ok(Self {
             extra,
+            compressed,
             calibration: Calibration {
                 reference_images: references.len(),
                 groups,
@@ -3566,7 +3761,11 @@ impl<R: Read + Seek> Saved<R> {
     // others, which only voted.
     pub fn calibration(mut self, keep: impl Fn(usize) -> bool) -> Result<Calibration> {
         let frames = if self.extra { self.references.len() } else { 0 };
-        for _ in 0..frames {
+        let compressed = self.compressed;
+        // Stored bytes and seals of the residuals read but not yet decoded: decoding is
+        // the slow part, so a few at a time take every thread.
+        let mut waiting: Vec<(StackFrame, Vec<u8>, u64)> = Vec::new();
+        for position in 0..frames {
             let index = self.decoder.count(frames - 1)?;
             let geometry = self.decoder.geometry()?;
             let [width, height, step] = [
@@ -3574,34 +3773,57 @@ impl<R: Read + Seek> Saved<R> {
                 self.decoder.count(1 << 16)?,
                 self.decoder.count(1 << 16)?,
             ];
+            let stored = self.decoder.count(3 * width * height + 4096)?;
             let signature = (0..self.decoder.count(1 << 16)?)
                 .map(|_| self.decoder.real())
                 .collect::<Result<Vec<_>>>()?;
             self.decoder.seal()?;
-            let length = 2 * width * height;
+            ensure!(compressed || stored == 2 * width * height, SAVED_DAMAGED);
             if keep(index) {
-                let mut bytes = vec![0; length];
-                self.decoder.bytes(&mut bytes)?;
-                self.decoder.seal()?;
-                self.calibration.stacks.push(StackFrame {
-                    index,
-                    geometry,
-                    width,
-                    height,
-                    step,
-                    signature,
-                    data: Arc::new(
-                        bytes
-                            .chunks_exact(2)
-                            .map(|value| i16::from_le_bytes([value[0], value[1]]))
-                            .collect(),
-                    ),
-                });
+                let mut bytes = vec![0; stored];
+                let mut seal = [0; 8];
+                self.decoder
+                    .reader
+                    .read_exact(&mut bytes)
+                    .and_then(|()| self.decoder.reader.read_exact(&mut seal))
+                    .context(SAVED_EARLY)?;
+                waiting.push((
+                    StackFrame {
+                        index,
+                        geometry,
+                        width,
+                        height,
+                        step,
+                        signature,
+                        data: Arc::new(Vec::new()),
+                    },
+                    bytes,
+                    u64::from_le_bytes(seal),
+                ));
             } else {
                 self.decoder
                     .reader
-                    .seek(SeekFrom::Current(length as i64 + 8))
-                    .context("saved sensor-dirt data cannot be read")?;
+                    .seek(SeekFrom::Current(stored as i64 + 8))
+                    .context(SAVED_EARLY)?;
+            }
+            if position + 1 == frames || waiting.len() >= 2 * rayon::current_num_threads() {
+                let decoded = std::mem::take(&mut waiting)
+                    .into_par_iter()
+                    .map(|(mut frame, bytes, seal)| {
+                        let data = if compressed {
+                            unpack(&bytes, frame.width, frame.width * frame.height)?
+                        } else {
+                            bytes
+                                .chunks_exact(2)
+                                .map(|value| i16::from_le_bytes([value[0], value[1]]))
+                                .collect()
+                        };
+                        ensure!(residual_hash(&data) == seal, SAVED_DAMAGED);
+                        frame.data = Arc::new(data);
+                        Ok(frame)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.calibration.stacks.extend(decoded);
             }
         }
         Ok(self.calibration)

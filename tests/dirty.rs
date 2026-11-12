@@ -771,6 +771,46 @@ fn extra_measures_confirmed_dirt_too_faint_for_the_target_to_propose() {
 }
 
 #[test]
+fn extra_keeps_the_fitted_repair_of_dirt_that_the_stack_renders_far_fainter() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // Wide open the dirt is a broad faint disc; in the stopped-down target it is small
+    // and deep.
+    let spot = |depth: f64, sigma: f64| {
+        move |x: f64, y: f64| {
+            -depth
+                * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / sigma.powi(2)).exp()
+        }
+    };
+    let bands = |_: f64, y: f64| 0.02 * (y / 9.0).sin();
+    let evidence: Vec<_> = (0..4)
+        .map(|index| {
+            let image = decode(
+                dir.path(),
+                &format!("wide{index}.DNG"),
+                &shaded(index, spot(0.05, 5.0)),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    // A banded sky keeps the target from measuring the stacked shadow itself, so the stack
+    // offers its own faint shape.
+    let banded = shaded(0, bands);
+    let original = shaded(0, |x, y| spot(0.35, 2.5)(x, y) + bands(x, y));
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(report.stacked_regions, 1, "{report:?}");
+    let before = worst_error(&original.pixels, &banded, center, 12.0);
+    let after = worst_error(&image.pixels, &banded, center, 12.0);
+    assert!(
+        before > 0.25 && after < 0.2 * before,
+        "{after} of {before}; {report:?}"
+    );
+}
+
+#[test]
 fn stacking_repairs_dust_too_faint_for_any_single_frame_fit() {
     let dir = tempfile::tempdir().unwrap();
     let center = (420.5, 120.5);
@@ -1615,6 +1655,24 @@ fn cli_aliases_and_separate_reference_lists_parse_without_changing_other_flags()
         assert!(parse(&[load, "dirt.fdl", "-fdl", "ref1.DNG"]).is_err());
         assert!(parse(&[load, "dirt.fdl", save, "other.fdl"]).is_err());
         assert!(parse(&[save]).is_err() && parse(&[load]).is_err());
+        assert_eq!(cli.fix_dirty_compression, None);
+    }
+    for flag in [
+        "-fdl-compression",
+        "--fdl-compression",
+        "-fix-dirty-compression",
+        "--fix-dirty-compression",
+    ] {
+        for level in 1..=9 {
+            let cli = parse(&["-fdl-save", "dirt.fdl", flag, &level.to_string()]).unwrap();
+            assert_eq!(cli.fix_dirty_compression, Some(level));
+        }
+        for level in ["0", "10", "-1", "best"] {
+            assert!(parse(&["-fdl-save", "dirt.fdl", flag, level]).is_err());
+        }
+        // There is nothing to compress without saving.
+        assert!(parse(&[flag, "5"]).is_err());
+        assert!(parse(&["-fdl-load", "dirt.fdl", flag, "5"]).is_err());
     }
     // Only saving admits a run without inputs.
     let bare = |arguments: &[&str]| {
@@ -1754,6 +1812,105 @@ fn extra_stacking_uses_the_references_nearest_to_a_separate_target() {
 }
 
 #[test]
+fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    // Seven views with a shadow too faint for any single-frame fit, then seven of a later
+    // session that no longer has it. The target is the last frame of the first session, so
+    // half of its neighbors, taken from both sides, are clean.
+    let view = |k: usize, dusty: bool| {
+        let (sin, cos) = (k as f64 * 0.41).sin_cos();
+        shaded(5, move |x, y| {
+            let shadow = if dusty {
+                -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
+            } else {
+                0.0
+            };
+            cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow
+        })
+    };
+    let references: Vec<_> = (0..14)
+        .map(|k| {
+            let path = dir.path().join(format!("ref{k:02}.DNG"));
+            view(k, k < 7).write(&path);
+            path
+        })
+        .collect();
+    let convert = |name: &str, dusty: bool| {
+        let target = dir.path().join(format!("{name}.DNG"));
+        view(14, dusty).write(&target);
+        let output = dir.path().join(format!("output-{name}"));
+        success(
+            command(&target, &output)
+                .args(["-fdx", "--report", "-fdl"])
+                .args(&references)
+                .output()
+                .unwrap(),
+        );
+        json(&output.join(format!("{name}.json")))["dirty_correction"].clone()
+    };
+    let dirty = convert("ref06b", true);
+    assert_eq!(dirty["stacked_regions"], 1, "{dirty}");
+    assert!(dirty["changed_samples"].as_u64().unwrap() > 0, "{dirty}");
+    // The first frame of the clean session has nothing to repair, whatever came before.
+    let clean = convert("ref06c", false);
+    assert_eq!(clean["changed_samples"], 0, "{clean}");
+}
+
+#[test]
+fn extra_one_sided_stacks_never_replace_a_shadow_fitted_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = (420.5, 120.5);
+    let spot = |depth: f64, sigma: f64| {
+        move |x: f64, y: f64| {
+            -depth
+                * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / sigma.powi(2)).exp()
+        }
+    };
+    let tilt = |k: usize| {
+        let (sin, cos) = (k as f64 * 0.41).sin_cos();
+        move |x: f64, y: f64| cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5)
+    };
+    // Seven views of a session shot wide open, where the dirt is a broad soft disc, then
+    // seven of a later session that no longer has it.
+    let evidence: Vec<_> = (0..14)
+        .map(|k| {
+            let dust = spot(if k < 7 { 0.1 } else { 0.0 }, 5.0);
+            let image = decode(
+                dir.path(),
+                &format!("ref{k:02}.DNG"),
+                &shaded(5, |x, y| tilt(k)(x, y) + dust(x, y)),
+            );
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    // The last frame of the first session, stopped down: the dirt is smaller and deeper.
+    // Only the stack of the earlier frames shows it, and on a banded sky that stack has no
+    // more to offer than its own broad shape, a poor stand-in for the fitted shadow.
+    let bands = |x: f64, y: f64| tilt(14)(x, y) + 0.02 * (y / 9.0).sin();
+    let banded = shaded(5, bands);
+    let original = shaded(5, |x, y| bands(x, y) + spot(0.2, 3.5)(x, y));
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration
+        .plan_near(&target, Some(7))
+        .apply(&mut image)
+        .unwrap();
+    assert_eq!(
+        (report.stacked_regions, report.spots.len()),
+        (0, 1),
+        "{report:?}"
+    );
+    let before = worst_error(&original.pixels, &banded, center, 12.0);
+    let after = worst_error(&image.pixels, &banded, center, 12.0);
+    assert!(
+        before > 0.15 && after < 0.2 * before,
+        "{after} of {before}; {report:?}"
+    );
+}
+
+#[test]
 fn saved_reference_data_reproduces_the_run_that_analyzed_the_references() {
     let dir = tempfile::tempdir().unwrap();
     let center = (420.5, 120.5);
@@ -1817,6 +1974,30 @@ fn saved_reference_data_reproduces_the_run_that_analyzed_the_references() {
     );
     assert!(pixels == expected, "loaded data changed the output");
     assert_eq!(loaded_report, report);
+    // Compressed data is smaller and is recognized on loading without any flag.
+    let compressed = dir.path().join("dirt-xz.fdl");
+    let packing: Vec<&std::ffi::OsStr> = list
+        .iter()
+        .copied()
+        .chain([
+            "--fdl-save".as_ref(),
+            compressed.as_os_str(),
+            "-fdl-compression".as_ref(),
+            "9".as_ref(),
+        ])
+        .collect();
+    let (pixels, packing_report, text) = run("packing", &packing);
+    assert!(text.contains("xz preset 9"), "{text}");
+    assert!(pixels == expected && packing_report == report);
+    assert!(
+        fs::metadata(&compressed).unwrap().len() * 2 < fs::metadata(&saved).unwrap().len(),
+        "compression saved too little"
+    );
+    let (pixels, unpacked_report, _) = run(
+        "unpacked",
+        &["--fix-dirty-load".as_ref(), compressed.as_os_str()],
+    );
+    assert!(pixels == expected && unpacked_report == report);
     // References alone can be saved, to the same bytes, without converting anything.
     let alone = dir.path().join("alone.fdl");
     let save_alone = || {
@@ -1943,9 +2124,20 @@ fn saved_stack_data_is_read_only_for_the_references_a_target_needs() {
         .collect();
     let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
     let mut bytes = Vec::new();
-    calibration.save(&mut bytes, true, &paths).unwrap();
-    assert!(calibration.save(Vec::new(), false, &paths).is_err());
-    assert!(calibration.save(Vec::new(), true, &paths[..3]).is_err());
+    calibration.save(&mut bytes, true, &paths, None).unwrap();
+    assert!(calibration.save(Vec::new(), false, &paths, None).is_err());
+    assert!(
+        calibration
+            .save(Vec::new(), true, &paths[..3], None)
+            .is_err()
+    );
+    for level in [0, 10] {
+        assert!(
+            calibration
+                .save(Vec::new(), true, &paths, Some(level))
+                .is_err()
+        );
+    }
     let original = shaded(0, faint);
     let repaired = |calibration: &Calibration| {
         let mut image = decode(dir.path(), "target.DNG", &original);
@@ -1968,6 +2160,30 @@ fn saved_stack_data_is_read_only_for_the_references_a_target_needs() {
     assert!(partial == repaired(&windowed));
     assert_eq!(partial.1, 0);
     assert!(partial.0 == original.pixels);
+    // Compressed residuals are much shorter, decode to the same samples, can be skipped
+    // like stored ones, and damage inside them is noticed.
+    for level in [1, 6, 9] {
+        let mut packed = Vec::new();
+        calibration
+            .save(&mut packed, true, &paths, Some(level))
+            .unwrap();
+        assert!(
+            packed.len() * 2 < bytes.len(),
+            "level {level}: {} of {} bytes",
+            packed.len(),
+            bytes.len()
+        );
+        let open = |bytes: &[u8]| dirty::Saved::open(std::io::Cursor::new(bytes.to_vec())).unwrap();
+        let saved = open(&packed);
+        assert!(saved.extra && saved.compressed && !open(&bytes).compressed);
+        assert!(repaired(&saved.calibration(|_| true).unwrap()) == expected);
+        assert!(repaired(&open(&packed).calibration(|index| index < 2).unwrap()) == partial);
+        let mut damaged = packed.clone();
+        let middle = damaged.len() - 40;
+        damaged[middle] ^= 0x40;
+        assert!(open(&damaged).calibration(|_| true).is_err());
+        assert!(open(&damaged).calibration(|index| index < 2).is_ok());
+    }
 }
 
 #[test]

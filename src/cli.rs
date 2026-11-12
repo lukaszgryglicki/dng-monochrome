@@ -225,6 +225,17 @@ pub struct Cli {
 
     #[arg(
         long,
+        visible_alias = "fdl-compression",
+        requires = "fix_dirty_save",
+        conflicts_with = "fix_dirty_load",
+        value_parser = clap::value_parser!(u32).range(1..=9),
+        value_name = "LEVEL",
+        help = "Compress the residual maps of --fix-dirty-save data with xz preset 1..9; default: stored uncompressed; --fix-dirty-load reads both"
+    )]
+    pub fix_dirty_compression: Option<u32>,
+
+    #[arg(
+        long,
         visible_alias = "fdl-load",
         conflicts_with = "fix_dirty_list",
         value_name = "FILE",
@@ -654,6 +665,8 @@ fn normalize_arguments(args: impl IntoIterator<Item = OsString>) -> Vec<OsString
         "fdl",
         "fix-dirty-save",
         "fdl-save",
+        "fix-dirty-compression",
+        "fdl-compression",
         "fix-dirty-load",
         "fdl-load",
         "fix-dust-strength",
@@ -1053,11 +1066,14 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
             .prefix(".dng-monochrome-")
             .tempfile_in(parent)
             .with_context(|| format!("creating temporary output in {}", parent.display()))?;
-        calibration.save(
-            io::BufWriter::new(temporary.as_file_mut()),
-            cli.fix_dirty_extra,
-            &saved,
-        )?;
+        dirt_pool(threads)?.install(|| {
+            calibration.save(
+                io::BufWriter::new(temporary.as_file_mut()),
+                cli.fix_dirty_extra,
+                &saved,
+                cli.fix_dirty_compression,
+            )
+        })?;
         temporary.as_file().sync_all()?;
         if cli.overwrite {
             temporary.persist(file)
@@ -1068,9 +1084,15 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
         .with_context(|| format!("publishing {}", file.display()))?;
         if !cli.silent {
             eprintln!(
-                "Sensor-dirt data of {} reference(s) saved to {}",
+                "Sensor-dirt data of {} reference(s) saved to {} ({} bytes, residual maps {})",
                 references.len(),
-                file.display()
+                file.display(),
+                std::fs::metadata(file).map_or(0, |metadata| metadata.len()),
+                match cli.fix_dirty_compression {
+                    _ if !cli.fix_dirty_extra => "not needed".to_owned(),
+                    Some(level) => format!("compressed with xz preset {level}"),
+                    None => "uncompressed".to_owned(),
+                }
             );
         }
         // Planning then sees what a run that does not save sees.
@@ -1090,6 +1112,15 @@ fn prepare_dirty(cli: &Cli, inputs: &[Input], threads: usize) -> Result<Option<V
         );
     }
     Ok(Some(plans))
+}
+
+// Saved residual maps are compressed and decoded several at a time on the run's threads.
+fn dirt_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|worker| format!("dng-mono-dirt-{worker}"))
+        .build()
+        .context("creating the sensor-dirt data thread pool")
 }
 
 // The prepass of a run that reads saved reference data: only the targets are analyzed.
@@ -1136,8 +1167,8 @@ fn load_dirty(
         let last = (center + dirty::STACK_REACH).min(references.len() - 1);
         stacked[center.saturating_sub(dirty::STACK_REACH)..=last].fill(true);
     }
-    let calibration = saved
-        .calibration(|index| stacked[index])
+    let calibration = dirt_pool(threads)?
+        .install(|| saved.calibration(|index| stacked[index]))
         .with_context(|| format!("loading sensor-dirt data from {}", file.display()))?;
     let completed = AtomicUsize::new(0);
     let results = process_files(inputs.len(), threads, usize::from(cli.jobs), |index| {

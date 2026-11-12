@@ -391,7 +391,7 @@ Color reports and analysis JSON contain separate channel metadata/DR results.
 dng-monochrome /path/to/one/DNG-directory -fd -o cleaned --report
 dng-monochrome shot.ARW -c -nc --transfer srgb -fdl /path/to/ARW-directory /path/to/older-ARWs -o cleaned
 dng-monochrome /path/to/one/DNG-directory -fds 1.25 -o stronger --report
-dng-monochrome -c -fdx -fdl '/path/to/photos/*/*/*.ARW' -fdl-save sony.fdl
+dng-monochrome -c -fdx -fdl '/path/to/photos/*/*/*.ARW' -fdl-save sony.fdl -fdl-compression 6
 dng-monochrome shot.ARW -c -fdx -fdl-load sony.fdl -o cleaned
 ```
 
@@ -412,9 +412,15 @@ usual or have none at all; it refuses to replace an existing FILE without
 references would write, and takes no `-fdl`. The file holds the confirmed spots,
 the reference paths in their sorted order (a target still stacks the references
 next to its own path) and, with `-fdx`, about 4 MB of residual map per reference,
-of which a run reads only those within 128 files of a target. It is bound to the
-`-fdx` setting it was saved with and to this version's analysis; save it again
-after adding references or updating the program.
+of which a run reads only those within 128 files of a target. Those maps are
+stored as they are unless `--fix-dirty-compression LEVEL` (`-fdl-compression`,
+xz preset 1 to 9) is given: each map is then predicted from its neighboring
+cells and its flags and error bytes are compressed separately, which is what
+makes such noisy data shrink at all, to a bit more than half (xz alone saves
+about a third). Level 6 is as small as it gets; lower levels save more quickly.
+Loading recognizes either form and decodes on the run's threads. The file is
+bound to the `-fdx` setting it was saved with and to this version's analysis;
+save it again after adding references or updating the program.
 
 `--fix-dirty-extra` (`-fdx`, also `--fix-dust-extra`) additionally detects enclosed
 irregular shadows such as curved fibers, in both mono and color modes. It implies
@@ -428,7 +434,8 @@ Extra mode also stacks, for every target, the high-passed analysis previews of
 up to 24 nearest distinct reference views in path order, and the closest 12 on
 their own so that a long reference list cannot dilute a short session. Views
 whose shadows are as deep as the target's are preferred (an aperture proxy
-needing no metadata). A stacked shadow counts only when it is small, isolated on
+needing no metadata).
+A stacked shadow counts only when it is small, isolated on
 an otherwise flat stack and seen by at least three views with plain, unrelated
 surroundings; a faint speck needs six. Broad soft shadows stay with the fitted
 correction above. Where the target is evenly smooth around it, the target
@@ -439,7 +446,9 @@ instead, and left out when it is hardly deeper than that unevenness. In textured
 surroundings only a compact shadow from an aperture-matched stack is applied,
 and only if the target shows it at a similar depth. Dark scene structure running
 through a shadow, such as a wire, leaves that shadow uncorrected rather than
-erased.
+erased. A stacked shadow replaces the fitted correction of the spot it covers
+unless it amounts to less than half of that correction; both then apply, the
+stronger one at each sample.
 
 The same dirt is small, dark and sharp stopped down and broad and soft wide
 open, so a target may show a confirmed spot in a shape that its references never
@@ -448,6 +457,14 @@ confirmed only as a compact shadow when the shape balances on that spot, stays
 within its reach and takes at most three times its light. Where a target
 proposes nothing at a confirmed spot, the target is measured there directly: a
 shadow is repaired only if it is significant and isolated on plain surroundings.
+
+A neighboring session shot through another aperture or filter can still hide
+the shadows of the target's own session from those stacks. Once everything else
+is planned, extra mode therefore also stacks the nearer half of the preferred
+views, and only the views before the target or only those after it. These
+further stacks rest on fewer views or on one side alone, so they only fill in:
+a shadow of theirs is used where no other correction, whether stacked, fitted or
+measured on the target, already covers part of it, and it never replaces one.
 
 Every shadow confirmed in extra mode is finally refined on the developed
 samples themselves, once for all Bayer planes: the error shared along each
@@ -551,6 +568,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers, stack nearby references and refine confirmed shadows at full resolution; opt-in; implies `--fix-dirty`; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `--fix-dirty-save FILE`, `-fdl-save FILE` | Save the analyzed reference data for later runs; implies `--fix-dirty`; inputs optional; needs `--overwrite` to replace FILE |
+| `--fix-dirty-compression N`, `-fdl-compression N` | Compress the saved residual maps with xz preset 1..9; default uncompressed; requires `--fix-dirty-save` |
 | `--fix-dirty-load FILE`, `-fdl-load FILE` | Use saved reference data instead of analyzing references; implies `--fix-dirty`; same `-fdx` setting as when saved; conflicts with `-fdl` and `-fdl-save` |
 | `--fix-dust-strength N`, `-fds N` | Correction strength 0..2, default 1; implies `--fix-dirty`; 0 leaves pixels unchanged, >1 can overcorrect |
 | `--noise-reduction`, `-nr` | Enable measured-noise, edge-preserving RAW denoising at level 1; default off; mono and color |
