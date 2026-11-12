@@ -464,9 +464,12 @@ is planned, extra mode therefore also stacks the nearer half of the preferred
 views, and only the views before the target or only those after it. These
 further stacks rest on fewer views or on one side alone, so they only fill in:
 a shadow of theirs is used where no other correction, whether stacked, fitted or
-measured on the target, already covers part of it, and only if the target
-measures that shadow itself. Their shape alone is never applied, so such a
-shadow stays among cloud bands or texture.
+measured on the target, already covers part of it. The target must measure such
+a shadow itself; where cloud bands, grain or texture prevent that, these stacks
+are trusted as described above only for a speck of at most 64 analysis cells, as
+dust casts it stopped down, whose place at least five views show. Scene
+gradients imitate anything broader, and a few neighboring frames of one scene
+share its small details; such shadows are left alone.
 
 Every shadow confirmed in extra mode is finally refined on the developed
 samples themselves, once for all Bayer planes: the error shared along each

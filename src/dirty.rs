@@ -20,6 +20,11 @@ const STACK_VIEWS: usize = 24;
 const STACK_POOL: usize = 64;
 const STACK_MIN_VIEWS: usize = 3;
 const STACK_MARGIN: usize = 12;
+// A one-sided or halved stack may repair a shadow that the target cannot measure itself only
+// if the shadow is no larger than this many analysis-preview cells and this many views show
+// its place.
+const STACK_SPECK: usize = 64;
+const STACK_SPECK_VIEWS: usize = 5;
 // How many frames on either side of a target, in capture order, its stack may draw from;
 // twice the pool, because near-duplicate views are skipped.
 pub const STACK_REACH: usize = 2 * STACK_POOL;
@@ -1465,10 +1470,9 @@ impl Calibration {
                     .map(|patch| Field::from_patch(patch.clone(), step, None)),
             );
             // The further stacks rest on fewer views or on one side of the target only.
-            // They fill what nothing above corrects, never replace a shadow fitted or
-            // measured on the target itself, and count only where the target measures
-            // their shadow.
-            for (frames, regions) in &further {
+            // They fill what nothing above corrects and never replace a shadow fitted or
+            // measured on the target itself.
+            for (frames, regions, similar) in &further {
                 let found: Vec<Field> = regions
                     .par_iter()
                     .filter(|region| {
@@ -1477,7 +1481,7 @@ impl Calibration {
                             .any(|fields| region.covered(target, fields))
                     })
                     .filter_map(|region| {
-                        Field::new(region, frames, target, own, Trust::Target).ok()
+                        Field::new(region, frames, target, own, Trust::Further(*similar)).ok()
                     })
                     .collect();
                 fields.extend(found);
@@ -2277,12 +2281,14 @@ enum Unmeasured {
 // How far a stack is trusted where the target cannot measure a shadow itself.
 #[derive(Clone, Copy, PartialEq)]
 enum Trust {
-    // Not at all: only the target's own measurement counts.
-    Target,
     // For its shape, scaled to the target, over smooth but uneven surroundings.
     Shape,
     // Also as it is in textured surroundings: its views render dust as the target does.
     Matched,
+    // A one-sided or halved stack, of matched views or not: as above, but only for a speck,
+    // as dust casts it stopped down, in enough views. Scene gradients imitate broader
+    // shadows, and a few neighboring frames of one scene share its small details.
+    Further(bool),
 }
 
 struct Region {
@@ -2810,9 +2816,17 @@ impl Field {
             })
         };
         let refine = !matches!(measured, Err(Unmeasured::Rough));
+        let (shape, matched) = match trust {
+            Trust::Shape => (true, false),
+            Trust::Matched => (true, true),
+            Trust::Further(matched) => {
+                let speck = region.area <= STACK_SPECK && views >= STACK_SPECK_VIEWS;
+                (speck, speck && matched)
+            }
+        };
         let (mut gain, near) = match measured {
             Ok(measured) => measured,
-            Err(Unmeasured::Uneven) if trust != Trust::Target => (
+            Err(Unmeasured::Uneven) if shape => (
                 template
                     .iter()
                     .map(|shadow| -shadow * amplitude as f32)
@@ -2820,7 +2834,7 @@ impl Field {
                 region.near.clone(),
             ),
             Err(Unmeasured::Rough)
-                if trust == Trust::Matched
+                if matched
                     && score >= 6.0
                     && (0.6..=1.6).contains(&amplitude)
                     && compact
@@ -2988,8 +3002,9 @@ impl Field {
     }
 }
 
-// Views of a further stack and the isolated shadows of that stack.
-type Further<'a> = (Vec<&'a [i16]>, Vec<Region>);
+// Views of a further stack, the isolated shadows of that stack and whether the views were
+// matched to the target's dust rendering.
+type Further<'a> = (Vec<&'a [i16]>, Vec<Region>, bool);
 
 impl Calibration {
     // Stack the nearest distinct reference views with the target's dust rendering and keep
@@ -3149,11 +3164,11 @@ impl Calibration {
         ] {
             if !tried.iter().any(|other| same(other, frames)) {
                 tried.push(frames);
-                further.push((frames.to_vec(), regions(frames)));
+                further.push((frames.to_vec(), regions(frames), true));
             }
         }
         for (frames, regions) in stacks.drain(around..) {
-            further.push((frames.to_vec(), regions));
+            further.push((frames.to_vec(), regions, false));
         }
         (fields, further)
     }

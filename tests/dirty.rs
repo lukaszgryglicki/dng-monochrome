@@ -1815,28 +1815,35 @@ fn extra_stacking_uses_the_references_nearest_to_a_separate_target() {
 fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
     let dir = tempfile::tempdir().unwrap();
     let center = (420.5, 120.5);
-    // Seven views with a shadow too faint for any single-frame fit, then seven of a later
-    // session that no longer has it. The target is the last frame of the first session, so
-    // half of its neighbors, taken from both sides, are clean.
-    let view = |k: usize, depth: f64, bands: f64| {
+    // A session of `dusty` views with a shadow too faint for any single-frame fit, then a
+    // later session whose views no longer have it. The target is the last frame of the
+    // first session, so half of its neighbors, taken from both sides, are clean. The shadow
+    // is a speck, or a streak reaching `half` pixels to either side of it.
+    let view = |k: usize, half: f64, depth: f64, bands: f64| {
         let (sin, cos) = (k as f64 * 0.41).sin_cos();
         shaded(5, move |x, y| {
-            let shadow =
-                -depth * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp();
+            let along = ((x - center.0).abs() - half).max(0.0);
+            let shadow = -depth * (-0.5 * (along.powi(2) + (y - center.1).powi(2)) / 36.0).exp();
             cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow + bands * (y / 9.0).sin()
         })
     };
-    let references: Vec<_> = (0..14)
-        .map(|k| {
-            let path = dir.path().join(format!("ref{k:02}.DNG"));
-            view(k, if k < 7 { 0.011 } else { 0.0 }, 0.0).write(&path);
-            path
-        })
-        .collect();
-    let convert = |name: &str, depth: f64, bands: f64| {
-        let target = dir.path().join(format!("{name}.DNG"));
-        view(14, depth, bands).write(&target);
-        let output = dir.path().join(format!("output-{name}"));
+    let convert = |half: f64, dusty: usize, suffix: &str, depth: f64, bands: f64| {
+        let session = dir.path().join(format!("session{half}-{dusty}"));
+        fs::create_dir_all(&session).unwrap();
+        let references: Vec<_> = (0..14)
+            .map(|k| {
+                let path = session.join(format!("ref{k:02}.DNG"));
+                if !path.exists() {
+                    view(k, half, if k < dusty { 0.011 } else { 0.0 }, 0.0).write(&path);
+                }
+                path
+            })
+            .collect();
+        // Sorts right after the last frame of the first session.
+        let name = format!("ref{:02}{suffix}", dusty - 1);
+        let target = session.join(format!("{name}.DNG"));
+        view(14, half, depth, bands).write(&target);
+        let output = session.join(format!("output-{name}"));
         success(
             command(&target, &output)
                 .args(["-fdx", "--report", "-fdl"])
@@ -1846,15 +1853,29 @@ fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
         );
         json(&output.join(format!("{name}.json")))["dirty_correction"].clone()
     };
-    let dirty = convert("ref06b", 0.011, 0.0);
-    assert_eq!(dirty["stacked_regions"], 1, "{dirty}");
-    assert!(dirty["changed_samples"].as_u64().unwrap() > 0, "{dirty}");
-    // On a banded sky the target cannot measure the shadow itself, and a stack of one side
-    // alone is not trusted for its shape.
-    let banded = convert("ref06c", 0.03, 0.008);
-    assert_eq!(banded["changed_samples"], 0, "{banded}");
+    // On plain ground the target measures the shadow that only the stack of its own
+    // session shows.
+    for (half, dusty) in [(0.0, 7), (16.0, 7), (0.0, 4)] {
+        let dirty = convert(half, dusty, "b", 0.011, 0.0);
+        assert_eq!(dirty["stacked_regions"], 1, "{dirty}");
+        assert!(dirty["changed_samples"].as_u64().unwrap() > 0, "{dirty}");
+    }
+    // On a banded sky the target cannot measure the shadow itself. A stack of one side
+    // alone is then trusted for the shape of a speck, as dust casts it stopped down,
+    let speck = convert(0.0, 7, "c", 0.03, 0.008);
+    assert_eq!(speck["stacked_regions"], 1, "{speck}");
+    assert!(speck["changed_samples"].as_u64().unwrap() > 0, "{speck}");
+    // but not for a broader shadow, which scene gradients imitate, nor on the word of four
+    // views, which may share the small details of one scene.
+    for (half, dusty) in [(16.0, 7), (0.0, 4)] {
+        let untouched = convert(half, dusty, "c", 0.03, 0.008);
+        assert_eq!(
+            untouched["changed_samples"], 0,
+            "{half} {dusty}: {untouched}"
+        );
+    }
     // The first frame of the clean session has nothing to repair, whatever came before.
-    let clean = convert("ref06d", 0.0, 0.0);
+    let clean = convert(0.0, 7, "d", 0.0, 0.0);
     assert_eq!(clean["changed_samples"], 0, "{clean}");
 }
 
