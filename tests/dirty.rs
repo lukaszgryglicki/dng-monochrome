@@ -1818,27 +1818,24 @@ fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
     // Seven views with a shadow too faint for any single-frame fit, then seven of a later
     // session that no longer has it. The target is the last frame of the first session, so
     // half of its neighbors, taken from both sides, are clean.
-    let view = |k: usize, dusty: bool| {
+    let view = |k: usize, depth: f64, bands: f64| {
         let (sin, cos) = (k as f64 * 0.41).sin_cos();
         shaded(5, move |x, y| {
-            let shadow = if dusty {
-                -0.011 * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp()
-            } else {
-                0.0
-            };
-            cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow
+            let shadow =
+                -depth * (-0.5 * ((x - center.0).powi(2) + (y - center.1).powi(2)) / 36.0).exp();
+            cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow + bands * (y / 9.0).sin()
         })
     };
     let references: Vec<_> = (0..14)
         .map(|k| {
             let path = dir.path().join(format!("ref{k:02}.DNG"));
-            view(k, k < 7).write(&path);
+            view(k, if k < 7 { 0.011 } else { 0.0 }, 0.0).write(&path);
             path
         })
         .collect();
-    let convert = |name: &str, dusty: bool| {
+    let convert = |name: &str, depth: f64, bands: f64| {
         let target = dir.path().join(format!("{name}.DNG"));
-        view(14, dusty).write(&target);
+        view(14, depth, bands).write(&target);
         let output = dir.path().join(format!("output-{name}"));
         success(
             command(&target, &output)
@@ -1849,11 +1846,15 @@ fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
         );
         json(&output.join(format!("{name}.json")))["dirty_correction"].clone()
     };
-    let dirty = convert("ref06b", true);
+    let dirty = convert("ref06b", 0.011, 0.0);
     assert_eq!(dirty["stacked_regions"], 1, "{dirty}");
     assert!(dirty["changed_samples"].as_u64().unwrap() > 0, "{dirty}");
+    // On a banded sky the target cannot measure the shadow itself, and a stack of one side
+    // alone is not trusted for its shape.
+    let banded = convert("ref06c", 0.03, 0.008);
+    assert_eq!(banded["changed_samples"], 0, "{banded}");
     // The first frame of the clean session has nothing to repair, whatever came before.
-    let clean = convert("ref06c", false);
+    let clean = convert("ref06d", 0.0, 0.0);
     assert_eq!(clean["changed_samples"], 0, "{clean}");
 }
 
@@ -1886,11 +1887,10 @@ fn extra_one_sided_stacks_never_replace_a_shadow_fitted_on_the_target() {
         .collect();
     let calibration = Calibration::new(&evidence).unwrap();
     // The last frame of the first session, stopped down: the dirt is smaller and deeper.
-    // Only the stack of the earlier frames shows it, and on a banded sky that stack has no
-    // more to offer than its own broad shape, a poor stand-in for the fitted shadow.
-    let bands = |x: f64, y: f64| tilt(14)(x, y) + 0.02 * (y / 9.0).sin();
-    let banded = shaded(5, bands);
-    let original = shaded(5, |x, y| bands(x, y) + spot(0.2, 3.5)(x, y));
+    // Only the stack of the earlier frames shows it, and the target could measure that
+    // shadow, but the shadow fitted on the target already stands for this dirt.
+    let clean = shaded(5, tilt(14));
+    let original = shaded(5, |x, y| tilt(14)(x, y) + spot(0.2, 3.5)(x, y));
     let mut image = decode(dir.path(), "target.DNG", &original);
     let target = dirty::analyze_with_extra(&image, true).unwrap();
     let report = calibration
@@ -1902,8 +1902,8 @@ fn extra_one_sided_stacks_never_replace_a_shadow_fitted_on_the_target() {
         (0, 1),
         "{report:?}"
     );
-    let before = worst_error(&original.pixels, &banded, center, 12.0);
-    let after = worst_error(&image.pixels, &banded, center, 12.0);
+    let before = worst_error(&original.pixels, &clean, center, 12.0);
+    let after = worst_error(&image.pixels, &clean, center, 12.0);
     assert!(
         before > 0.15 && after < 0.2 * before,
         "{after} of {before}; {report:?}"

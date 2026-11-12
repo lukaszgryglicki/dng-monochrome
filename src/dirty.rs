@@ -1465,9 +1465,10 @@ impl Calibration {
                     .map(|patch| Field::from_patch(patch.clone(), step, None)),
             );
             // The further stacks rest on fewer views or on one side of the target only.
-            // They fill what nothing above corrects and never replace a shadow fitted or
-            // measured on the target itself.
-            for (frames, regions, similar) in &further {
+            // They fill what nothing above corrects, never replace a shadow fitted or
+            // measured on the target itself, and count only where the target measures
+            // their shadow.
+            for (frames, regions) in &further {
                 let found: Vec<Field> = regions
                     .par_iter()
                     .filter(|region| {
@@ -1475,7 +1476,9 @@ impl Calibration {
                             .iter()
                             .any(|fields| region.covered(target, fields))
                     })
-                    .filter_map(|region| Field::new(region, frames, target, own, *similar).ok())
+                    .filter_map(|region| {
+                        Field::new(region, frames, target, own, Trust::Target).ok()
+                    })
                     .collect();
                 fields.extend(found);
             }
@@ -2271,6 +2274,17 @@ enum Unmeasured {
     Scenery,
 }
 
+// How far a stack is trusted where the target cannot measure a shadow itself.
+#[derive(Clone, Copy, PartialEq)]
+enum Trust {
+    // Not at all: only the target's own measurement counts.
+    Target,
+    // For its shape, scaled to the target, over smooth but uneven surroundings.
+    Shape,
+    // Also as it is in textured surroundings: its views render dust as the target does.
+    Matched,
+}
+
 struct Region {
     window: [usize; 4],
     core: Vec<bool>,
@@ -2690,7 +2704,7 @@ impl Field {
         frames: &[&[i16]],
         target: &Evidence,
         own: &[i16],
-        matched: bool,
+        trust: Trust,
     ) -> Result<Self, &'static str> {
         let width = target.width;
         let [x0, y0, w, h] = region.window;
@@ -2798,7 +2812,7 @@ impl Field {
         let refine = !matches!(measured, Err(Unmeasured::Rough));
         let (mut gain, near) = match measured {
             Ok(measured) => measured,
-            Err(Unmeasured::Uneven) => (
+            Err(Unmeasured::Uneven) if trust != Trust::Target => (
                 template
                     .iter()
                     .map(|shadow| -shadow * amplitude as f32)
@@ -2806,7 +2820,7 @@ impl Field {
                 region.near.clone(),
             ),
             Err(Unmeasured::Rough)
-                if matched
+                if trust == Trust::Matched
                     && score >= 6.0
                     && (0.6..=1.6).contains(&amplitude)
                     && compact
@@ -2974,9 +2988,8 @@ impl Field {
     }
 }
 
-// Views of a further stack, the isolated shadows of that stack and whether the views were
-// matched to the target's dust rendering.
-type Further<'a> = (Vec<&'a [i16]>, Vec<Region>, bool);
+// Views of a further stack and the isolated shadows of that stack.
+type Further<'a> = (Vec<&'a [i16]>, Vec<Region>);
 
 impl Calibration {
     // Stack the nearest distinct reference views with the target's dust rendering and keep
@@ -3100,12 +3113,12 @@ impl Calibration {
                 .collect()
         };
         let mut fields: Vec<Field> = Vec::new();
-        let mut keep = |frames: &[&[i16]], regions: &[Region], matched: bool| {
+        let mut keep = |frames: &[&[i16]], regions: &[Region], trust: Trust| {
             // A later stack only adds shadows that no earlier field covers.
             let rest: Vec<Field> = regions
                 .par_iter()
                 .filter(|region| !region.covered(target, &fields))
-                .filter_map(|region| Field::new(region, frames, target, own, matched).ok())
+                .filter_map(|region| Field::new(region, frames, target, own, trust).ok())
                 .collect();
             fields.extend(rest);
         };
@@ -3117,10 +3130,10 @@ impl Calibration {
             }
         };
         let both = similar(&stacks[..around]);
-        keep(&both, &regions(&both), true);
+        keep(&both, &regions(&both), Trust::Matched);
         // Shadows seen by too few aperture-matched views may still be measurable directly.
         for (frames, regions) in &stacks[..around] {
-            keep(frames, regions, false);
+            keep(frames, regions, Trust::Shape);
         }
         // The proxy also admits views of other apertures, and a neighboring session may
         // dilute every stack around the target. What is still missing then may come from
@@ -3136,11 +3149,11 @@ impl Calibration {
         ] {
             if !tried.iter().any(|other| same(other, frames)) {
                 tried.push(frames);
-                further.push((frames.to_vec(), regions(frames), true));
+                further.push((frames.to_vec(), regions(frames)));
             }
         }
         for (frames, regions) in stacks.drain(around..) {
-            further.push((frames.to_vec(), regions, false));
+            further.push((frames.to_vec(), regions));
         }
         (fields, further)
     }

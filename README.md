@@ -464,7 +464,9 @@ is planned, extra mode therefore also stacks the nearer half of the preferred
 views, and only the views before the target or only those after it. These
 further stacks rest on fewer views or on one side alone, so they only fill in:
 a shadow of theirs is used where no other correction, whether stacked, fitted or
-measured on the target, already covers part of it, and it never replaces one.
+measured on the target, already covers part of it, and only if the target
+measures that shadow itself. Their shape alone is never applied, so such a
+shadow stays among cloud bands or texture.
 
 Every shadow confirmed in extra mode is finally refined on the developed
 samples themselves, once for all Bayer planes: the error shared along each
