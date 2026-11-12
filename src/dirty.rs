@@ -22,9 +22,35 @@ const STACK_MIN_VIEWS: usize = 3;
 const STACK_MARGIN: usize = 12;
 // A one-sided or halved stack may repair a shadow that the target cannot measure itself only
 // if the shadow is no larger than this many analysis-preview cells and this many views show
-// its place.
+// its place, and if the target is no darker there than this many times the stack, a target
+// stopped down further than its neighbors being allowed that excess on top: such stacks
+// hold enough chance specks that a bird or a twig of the target lands on one.
 const STACK_SPECK: usize = 64;
 const STACK_SPECK_VIEWS: usize = 5;
+const STACK_SPECK_SCALE: f64 = 1.6;
+// Dirt far from the sensor casts discs tens of preview cells across, which the residual's
+// high-pass flattens. Extra detection therefore stacks a second, broad level: the preview
+// averaged over BROAD_CELL cells a side, against the plane fitted around each broad cell
+// with a Gaussian weight of BROAD_BACKGROUND broad cells.
+const BROAD_CELL: usize = 4;
+const BROAD_BACKGROUND: f64 = 12.0;
+// Broad cells further than this from that plane, either way, do not shape it: a shadow
+// keeps its depth, and what the sky itself varies by cancels out.
+const BROAD_BOUND: f32 = 0.006;
+// Smaller shadows belong to the analysis preview itself.
+const BROAD_AREA: std::ops::RangeInclusive<usize> = 30..=4000;
+// A broad cell is plain ground only if its own preview cells, leveled, stay within this
+// many times the spread that grain alone gives cells of its brightness, or within
+// BROAD_RANGE: the texture flags of the preview reach a few cells past an edge.
+const BROAD_GRAIN: f32 = 3.0;
+const BROAD_RANGE: f32 = 0.03;
+// Plain ground continues from one broad cell of a target to the next only across less
+// than this: a shadow of far dirt is soft, a ridge or a roof line is not.
+const BROAD_STEP: f32 = 0.12;
+// The shadow of far dirt wanders, and a target shot wider open than the views of a stack
+// shows a wider disc than that stack: its own shadow may run on this many broad cells
+// beyond the stack's.
+const BROAD_REACH: usize = 8;
 // How many frames on either side of a target, in capture order, its stack may draw from;
 // twice the pool, because near-duplicate views are skipped.
 pub const STACK_REACH: usize = 2 * STACK_POOL;
@@ -261,6 +287,138 @@ impl Preview {
                 }
             });
         codes
+    }
+
+    // The same evidence one level up, for shadows too broad for the residual: see
+    // BROAD_CELL. A broad cell is smooth where three quarters of its preview cells are and
+    // no edge runs through it; elsewhere it holds no evidence at all. Also returns the log
+    // level of every broad cell, on which a target measures such a shadow.
+    fn broad(&self, codes: &[i16]) -> (Vec<i16>, Vec<f32>) {
+        let (width, height) = (
+            self.width.div_ceil(BROAD_CELL),
+            self.height.div_ceil(BROAD_CELL),
+        );
+        let mut level = vec![0.0f32; width * height];
+        // Share of flagged preview cells (0 none, 1 three quarters, 2 all) and how far the
+        // cells of a broad cell spread around their own plane.
+        let mut flags = vec![0u8; width * height];
+        let mut range = vec![0.0f32; width * height];
+        level
+            .par_chunks_mut(width)
+            .zip(flags.par_chunks_mut(width))
+            .zip(range.par_chunks_mut(width))
+            .enumerate()
+            .for_each(|(y, ((level, flags), range))| {
+                for x in 0..width {
+                    let (x0, y0) = (x * BROAD_CELL, y * BROAD_CELL);
+                    let (x1, y1) = (
+                        (x0 + BROAD_CELL).min(self.width),
+                        (y0 + BROAD_CELL).min(self.height),
+                    );
+                    let (mx, my) = ((x0 + x1 - 1) as f32 * 0.5, (y0 + y1 - 1) as f32 * 0.5);
+                    let (mut sum, mut flagged, mut count) = (0.0f64, 0usize, 0usize);
+                    let mut logs = [0.0f32; BROAD_CELL * BROAD_CELL];
+                    // Moments of the plane through the cell's own preview cells.
+                    let (mut mean, mut tilt, mut spread) = (0.0f32, [0.0f32; 2], [0.0f32; 2]);
+                    for cy in y0..y1 {
+                        for cx in x0..x1 {
+                            let i = cy * self.width + cx;
+                            sum += f64::from(self.pixels[i]);
+                            flagged += usize::from(stack_smooth(codes[i]));
+                            let value = self.pixels[i].max(0.0007).ln();
+                            let (dx, dy) = (cx as f32 - mx, cy as f32 - my);
+                            logs[count] = value;
+                            mean += value;
+                            tilt = [tilt[0] + dx * value, tilt[1] + dy * value];
+                            spread = [spread[0] + dx * dx, spread[1] + dy * dy];
+                            count += 1;
+                        }
+                    }
+                    mean /= count as f32;
+                    let slope = [0, 1].map(|axis| {
+                        if spread[axis] > 0.0 {
+                            tilt[axis] / spread[axis]
+                        } else {
+                            0.0
+                        }
+                    });
+                    let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for (k, value) in logs[..count].iter().enumerate() {
+                        let dx = (x0 + k % (x1 - x0)) as f32 - mx;
+                        let dy = (y0 + k / (x1 - x0)) as f32 - my;
+                        let leveled = value - mean - slope[0] * dx - slope[1] * dy;
+                        low = low.min(leveled);
+                        high = high.max(leveled);
+                    }
+                    level[x] = (sum / count as f64).max(0.0007).ln() as f32;
+                    flags[x] = u8::from(flagged * 4 >= count * 3) + u8::from(flagged == count);
+                    range[x] = high - low;
+                }
+            });
+        // Grain of each brightness octave: the 20th-percentile spread of its wholly
+        // flagged cells, as the residual takes its noise floors.
+        let octave = |level: f32| {
+            (f64::from(level) / std::f64::consts::LN_2 + 11.0)
+                .floor()
+                .clamp(0.0, 11.0) as usize
+        };
+        let quantile = |values: &mut Vec<f32>| {
+            let index = values.len() / 5;
+            *values.select_nth_unstable_by(index, f32::total_cmp).1
+        };
+        let mut all: Vec<f32> = (0..width * height)
+            .filter(|&i| flags[i] == 2)
+            .map(|i| range[i])
+            .collect();
+        let fallback = if all.is_empty() {
+            0.0
+        } else {
+            quantile(&mut all)
+        };
+        let measured: Vec<Option<f32>> = (0..12)
+            .map(|wanted| {
+                let mut values: Vec<f32> = (0..width * height)
+                    .filter(|&i| flags[i] == 2 && octave(level[i]) == wanted)
+                    .map(|i| range[i])
+                    .collect();
+                (values.len() >= 20).then(|| quantile(&mut values))
+            })
+            .collect();
+        let limits: Vec<f32> = (0..12usize)
+            .map(|wanted| {
+                let grain = (0..12usize)
+                    .filter_map(|other| {
+                        measured[other].map(|value| (other.abs_diff(wanted), value))
+                    })
+                    .min_by_key(|(distance, _)| *distance)
+                    .map_or(fallback, |(_, value)| value);
+                (BROAD_GRAIN * grain).max(BROAD_RANGE)
+            })
+            .collect();
+        let smooth: Vec<bool> = (0..width * height)
+            .map(|i| flags[i] > 0 && range[i] <= limits[octave(level[i])])
+            .collect();
+        let mut kept = smooth.clone();
+        let mut plane = level_plane(&level, &kept, width, height, BROAD_BACKGROUND);
+        for _ in 0..2 {
+            for (i, kept) in kept.iter_mut().enumerate() {
+                *kept = smooth[i]
+                    && plane[i].is_some_and(|base| (level[i] - base).abs() <= BROAD_BOUND);
+            }
+            plane = level_plane(&level, &kept, width, height, BROAD_BACKGROUND);
+        }
+        let codes = (0..width * height)
+            .map(|i| match plane[i] {
+                Some(base) if smooth[i] => {
+                    let value = ((level[i] - base) * STACK_UNITS)
+                        .round()
+                        .clamp(-16383.0, 16383.0) as i16;
+                    (value << 1) | 1
+                }
+                _ => 0,
+            })
+            .collect();
+        (codes, level)
     }
 
     fn irregular_proposals(
@@ -953,6 +1111,9 @@ pub struct Evidence {
     signature: Vec<f64>,
     candidates: Vec<Candidate>,
     stack: Option<Arc<Vec<i16>>>,
+    // The broad level of `stack`, kept along with it, and the log level of its cells.
+    broad: Option<Arc<Vec<i16>>>,
+    level: Option<Arc<Vec<f32>>>,
 }
 
 pub fn analyze(image: &MonoImage) -> Result<Evidence> {
@@ -967,6 +1128,8 @@ pub fn analyze_with_extra(image: &MonoImage, extra: bool) -> Result<Evidence> {
 // A reference further than STACK_REACH frames from every target only needs its votes.
 pub fn analyze_with_stack(image: &MonoImage, extra: bool, stack: bool) -> Result<Evidence> {
     let preview = Preview::new(image)?;
+    let codes = stack.then(|| preview.residual());
+    let (broad, level) = codes.as_ref().map(|codes| preview.broad(codes)).unzip();
     Ok(Evidence {
         geometry: Geometry::new(&image.metadata),
         width: preview.width,
@@ -974,7 +1137,9 @@ pub fn analyze_with_stack(image: &MonoImage, extra: bool, stack: bool) -> Result
         step: preview.step,
         signature: preview.signature(),
         candidates: preview.candidates(extra),
-        stack: stack.then(|| Arc::new(preview.residual())),
+        stack: codes.map(Arc::new),
+        broad: broad.map(Arc::new),
+        level: level.map(Arc::new),
     })
 }
 
@@ -1009,6 +1174,7 @@ struct StackFrame {
     step: usize,
     signature: Vec<f64>,
     data: Arc<Vec<i16>>,
+    broad: Arc<Vec<i16>>,
 }
 
 pub struct Calibration {
@@ -1252,6 +1418,7 @@ impl Calibration {
                         step: frame.step,
                         signature: frame.signature.clone(),
                         data: frame.stack.clone()?,
+                        broad: frame.broad.clone()?,
                     })
                 })
                 .collect(),
@@ -1270,10 +1437,10 @@ impl Calibration {
             .iter()
             .find(|group| group.geometry == target.geometry);
         // Stacked shadows need the same three independent views as every other one.
-        let (fields, further) = if group.is_some_and(|group| group.distinct_views >= 3) {
+        let (fields, further, broad) = if group.is_some_and(|group| group.distinct_views >= 3) {
             self.stack_fields(target, position)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         let sensor = |x: f64, y: f64| {
             (
@@ -1472,7 +1639,7 @@ impl Calibration {
             // The further stacks rest on fewer views or on one side of the target only.
             // They fill what nothing above corrects and never replace a shadow fitted or
             // measured on the target itself.
-            for (frames, regions, similar) in &further {
+            for (frames, regions, trust) in &further {
                 let found: Vec<Field> = regions
                     .par_iter()
                     .filter(|region| {
@@ -1480,13 +1647,69 @@ impl Calibration {
                             .iter()
                             .any(|fields| region.covered(target, fields))
                     })
-                    .filter_map(|region| {
-                        Field::new(region, frames, target, own, Trust::Further(*similar)).ok()
-                    })
+                    .filter_map(|region| Field::new(region, frames, target, own, *trust, None).ok())
                     .collect();
                 fields.extend(found);
             }
         }
+        // Broad shadows lie under all of that. Where the plan does not already repair most
+        // of one, the target is measured as the plan leaves it, and the shadow adds to it.
+        let mut wide: Vec<Field> = Vec::new();
+        if let (Some(own), Some(level)) = (&target.broad, &target.level) {
+            let planned = |x: f64, y: f64| -> f64 {
+                let mut gain = 0.0;
+                for patch in &patches {
+                    let px = (x - patch.origin[0]) / patch.spacing;
+                    let py = (y - patch.origin[1]) / patch.spacing;
+                    let bounds = 0.0..=(patch.side - 1) as f64;
+                    if bounds.contains(&px) && bounds.contains(&py) {
+                        gain += bilinear(&patch.values, patch.side, patch.side, px, py);
+                    }
+                }
+                // Fitted fields without a spot only refine what a patch above applies.
+                for field in fields
+                    .iter()
+                    .chain(&measured)
+                    .chain(fitted.iter().filter(|field| field.spot.is_some()))
+                {
+                    if let Some(measured) = field.sample(&field.gain, x, y) {
+                        gain = gain.max(measured);
+                    }
+                }
+                gain
+            };
+            // Every stack locates a broad shadow in the shape its own views gave it, wide
+            // open or stopped down, and a target whose shadow runs far beyond that shape was
+            // shot through another aperture than those views. Stack by stack, the first to
+            // locate a shadow stands; those whose shape the target keeps go first.
+            let mut found: Vec<(bool, Field)> = Vec::new();
+            for (frames, regions) in &broad {
+                let shadows: Vec<(bool, Field)> = regions
+                    .par_iter()
+                    .filter(|region| {
+                        region.overlap(target, &[&fields, &measured, &fitted]) * 2 < region.area
+                    })
+                    .filter_map(|region| {
+                        let broad: Leveled = (level, &planned);
+                        let field =
+                            Field::new(region, frames, target, own, Trust::Shape, Some(broad))
+                                .ok()?;
+                        let shape = region.near.iter().filter(|near| **near).count();
+                        let shown = field.support.iter().filter(|part| **part > 0.5).count();
+                        Some((shown * 2 > shape * 3, field))
+                    })
+                    .collect();
+                found.extend(shadows);
+            }
+            let (kept, stretched): (Vec<_>, Vec<_>) =
+                found.into_iter().partition(|(stretched, _)| !stretched);
+            for (_, field) in kept.into_iter().chain(stretched) {
+                if !wide.iter().any(|other| field.touches(other)) {
+                    wide.push(field);
+                }
+            }
+        }
+        fields.extend(wide);
         // Stacked fields lead the plan; the report counts them.
         let stacked_regions = fields.len();
         fields.extend(measured);
@@ -2063,6 +2286,115 @@ fn gaussian(values: &[f32], width: usize, height: usize, sigma: f64, odd: bool) 
     result
 }
 
+// For every cell, the level there of the plane fitted with Gaussian weights to the masked
+// cells around it; None where those do not surround the cell well enough to fix a plane.
+// Unlike a normalized blur, such a fit follows a gradient up to the edge of the mask.
+fn level_plane(
+    values: &[f32],
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    sigma: f64,
+) -> Vec<Option<f32>> {
+    let radius = (3.0 * sigma).ceil() as isize;
+    let total: f64 = (-radius..=radius)
+        .map(|d| (-0.5 * (d * d) as f64 / (sigma * sigma)).exp())
+        .sum();
+    // Weights of the moments of order 0, 1 and 2 along one axis.
+    let kernels = [0, 1, 2].map(|order| -> Vec<f32> {
+        (-radius..=radius)
+            .map(|d| {
+                let d = d as f64;
+                ((-0.5 * d * d / (sigma * sigma)).exp() / total * d.powi(order)) as f32
+            })
+            .collect()
+    });
+    let reach = radius as usize;
+    // Zero beyond the borders: cells that do not exist carry no weight.
+    let across = |source: &[f32], kernel: &[f32]| -> Vec<f32> {
+        let mut result = vec![0.0f32; source.len()];
+        result
+            .par_chunks_mut(width)
+            .zip(source.par_chunks(width))
+            .for_each(|(out, line)| {
+                for (x, value) in out.iter_mut().enumerate() {
+                    let first = x.saturating_sub(reach);
+                    let last = (x + reach).min(width - 1);
+                    *value = line[first..=last]
+                        .iter()
+                        .zip(&kernel[first + reach - x..])
+                        .map(|(a, b)| a * b)
+                        .sum();
+                }
+            });
+        result
+    };
+    let down = |source: &[f32], kernel: &[f32]| -> Vec<f32> {
+        let mut result = vec![0.0f32; source.len()];
+        result
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, out)| {
+                for sy in y.saturating_sub(reach)..=(y + reach).min(height - 1) {
+                    let weight = kernel[sy + reach - y];
+                    for (value, source) in out.iter_mut().zip(&source[sy * width..][..width]) {
+                        *value += weight * source;
+                    }
+                }
+            });
+        result
+    };
+    let count = mask.iter().filter(|inside| **inside).count().max(1);
+    let mean = (values
+        .iter()
+        .zip(mask)
+        .filter(|(_, inside)| **inside)
+        .map(|(value, _)| f64::from(*value))
+        .sum::<f64>()
+        / count as f64) as f32;
+    let weight: Vec<f32> = mask
+        .iter()
+        .map(|inside| f32::from(u8::from(*inside)))
+        .collect();
+    let signal: Vec<f32> = values
+        .iter()
+        .zip(mask)
+        .map(|(value, inside)| if *inside { value - mean } else { 0.0 })
+        .collect();
+    let rows: Vec<Vec<f32>> = kernels
+        .iter()
+        .map(|kernel| across(&weight, kernel))
+        .collect();
+    let [s, sx, sy, sxx, sxy, syy] =
+        [(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2)].map(|(x, y)| down(&rows[x], &kernels[y]));
+    let rows: Vec<Vec<f32>> = kernels[..2]
+        .iter()
+        .map(|kernel| across(&signal, kernel))
+        .collect();
+    let [t, tx, ty] = [(0, 0), (1, 0), (0, 1)].map(|(x, y)| down(&rows[x], &kernels[y]));
+    (0..width * height)
+        .into_par_iter()
+        .map(|i| {
+            let [s, sx, sy, sxx, sxy, syy] =
+                [s[i], sx[i], sy[i], sxx[i], sxy[i], syy[i]].map(f64::from);
+            if s <= 0.02 {
+                return None;
+            }
+            // Spread of the weighted cells about their own center, in both directions.
+            let (mx, my) = (sx / s, sy / s);
+            let spread = (sxx / s - mx * mx) * (syy / s - my * my) - (sxy / s - mx * my).powi(2);
+            if spread <= (0.15 * sigma * sigma).powi(2) {
+                return None;
+            }
+            let plane = solve(
+                [[s, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]],
+                [t[i], tx[i], ty[i]].map(f64::from),
+            )?;
+            Some(plane[0] as f32 + mean)
+        })
+        .collect()
+}
+
 // Half-thickness of a mask in cells: how many 4-neighbor erosions empty it, up to `limit`.
 fn thickness(mask: &[bool], width: usize, height: usize, limit: usize) -> usize {
     let mut body = mask.to_vec();
@@ -2155,7 +2487,7 @@ impl StackMap {
     }
 
     // Isolated dark features supported by enough smooth views on an otherwise flat stack.
-    fn regions(&self, width: usize, height: usize) -> Vec<Region> {
+    fn regions(&self, width: usize, height: usize, broad: bool) -> Vec<Region> {
         let enough = |i: usize| usize::from(self.count[i]) >= STACK_MIN_VIEWS;
         let grows = |i: usize| enough(i) && self.median[i] < -0.004 && self.score(i) < -3.0;
         let seeds = |i: usize| enough(i) && self.median[i] < -0.008 && self.score(i) < -6.0;
@@ -2188,9 +2520,10 @@ impl StackMap {
                 top = top.min(i / width);
                 bottom = bottom.max(i / width);
             }
-            // The residual's own high-pass flattens broad shadows; the parametric fits
-            // keep those.
-            if !(3..=1000).contains(&pixels.len())
+            // The residual's own high-pass flattens broad shadows; the broad level and the
+            // parametric fits keep those.
+            let size = if broad { BROAD_AREA } else { 3..=1000 };
+            if !size.contains(&pixels.len())
                 || left < 2
                 || top < 2
                 || right + 3 > width
@@ -2221,7 +2554,17 @@ impl StackMap {
                     .collect()
             };
             let near = dilated(2);
-            if thickness(&core, w, h, 7) > 6 {
+            if broad {
+                // Dirt far from the sensor casts a filled disc. Scenery that the views
+                // share leaves wisps and bands instead.
+                let (across, down) = (right - left + 1, bottom - top + 1);
+                if pixels.len() * 20 < across * down * 11
+                    || thickness(&core, w, h, usize::MAX) * 10 < across.min(down) * 3
+                    || across.max(down) > 2 * across.min(down)
+                {
+                    continue;
+                }
+            } else if thickness(&core, w, h, 7) > 6 {
                 continue;
             }
             let median: Vec<f32> = (0..w * h)
@@ -2287,10 +2630,13 @@ enum Trust {
     Matched,
     // A one-sided or halved stack, of matched views or not: as above, but only for a speck,
     // as dust casts it stopped down, in enough views. Scene gradients imitate broader
-    // shadows, and a few neighboring frames of one scene share its small details.
-    Further(bool),
+    // shadows, and a few neighboring frames of one scene share its small details. Nor may
+    // the target be much darker there than the stack: its second value is how much deeper
+    // than its stack the target shows dust in general, at least one.
+    Further(bool, f64),
 }
 
+#[derive(Clone)]
 struct Region {
     window: [usize; 4],
     core: Vec<bool>,
@@ -2320,6 +2666,24 @@ impl Region {
             let raw_y = target.geometry.crop[1] as f64 + ((y0 + i / w) as f64 + 0.5) * step - 0.5;
             self.core[i] && fields.iter().any(|field| field.covers(raw_x, raw_y))
         })
+    }
+
+    // How many cells of a broad shadow's core the fields already correct on the target.
+    fn overlap(&self, target: &Evidence, fields: &[&Vec<Field>]) -> usize {
+        let [x0, y0, w, _] = self.window;
+        let step = (target.step * BROAD_CELL) as f64;
+        (0..self.core.len())
+            .filter(|&i| {
+                let raw_x =
+                    target.geometry.crop[0] as f64 + ((x0 + i % w) as f64 + 0.5) * step - 0.5;
+                let raw_y =
+                    target.geometry.crop[1] as f64 + ((y0 + i / w) as f64 + 0.5) * step - 0.5;
+                self.core[i]
+                    && fields
+                        .iter()
+                        .any(|fields| fields.iter().any(|field| field.covers(raw_x, raw_y)))
+            })
+            .count()
     }
 
     fn template(&self, median: &[f32]) -> Vec<f32> {
@@ -2395,6 +2759,340 @@ impl Region {
             .map(|i| (level(plane, i) - f64::from(data[i])) as f32)
             .collect();
         Some((shadow, noise))
+    }
+
+    // A window against the quadratic surface through the given ring cells, fitted three
+    // times so that what strays from it does not bend it. The residual of the broad level
+    // cannot serve here: around a shadow its background leans on whichever side is
+    // brighter, while this levels the very ring the shadow is then measured against.
+    fn leveled(&self, data: &[f32], ring: &[usize]) -> Option<Vec<f32>> {
+        let [_, _, w, h] = self.window;
+        let scale = 2.0 / w.max(h) as f64;
+        let basis = |i: usize| {
+            let x = ((i % w) as f64 - w as f64 * 0.5) * scale;
+            let y = ((i / w) as f64 - h as f64 * 0.5) * scale;
+            [1.0, x, y, x * x, x * y, y * y]
+        };
+        let level = |surface: [f64; 6], i: usize| -> f64 {
+            basis(i).iter().zip(surface).map(|(a, b)| a * b).sum()
+        };
+        let mut surface = [0.0; 6];
+        let mut noise = f64::INFINITY;
+        for _ in 0..3 {
+            let mut normal = [[0.0; 6]; 6];
+            let mut right = [0.0; 6];
+            for &i in ring {
+                let value = f64::from(data[i]);
+                if (value - level(surface, i)).abs() > 3.0 * noise {
+                    continue;
+                }
+                let basis = basis(i);
+                for a in 0..6 {
+                    right[a] += basis[a] * value;
+                    for b in 0..6 {
+                        normal[a][b] += basis[a] * basis[b];
+                    }
+                }
+            }
+            surface = solve(normal, right)?;
+            let mut errors: Vec<f32> = ring
+                .iter()
+                .map(|&i| (f64::from(data[i]) - level(surface, i)) as f32)
+                .collect();
+            noise = f64::from(stack_median(&mut errors).1).max(1e-4);
+        }
+        Some(
+            (0..w * h)
+                .map(|i| data[i] - level(surface, i) as f32)
+                .collect(),
+        )
+    }
+
+    // The plain ground of a target that a broad shadow lies on: of the patches of smooth
+    // cells that hang together without a jump from cell to cell, the one holding most of
+    // the shadow's core. What lies behind a ridge, or below it in a valley, is other ground
+    // however smooth it is: measured against this one it would pass for a shadow of its
+    // own depth, and in the ring it would bend the level the shadow is measured from.
+    fn reached(&self, level: &[f32], smooth: &[bool]) -> Vec<bool> {
+        let [_, _, w, h] = self.window;
+        let mut patch = vec![usize::MAX; w * h];
+        let (mut most, mut chosen, mut patches) = (0, usize::MAX, 0);
+        for start in 0..w * h {
+            if !smooth[start] || patch[start] != usize::MAX {
+                continue;
+            }
+            patch[start] = patches;
+            let mut queue = vec![start];
+            let (mut next, mut held) = (0, 0);
+            while next < queue.len() {
+                let i = queue[next];
+                next += 1;
+                held += usize::from(self.core[i]);
+                let (x, y) = (i % w, i / w);
+                for sy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+                    for sx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                        let j = sy * w + sx;
+                        if smooth[j]
+                            && patch[j] == usize::MAX
+                            && (level[j] - level[i]).abs() <= BROAD_STEP
+                        {
+                            patch[j] = patches;
+                            queue.push(j);
+                        }
+                    }
+                }
+            }
+            if held > most {
+                (most, chosen) = (held, patches);
+            }
+            patches += 1;
+        }
+        patch
+            .iter()
+            .map(|patch| chosen != usize::MAX && *patch == chosen)
+            .collect()
+    }
+
+    // How many cells every cell of the window lies from ground that the target cannot
+    // measure, up to BROAD_REACH; a lone such cell or a wire is no ground.
+    fn aground(&self, plain: &[bool]) -> Vec<usize> {
+        let [_, _, w, h] = self.window;
+        let around = |i: usize| {
+            let (x, y) = (i % w, i / w);
+            (y.saturating_sub(1)..=(y + 1).min(h - 1)).flat_map(move |sy| {
+                (x.saturating_sub(1)..=(x + 1).min(w - 1)).map(move |sx| sy * w + sx)
+            })
+        };
+        let mut distance = vec![usize::MAX; w * h];
+        let mut front: Vec<usize> = (0..w * h)
+            .filter(|&i| !plain[i] && around(i).filter(|&j| !plain[j]).count() >= 5)
+            .collect();
+        for &i in &front {
+            distance[i] = 0;
+        }
+        for step in 1..=BROAD_REACH {
+            let mut next = Vec::new();
+            for &i in &front {
+                for j in around(i) {
+                    if distance[j] == usize::MAX {
+                        distance[j] = step;
+                        next.push(j);
+                    }
+                }
+            }
+            front = next;
+        }
+        distance
+    }
+
+    // The shadow of far dirt wanders, and a target shot wider open than the views of a
+    // stack shows a wider disc than that stack. So where the target's own shadow, leveled,
+    // runs on from the stack's into the ground beside it, up to BROAD_REACH cells, that
+    // ground is shadow as well: it must neither shape the surface the shadow is measured
+    // from nor be taken off it. Only clear of ground that cannot be measured, though: the
+    // haze along a ridge is dark as well. Returns the region with its shadow widened so far
+    // and its ground cut back to two cells off that, or nothing if the stack's shape holds.
+    fn widened(&self, leveled: &[f32], plain: &[bool]) -> Option<Self> {
+        let [_, _, w, h] = self.window;
+        let within = |i: usize, reach: usize| {
+            let (x, y) = (i % w, i / w);
+            (y.saturating_sub(reach)..=(y + reach).min(h - 1)).flat_map(move |sy| {
+                (x.saturating_sub(reach)..=(x + reach).min(w - 1)).map(move |sx| sy * w + sx)
+            })
+        };
+        let aground = self.aground(plain);
+        // Dark against the surface, grain averaged out over the plain cells next to each.
+        let dark: Vec<bool> = (0..w * h)
+            .map(|i| {
+                let (mut sum, mut count) = (0.0f32, 0.0f32);
+                for j in within(i, 1).filter(|&j| plain[j]) {
+                    sum += leveled[j];
+                    count += 1.0;
+                }
+                plain[i] && aground[i] == usize::MAX && sum < -BROAD_BOUND * count
+            })
+            .collect();
+        let mut shadow = self.near.clone();
+        let mut front: Vec<usize> = (0..w * h).filter(|&i| shadow[i]).collect();
+        for _ in 0..BROAD_REACH {
+            let mut next = Vec::new();
+            for &i in &front {
+                for j in within(i, 1) {
+                    if !shadow[j] && dark[j] {
+                        shadow[j] = true;
+                        next.push(j);
+                    }
+                }
+            }
+            front = next;
+        }
+        if shadow == self.near {
+            return None;
+        }
+        let mut wider = self.clone();
+        for i in 0..w * h {
+            wider.quiet[i] &= !within(i, 2).any(|j| shadow[j]);
+        }
+        wider.near = shadow;
+        Some(wider)
+    }
+
+    // The ground around a broad shadow is seldom as level as the surface fitted through
+    // it: haze darkens the sky towards a ridge, and towards a horizon the sky runs away
+    // from any such surface. Both show on the ring itself, so neither is part of the
+    // shadow: first what the ring lies below the surface at each distance from ground
+    // that cannot be measured, then what is left of its depth, carried across the shadow
+    // from cell to cell. Only depth is taken off, so a shadow can lose by this and never
+    // gain.
+    fn grounded(&self, gain: &mut [f32], data: &[f32], plain: &[bool]) {
+        let [_, _, w, h] = self.window;
+        let ring: Vec<usize> = (0..w * h).filter(|&i| self.quiet[i] && plain[i]).collect();
+        let Some((mut shadow, _)) = self.shadow(data, &ring) else {
+            return;
+        };
+        let around = |i: usize| {
+            let (x, y) = (i % w, i / w);
+            (y.saturating_sub(1)..=(y + 1).min(h - 1)).flat_map(move |sy| {
+                (x.saturating_sub(1)..=(x + 1).min(w - 1)).map(move |sx| sy * w + sx)
+            })
+        };
+        let distance = self.aground(plain);
+        // The ring's depth at each distance: its median, never growing away from the ground.
+        let mut haze = [0.0f32; BROAD_REACH + 2];
+        for step in (1..=BROAD_REACH).rev() {
+            let mut values: Vec<f32> = ring
+                .iter()
+                .filter(|&&i| distance[i] == step)
+                .map(|&i| shadow[i])
+                .collect();
+            haze[step] = haze[step + 1];
+            if values.len() >= 8 {
+                haze[step] = haze[step].max(stack_median(&mut values).0);
+            }
+        }
+        for i in (0..w * h).filter(|&i| plain[i] && distance[i] <= BROAD_REACH) {
+            shadow[i] -= haze[distance[i]];
+            gain[i] = (gain[i] - haze[distance[i]]).max(0.0);
+        }
+        // What is left of the ring's own depth, its grain averaged out over the ring cells
+        // next to each.
+        let mut floor = vec![0.0f32; w * h];
+        for &i in &ring {
+            let (mut sum, mut count) = (0.0f32, 0.0f32);
+            for j in around(i).filter(|&j| self.quiet[j] && plain[j]) {
+                sum += shadow[j];
+                count += 1.0;
+            }
+            floor[i] = (sum / count).max(0.0);
+        }
+        let open: Vec<usize> = (0..w * h).filter(|&i| plain[i] && !self.quiet[i]).collect();
+        for _ in 0..w * h {
+            let mut change = 0.0f32;
+            for &i in &open {
+                let (x, y) = (i % w, i / w);
+                let (mut sum, mut count) = (0.0f32, 0.0f32);
+                for j in around(i).filter(|&j| plain[j] && (j % w == x) != (j / w == y)) {
+                    sum += floor[j];
+                    count += 1.0;
+                }
+                if count > 0.0 {
+                    change = change.max((sum / count - floor[i]).abs());
+                    floor[i] = sum / count;
+                }
+            }
+            if change < 1e-5 {
+                break;
+            }
+        }
+        for (gain, floor) in gain.iter_mut().zip(&floor) {
+            *gain = (*gain - floor).max(0.0);
+        }
+    }
+
+    // A target cannot measure all of a broad shadow where a ridge or a wire crosses it.
+    // Near the measured cells the gain passes on from cell to cell; further from them the
+    // stack's shape of the shadow (`shape`, its depth below zero) stands in, scaled to the
+    // depth the target measured. So no step marks where the measurement ended, and scenery
+    // under the shadow is lifted with the sky beside it. The cells right along such ground
+    // are filled as well, and the next ones where they are darker than the measured cells
+    // behind them: a hazy ridge darkens the sky beside it, a wire does not.
+    fn continued(&self, gain: &mut [f32], near: &[bool], plain: &[bool], shape: &[f32]) {
+        let [_, _, w, h] = self.window;
+        let within = |i: usize, reach: usize| {
+            let (x, y) = (i % w, i / w);
+            (y.saturating_sub(reach)..=(y + reach).min(h - 1)).flat_map(move |sy| {
+                (x.saturating_sub(reach)..=(x + reach).min(w - 1)).map(move |sx| sy * w + sx)
+            })
+        };
+        // 0 not measured, 1 right along such ground, 2 next to that, 3 clear of it.
+        let rank: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let beside = |reach: usize| within(i, reach).filter(|&j| !plain[j]).count();
+                if !plain[i] {
+                    0
+                } else if beside(1) >= 3 {
+                    1
+                } else if beside(2) >= 5 {
+                    2
+                } else {
+                    3
+                }
+            })
+            .collect();
+        let open: Vec<bool> = (0..w * h)
+            .map(|i| {
+                near[i]
+                    && match rank[i] {
+                        0 | 1 => true,
+                        2 => within(i, 3)
+                            .filter(|&j| rank[j] == 3)
+                            .map(|j| gain[j])
+                            .reduce(f32::max)
+                            .is_some_and(|behind| gain[i] > 1.25 * behind + 0.005),
+                        _ => false,
+                    }
+            })
+            .collect();
+        for i in (0..w * h).filter(|&i| open[i]) {
+            gain[i] = 0.0;
+        }
+        // How deep the target's shadow is against the stack's, where both are deep.
+        let deepest = shape.iter().copied().fold(0.0, f32::min);
+        let mut ratios: Vec<f32> = (0..w * h)
+            .filter(|&i| near[i] && !open[i] && shape[i] < 0.0 && shape[i] <= 0.6 * deepest)
+            .map(|i| gain[i] / -shape[i])
+            .collect();
+        let scale = if ratios.is_empty() {
+            0.0
+        } else {
+            let middle = ratios.len() / 2;
+            *ratios.select_nth_unstable_by(middle, f32::total_cmp).1
+        };
+        // Further than three cells from every measured one the stack's shape stands in.
+        let mut relaxed = Vec::new();
+        for i in (0..w * h).filter(|&i| open[i]) {
+            if within(i, 3).any(|j| near[j] && !open[j]) {
+                relaxed.push(i);
+            } else {
+                gain[i] = scale * -shape[i];
+            }
+        }
+        // Nearer to them the gain passes from cell to cell.
+        for _ in 0..w * h {
+            let mut change = 0.0f32;
+            for &i in &relaxed {
+                let (x, y) = (i % w, i / w);
+                let mut sum = 0.0f32;
+                for j in within(i, 1).filter(|&j| near[j] && (j % w == x) != (j / w == y)) {
+                    sum += gain[j];
+                }
+                change = change.max((0.25 * sum - gain[i]).abs());
+                gain[i] = 0.25 * sum;
+            }
+            if change < 1e-5 {
+                break;
+            }
+        }
     }
 
     // The target's own shadow against the plane of its quiet ring, and where it lies. The
@@ -2652,6 +3350,9 @@ struct Field {
     // plan already applies it and the field only refines.
     spot: Option<usize>,
     refine: bool,
+    // A shadow of the broad level: it adds to whatever the analysis preview repairs on
+    // top of it, where shadows of one level only ever take the strongest.
+    broad: bool,
     views: usize,
     area: usize,
     center: [f64; 2],
@@ -2672,6 +3373,17 @@ impl Field {
     fn covers(&self, raw_x: f64, raw_y: f64) -> bool {
         self.sample(&self.support, raw_x, raw_y)
             .is_some_and(|support| support > 0.5)
+    }
+
+    // Whether this field corrects some place that another one does.
+    fn touches(&self, other: &Self) -> bool {
+        (0..self.support.len()).any(|i| {
+            self.support[i] > 0.5
+                && other.covers(
+                    self.origin[0] + (i % self.size[0]) as f64 * self.spacing,
+                    self.origin[1] + (i / self.size[0]) as f64 * self.spacing,
+                )
+        })
     }
 
     // A confirmed patch: same gain, refinable inside its own measured support. Compact
@@ -2696,6 +3408,7 @@ impl Field {
             gain: patch.values,
             spot,
             refine: true,
+            broad: false,
             views: 0,
             area: 0,
             center: [0.0; 2],
@@ -2704,15 +3417,25 @@ impl Field {
     }
 
     // Validate one stacked region on the target and express its correction; the error names
-    // the safeguard that rejected it.
+    // the safeguard that rejected it. A region of the broad level comes with the target's
+    // broad log level and the log gain already planned at a raw position: what the plan
+    // leaves of the shadow is measured on that level.
     fn new(
         region: &Region,
         frames: &[&[i16]],
         target: &Evidence,
         own: &[i16],
         trust: Trust,
+        broad: Option<Leveled<'_>>,
     ) -> Result<Self, &'static str> {
-        let width = target.width;
+        let (width, step) = if broad.is_some() {
+            (
+                target.width.div_ceil(BROAD_CELL),
+                (target.step * BROAD_CELL) as f64,
+            )
+        } else {
+            (target.width, target.step as f64)
+        };
         let [x0, y0, w, h] = region.window;
         let target_codes = region.crop(own, width);
         let scene = region.surroundings(&target_codes);
@@ -2777,7 +3500,98 @@ impl Field {
             return Err("too few views across the shadow");
         }
         let template = region.template(&median);
-        let data: Vec<f32> = target_codes.iter().map(|&code| stack_value(code)).collect();
+        // Where a target of the broad level stands on plain ground; only there it measures.
+        let mut plain: Option<Vec<bool>> = None;
+        // The region as the target shows it, if its shadow is wider than the stack's.
+        let widened: Option<Region>;
+        let data: Vec<f32> = match broad {
+            None => {
+                widened = None;
+                target_codes.iter().map(|&code| stack_value(code)).collect()
+            }
+            Some((level, planned)) => {
+                // The target's own level as the plan leaves it, the gain planned within a
+                // broad cell being read at its four quarters.
+                let raised: Vec<f32> = (0..w * h)
+                    .map(|i| {
+                        let gain: f64 =
+                            [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)]
+                                .iter()
+                                .map(|(dx, dy)| {
+                                    planned(
+                                        target.geometry.crop[0] as f64
+                                            + ((x0 + i % w) as f64 + dx + 0.5) * step
+                                            - 0.5,
+                                        target.geometry.crop[1] as f64
+                                            + ((y0 + i / w) as f64 + dy + 0.5) * step
+                                            - 0.5,
+                                    )
+                                })
+                                .sum();
+                        level[(y0 + i / w) * width + x0 + i % w] + (0.25 * gain) as f32
+                    })
+                    .collect();
+                let smooth: Vec<bool> = target_codes
+                    .iter()
+                    .map(|&code| stack_smooth(code))
+                    .collect();
+                let reached = region.reached(&raised, &smooth);
+                let seen = (0..w * h).filter(|&i| region.core[i] && reached[i]).count();
+                if seen * 2 < core {
+                    return Err("too little plain ground under the broad shadow");
+                }
+                let ground = |region: &Region| -> Vec<usize> {
+                    (0..w * h)
+                        .filter(|&i| region.quiet[i] && reached[i])
+                        .collect()
+                };
+                let ring = ground(region);
+                if ring.len() < 16 {
+                    return Err("too little plain ground around the broad shadow");
+                }
+                let mut leveled = region
+                    .leveled(&raised, &ring)
+                    .ok_or("surroundings of the broad shadow cannot be leveled")?;
+                // The shadow as the target shows it, leveled once more from the ground
+                // around that.
+                widened = region
+                    .widened(&leveled, &reached)
+                    .filter(|wider| ground(wider).len() >= 16);
+                if let Some(wider) = &widened {
+                    leveled = wider
+                        .leveled(&raised, &ground(wider))
+                        .ok_or("surroundings of the broad shadow cannot be leveled")?;
+                }
+                // Anything else holds no evidence at all.
+                for (value, reached) in leveled.iter_mut().zip(&reached) {
+                    if !reached {
+                        *value = 0.0;
+                    }
+                }
+                plain = Some(reached);
+                leveled
+            }
+        };
+        // The region as the target shows it: its own where the target's shadow runs on.
+        let shown = widened.as_ref().unwrap_or(region);
+        // The target's cells that count as smooth, and the stack's shape where the target
+        // can be compared with it; the whole shape serves where the target cannot.
+        let whole = plain.as_ref().map(|_| template.clone());
+        let (target_codes, template) = match &plain {
+            None => (target_codes, template),
+            Some(plain) => (
+                target_codes
+                    .iter()
+                    .zip(plain)
+                    .map(|(&code, plain)| if *plain { code } else { 0 })
+                    .collect(),
+                template
+                    .iter()
+                    .zip(plain)
+                    .map(|(&shadow, plain)| if *plain { shadow } else { 0.0 })
+                    .collect(),
+            ),
+        };
         let (amplitude, score) = matched_amplitude(&data, &template);
         let ring = region.quiet.iter().filter(|quiet| **quiet).count();
         let flat = target_codes
@@ -2787,19 +3601,20 @@ impl Field {
             .count();
         let peak = template.iter().copied().fold(0.0, f32::min);
         // A faint speck in few views is within reach of chance: small details of one scene
-        // shot several times overlap that often.
-        if peak > -0.02 && region.area < 30 && views < 6 {
+        // shot several times overlap that often. So do faint broad patches of its sky.
+        if peak > -0.02 && (region.area < 30 || broad.is_some()) && views < 6 {
             return Err("too few views of a faint speck");
         }
         let compact = region.area <= 400
             && region.bounds[0].max(region.bounds[1])
                 <= 3 * region.bounds[0].min(region.bounds[1]) + 4;
-        let smooth = flat * 5 >= ring * 4;
+        // A broad cell that is not smooth holds no evidence at all.
+        let smooth = broad.is_some() || flat * 5 >= ring * 4;
         let expected: f64 = template.iter().map(|shadow| -f64::from(*shadow)).sum();
         let measured = if !region.plain(&target_codes) {
             Err(Unmeasured::Scenery)
         } else if (0.4..=3.0).contains(&amplitude) && score >= 5.0 {
-            region.measure(&data, &target_codes, amplitude * expected, smooth)
+            shown.measure(&data, &target_codes, amplitude * expected, smooth)
         } else {
             Err(Unmeasured::Scenery)
         };
@@ -2817,11 +3632,17 @@ impl Field {
         };
         let refine = !matches!(measured, Err(Unmeasured::Rough));
         let (shape, matched) = match trust {
-            Trust::Shape => (true, false),
+            // A broad shadow wanders with the lens, so its stack never has the target's
+            // shape: the target measures such a shadow or keeps it.
+            Trust::Shape => (broad.is_none(), false),
             Trust::Matched => (true, true),
-            Trust::Further(matched) => {
-                let speck = region.area <= STACK_SPECK && views >= STACK_SPECK_VIEWS;
-                (speck, speck && matched)
+            Trust::Further(matched, deepening) => {
+                let speck =
+                    broad.is_none() && region.area <= STACK_SPECK && views >= STACK_SPECK_VIEWS;
+                (
+                    speck && amplitude <= STACK_SPECK_SCALE * deepening,
+                    speck && matched,
+                )
             }
         };
         let (mut gain, near) = match measured {
@@ -2850,6 +3671,10 @@ impl Field {
             }
             Err(_) => return Err("target does not confirm the shadow"),
         };
+        if let (Some(plain), Some(whole)) = (&plain, &whole) {
+            shown.grounded(&mut gain, &data, plain);
+            shown.continued(&mut gain, &near, plain, whole);
+        }
         let near: Vec<f32> = near.iter().map(|near| f32::from(u8::from(*near))).collect();
         let support = gaussian(&near, w, h, 0.7, false);
         for (value, support) in gain.iter_mut().zip(&support) {
@@ -2863,7 +3688,6 @@ impl Field {
             sx += (x0 + i % w) as f64 / core as f64;
             sy += (y0 + i / w) as f64 / core as f64;
         }
-        let step = target.step as f64;
         Ok(Self {
             size: [w, h],
             origin: [
@@ -2876,10 +3700,21 @@ impl Field {
             support,
             // Set once the plan reports this shadow.
             spot: None,
-            refine,
+            // A broad shadow has no edge that its own cells could not follow.
+            refine: refine && broad.is_none(),
+            broad: broad.is_some(),
             views,
-            area: region.area,
-            center: [sx, sy],
+            // The plan reports areas and positions in cells of the analysis preview.
+            area: if broad.is_some() {
+                region.area * BROAD_CELL * BROAD_CELL
+            } else {
+                region.area
+            },
+            center: if broad.is_some() {
+                [sx, sy].map(|center| (center + 0.5) * BROAD_CELL as f64 - 0.5)
+            } else {
+                [sx, sy]
+            },
             error: region.noise,
         })
     }
@@ -2995,6 +3830,7 @@ impl Field {
             support,
             spot: None,
             refine: true,
+            broad: false,
             views: spot.distinct_views,
             center: [sx, sy],
             error: noise,
@@ -3002,21 +3838,26 @@ impl Field {
     }
 }
 
-// Views of a further stack, the isolated shadows of that stack and whether the views were
-// matched to the target's dust rendering.
-type Further<'a> = (Vec<&'a [i16]>, Vec<Region>, bool);
+// Views of a further stack, the isolated shadows of that stack and how far it is trusted.
+type Further<'a> = (Vec<&'a [i16]>, Vec<Region>, Trust);
+// Views of a stack on the broad level and its isolated shadows.
+type Broad<'a> = (Vec<&'a [i16]>, Vec<Region>);
+// What a target brings to a shadow of the broad level: the log level of its broad cells
+// and the log gain already planned at a raw position.
+type Leveled<'a> = (&'a [f32], &'a (dyn Fn(f64, f64) -> f64 + Sync));
 
 impl Calibration {
     // Stack the nearest distinct reference views with the target's dust rendering and keep
     // the isolated shadows that the target itself confirms. The further stacks come back
-    // unjudged: they may only fill what the whole plan leaves uncorrected.
+    // unjudged: they may only fill what the whole plan leaves uncorrected. So do the
+    // stacks of the broad level, whose shadows lie under everything else.
     fn stack_fields(
         &self,
         target: &Evidence,
         position: Option<usize>,
-    ) -> (Vec<Field>, Vec<Further<'_>>) {
+    ) -> (Vec<Field>, Vec<Further<'_>>, Vec<Broad<'_>>) {
         let Some(own) = &target.stack else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         };
         let width = target.width;
         let position = position
@@ -3053,7 +3894,7 @@ impl Calibration {
             }
         }
         if pool.len() < STACK_MIN_VIEWS {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
         let nearest: Vec<&[i16]> = pool
             .iter()
@@ -3096,7 +3937,7 @@ impl Calibration {
         let mut stacks: Vec<(&[&[i16]], Vec<Region>)> = sets
             .into_iter()
             .map(|frames| {
-                let regions = StackMap::new(frames, width).regions(width, target.height);
+                let regions = StackMap::new(frames, width).regions(width, target.height, false);
                 (frames, regions)
             })
             .collect();
@@ -3133,7 +3974,7 @@ impl Calibration {
             let rest: Vec<Field> = regions
                 .par_iter()
                 .filter(|region| !region.covered(target, &fields))
-                .filter_map(|region| Field::new(region, frames, target, own, trust).ok())
+                .filter_map(|region| Field::new(region, frames, target, own, trust, None).ok())
                 .collect();
             fields.extend(rest);
         };
@@ -3141,7 +3982,7 @@ impl Calibration {
             if frames.len() < STACK_MIN_VIEWS {
                 Vec::new()
             } else {
-                StackMap::new(frames, width).regions(width, target.height)
+                StackMap::new(frames, width).regions(width, target.height, false)
             }
         };
         let both = similar(&stacks[..around]);
@@ -3155,6 +3996,14 @@ impl Calibration {
         // the nearer half of the matched views, from the views matched on a one-sided stack
         // and from the one-sided stacks themselves.
         let one = similar(&stacks[around..]);
+        // Stopped down further than its neighbors, a target shows every shadow deeper than
+        // their stack does: by how much, on the stack around it that shows the most.
+        let deepening = stacks[..around]
+            .iter()
+            .map(|(_, regions)| regions)
+            .max_by_key(|regions| regions.len())
+            .and_then(|guide| stack_contrast(own, guide, width))
+            .map_or(1.0, |contrast| contrast.max(1.0));
         let mut tried: Vec<&[&[i16]]> = vec![&both];
         let mut further: Vec<Further> = Vec::new();
         for frames in [
@@ -3164,13 +4013,45 @@ impl Calibration {
         ] {
             if !tried.iter().any(|other| same(other, frames)) {
                 tried.push(frames);
-                further.push((frames.to_vec(), regions(frames), true));
+                further.push((
+                    frames.to_vec(),
+                    regions(frames),
+                    Trust::Further(true, deepening),
+                ));
             }
         }
         for (frames, regions) in stacks.drain(around..) {
-            further.push((frames.to_vec(), regions, false));
+            further.push((frames.to_vec(), regions, Trust::Further(false, deepening)));
         }
-        (fields, further)
+        // The broad level stacks the same views: first the matched ones, whose discs are
+        // as wide as the target's, then those around the target, then the further sets.
+        let (broad_width, broad_height) = (
+            width.div_ceil(BROAD_CELL),
+            target.height.div_ceil(BROAD_CELL),
+        );
+        let mut broad: Vec<Broad> = Vec::new();
+        let mut stacked: Vec<&[&[i16]]> = Vec::new();
+        for frames in std::iter::once(both.as_slice())
+            .chain(stacks.iter().map(|(frames, _)| *frames))
+            .chain(further.iter().map(|(frames, _, _)| frames.as_slice()))
+        {
+            if frames.len() < STACK_MIN_VIEWS || stacked.iter().any(|other| same(other, frames)) {
+                continue;
+            }
+            stacked.push(frames);
+            let views: Vec<&[i16]> = frames
+                .iter()
+                .filter_map(|data| {
+                    pool.iter()
+                        .find(|frame| std::ptr::eq(frame.data.as_ptr(), data.as_ptr()))
+                        .map(|frame| frame.broad.as_slice())
+                })
+                .collect();
+            let regions =
+                StackMap::new(&views, broad_width).regions(broad_width, broad_height, true);
+            broad.push((views, regions));
+        }
+        (fields, further, broad)
     }
 }
 
@@ -3247,17 +4128,23 @@ struct Layout<'a> {
     mapping: Mapping,
     patches: Vec<(Bounds, &'a Patch)>,
     fields: Vec<(Bounds, &'a Field)>,
+    broad: Vec<(Bounds, &'a Field)>,
 }
 
 impl Layout<'_> {
     fn touches(&self, y: usize) -> bool {
         let inside = |bounds: &Bounds| (bounds.1..=bounds.3).contains(&(y as f64));
         self.patches.iter().any(|(bounds, _)| inside(bounds))
-            || self.fields.iter().any(|(bounds, _)| inside(bounds))
+            || self
+                .fields
+                .iter()
+                .chain(&self.broad)
+                .any(|(bounds, _)| inside(bounds))
     }
 
     // Adds the planned log gains of output row `y`, columns `left..left + gains.len()`:
-    // compact shadows accumulate, then every other shape takes the maximum.
+    // compact shadows accumulate, then every other shape takes the maximum, and the broad
+    // shadows under them accumulate again.
     fn row(&self, y: usize, left: usize, gains: &mut [f64]) {
         let right = left + gains.len();
         let columns = |bounds: &Bounds| {
@@ -3287,6 +4174,14 @@ impl Layout<'_> {
                 }
             }
         }
+        for (bounds, field) in &self.broad {
+            for x in columns(bounds).into_iter().flatten() {
+                let (raw_x, raw_y) = self.mapping.to_raw(x, y);
+                if let Some(measured) = field.sample(&field.gain, raw_x, raw_y) {
+                    gains[x - left] += measured;
+                }
+            }
+        }
     }
 }
 
@@ -3302,23 +4197,28 @@ impl Plan {
                 (mapping.bounds(patch.origin, [size; 2]), patch)
             })
             .collect();
-        let fields = self
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(index, field)| field.spot.is_some() && !scenery.contains(index))
-            .map(|(_, field)| {
-                let size = [
-                    (field.size[0] - 1) as f64 * field.spacing,
-                    (field.size[1] - 1) as f64 * field.spacing,
-                ];
-                (mapping.bounds(field.origin, size), field)
-            })
-            .collect();
+        let placed = |broad: bool| -> Vec<(Bounds, &Field)> {
+            self.fields
+                .iter()
+                .enumerate()
+                .filter(|(index, field)| {
+                    field.spot.is_some() && field.broad == broad && !scenery.contains(index)
+                })
+                .map(|(_, field)| {
+                    let size = [
+                        (field.size[0] - 1) as f64 * field.spacing,
+                        (field.size[1] - 1) as f64 * field.spacing,
+                    ];
+                    (mapping.bounds(field.origin, size), field)
+                })
+                .collect()
+        };
+        let (fields, broad) = (placed(false), placed(true));
         Layout {
             mapping,
             patches,
             fields,
+            broad,
         }
     }
 }
@@ -3353,8 +4253,9 @@ fn bilinear(pixels: &[f32], width: usize, height: usize, x: f64, y: f64) -> f64 
 
 // Saved calibrations: everything a later run needs in place of the reference RAWs.
 const SAVED_MAGIC: &[u8; 8] = b"DNGMFDL\0";
-// Raised whenever analysis or planning changes what the saved numbers mean.
-const SAVED_VERSION: u32 = 1;
+// Raised whenever analysis or planning changes what the saved numbers mean. Format 2 added
+// the broad level of every residual.
+const SAVED_VERSION: u32 = 2;
 const SAVED_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const SAVED_DAMAGED: &str = "saved sensor-dirt data is damaged";
 const SAVED_EARLY: &str = "saved sensor-dirt data ends early or cannot be read";
@@ -3641,24 +4542,31 @@ impl Calibration {
             let stored = frames
                 .par_iter()
                 .map(|frame| {
+                    let broad = frame.width.div_ceil(BROAD_CELL);
                     ensure!(
-                        frame.data.len() == frame.width * frame.height,
+                        frame.data.len() == frame.width * frame.height
+                            && frame.broad.len() == broad * frame.height.div_ceil(BROAD_CELL),
                         "sensor-dirt residual of unexpected size"
                     );
-                    match compression {
-                        Some(level) => pack(&frame.data, frame.width, level),
-                        None => Ok(frame
-                            .data
-                            .iter()
-                            .flat_map(|value| value.to_le_bytes())
-                            .collect()),
-                    }
+                    [(&frame.data, frame.width), (&frame.broad, broad)]
+                        .into_iter()
+                        .map(|(data, width)| match compression {
+                            Some(level) => pack(data, width, level),
+                            None => Ok(data.iter().flat_map(|value| value.to_le_bytes()).collect()),
+                        })
+                        .collect::<Result<Vec<Vec<u8>>>>()
                 })
-                .collect::<Result<Vec<Vec<u8>>>>()?;
+                .collect::<Result<Vec<Vec<Vec<u8>>>>>()?;
             for (frame, stored) in frames.iter().zip(stored) {
                 encoder.count(frame.index)?;
                 encoder.geometry(&frame.geometry)?;
-                for value in [frame.width, frame.height, frame.step, stored.len()] {
+                for value in [
+                    frame.width,
+                    frame.height,
+                    frame.step,
+                    stored[0].len(),
+                    stored[1].len(),
+                ] {
                     encoder.count(value)?;
                 }
                 encoder.count(frame.signature.len())?;
@@ -3667,8 +4575,10 @@ impl Calibration {
                 }
                 encoder.seal()?;
                 // However it is stored, a residual is sealed as the samples it holds.
-                encoder.raw(&stored)?;
-                encoder.raw(&residual_hash(&frame.data).to_le_bytes())?;
+                for (stored, data) in stored.iter().zip([&frame.data, &frame.broad]) {
+                    encoder.raw(stored)?;
+                    encoder.raw(&residual_hash(data).to_le_bytes())?;
+                }
             }
         }
         encoder.writer.flush().context("writing sensor-dirt data")
@@ -3792,7 +4702,8 @@ impl<R: Read + Seek> Saved<R> {
         let compressed = self.compressed;
         // Stored bytes and seals of the residuals read but not yet decoded: decoding is
         // the slow part, so a few at a time take every thread.
-        let mut waiting: Vec<(StackFrame, Vec<u8>, u64)> = Vec::new();
+        type Stored = (Vec<u8>, u64);
+        let mut waiting: Vec<(StackFrame, [Stored; 2])> = Vec::new();
         for position in 0..frames {
             let index = self.decoder.count(frames - 1)?;
             let geometry = self.decoder.geometry()?;
@@ -3801,20 +4712,35 @@ impl<R: Read + Seek> Saved<R> {
                 self.decoder.count(1 << 16)?,
                 self.decoder.count(1 << 16)?,
             ];
-            let stored = self.decoder.count(3 * width * height + 4096)?;
+            // The residual, then its broad level.
+            let cells = [
+                width * height,
+                width.div_ceil(BROAD_CELL) * height.div_ceil(BROAD_CELL),
+            ];
+            let stored = [
+                self.decoder.count(3 * cells[0] + 4096)?,
+                self.decoder.count(3 * cells[1] + 4096)?,
+            ];
             let signature = (0..self.decoder.count(1 << 16)?)
                 .map(|_| self.decoder.real())
                 .collect::<Result<Vec<_>>>()?;
             self.decoder.seal()?;
-            ensure!(compressed || stored == 2 * width * height, SAVED_DAMAGED);
+            ensure!(
+                compressed || stored == cells.map(|cells| 2 * cells),
+                SAVED_DAMAGED
+            );
             if keep(index) {
-                let mut bytes = vec![0; stored];
-                let mut seal = [0; 8];
-                self.decoder
-                    .reader
-                    .read_exact(&mut bytes)
-                    .and_then(|()| self.decoder.reader.read_exact(&mut seal))
-                    .context(SAVED_EARLY)?;
+                let mut read = |length: usize| -> Result<Stored> {
+                    let mut bytes = vec![0; length];
+                    let mut seal = [0; 8];
+                    self.decoder
+                        .reader
+                        .read_exact(&mut bytes)
+                        .and_then(|()| self.decoder.reader.read_exact(&mut seal))
+                        .context(SAVED_EARLY)?;
+                    Ok((bytes, u64::from_le_bytes(seal)))
+                };
+                let stored = [read(stored[0])?, read(stored[1])?];
                 waiting.push((
                     StackFrame {
                         index,
@@ -3824,30 +4750,37 @@ impl<R: Read + Seek> Saved<R> {
                         step,
                         signature,
                         data: Arc::new(Vec::new()),
+                        broad: Arc::new(Vec::new()),
                     },
-                    bytes,
-                    u64::from_le_bytes(seal),
+                    stored,
                 ));
             } else {
                 self.decoder
                     .reader
-                    .seek(SeekFrom::Current(stored as i64 + 8))
+                    .seek(SeekFrom::Current((stored[0] + stored[1]) as i64 + 16))
                     .context(SAVED_EARLY)?;
             }
             if position + 1 == frames || waiting.len() >= 2 * rayon::current_num_threads() {
                 let decoded = std::mem::take(&mut waiting)
                     .into_par_iter()
-                    .map(|(mut frame, bytes, seal)| {
-                        let data = if compressed {
-                            unpack(&bytes, frame.width, frame.width * frame.height)?
-                        } else {
-                            bytes
-                                .chunks_exact(2)
-                                .map(|value| i16::from_le_bytes([value[0], value[1]]))
-                                .collect()
-                        };
-                        ensure!(residual_hash(&data) == seal, SAVED_DAMAGED);
-                        frame.data = Arc::new(data);
+                    .map(|(mut frame, stored)| {
+                        let widths = [frame.width, frame.width.div_ceil(BROAD_CELL)];
+                        let heights = [frame.height, frame.height.div_ceil(BROAD_CELL)];
+                        let mut maps = Vec::with_capacity(2);
+                        for (level, (bytes, seal)) in stored.into_iter().enumerate() {
+                            let data = if compressed {
+                                unpack(&bytes, widths[level], widths[level] * heights[level])?
+                            } else {
+                                bytes
+                                    .chunks_exact(2)
+                                    .map(|value| i16::from_le_bytes([value[0], value[1]]))
+                                    .collect()
+                            };
+                            ensure!(residual_hash(&data) == seal, SAVED_DAMAGED);
+                            maps.push(Arc::new(data));
+                        }
+                        frame.broad = maps.pop().context(SAVED_DAMAGED)?;
+                        frame.data = maps.pop().context(SAVED_DAMAGED)?;
                         Ok(frame)
                     })
                     .collect::<Result<Vec<_>>>()?;

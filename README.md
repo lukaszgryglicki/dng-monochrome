@@ -411,7 +411,7 @@ usual or have none at all; it refuses to replace an existing FILE without
 `--overwrite`. A run that loads writes exactly what the run analyzing the same
 references would write, and takes no `-fdl`. The file holds the confirmed spots,
 the reference paths in their sorted order (a target still stacks the references
-next to its own path) and, with `-fdx`, about 4 MB of residual map per reference,
+next to its own path) and, with `-fdx`, about 4 MB of residual maps per reference,
 of which a run reads only those within 128 files of a target. Those maps are
 stored as they are unless `--fix-dirty-compression LEVEL` (`-fdl-compression`,
 xz preset 1 to 9) is given: each map is then predicted from its neighboring
@@ -437,8 +437,8 @@ whose shadows are as deep as the target's are preferred (an aperture proxy
 needing no metadata).
 A stacked shadow counts only when it is small, isolated on
 an otherwise flat stack and seen by at least three views with plain, unrelated
-surroundings; a faint speck needs six. Broad soft shadows stay with the fitted
-correction above. Where the target is evenly smooth around it, the target
+surroundings; a faint speck needs six. Broad soft discs are stacked apart, as
+described below. Where the target is evenly smooth around it, the target
 measures its own shadow and the stack merely locates it, so dust too faint or
 too irregular for a single-frame fit is still repaired. Over uneven but smooth
 surroundings such as cloud bands, the stacked shape is scaled to the target
@@ -449,6 +449,32 @@ through a shadow, such as a wire, leaves that shadow uncorrected rather than
 erased. A stacked shadow replaces the fitted correction of the spot it covers
 unless it amounts to less than half of that correction; both then apply, the
 stronger one at each sample.
+
+Dirt further from the sensor, on a filter or a cover glass, casts a broad soft
+disc instead: hundreds of pixels across and a few percent deep wide open,
+smaller and deeper stopped down. It wanders with the lens and the stabilizer,
+so fitted spots seldom confirm it, and the high-passed previews do not hold it at
+all. Extra mode therefore stacks the same views a second time on a grid four
+times coarser, each cell against a plane fitted around it. A broad shadow
+counts when it is a filled disc seen by at least three views, six if it is
+fainter than 2%; the bands and wisps that repeated compositions leave are not
+discs. The target then measures the shadow itself, against a surface fitted
+through the plain ground around it; each stack locates the shadow in the shape
+its own views gave it, and the first whose shape the target keeps stands. Where
+the target's own shadow runs on beyond that shape, shifted with the lens or
+wider because the target was shot wider open, it is followed for up to eight
+cells. Only ground that hangs together with the shadow's own counts, so a valley
+or a dark slope behind a ridge neither passes for a shadow nor bends that
+surface, and what the ground around lies below the surface is taken off: haze
+towards a ridge, the sky running away towards a horizon. Where a ridge or wires
+cross the shadow, the gain is carried on from the measured cells, and further
+from them the stack's shape stands in, scaled to the target, so that no step
+marks where the measurement ended. A broad shadow that the target cannot measure
+on plain ground, beside a sun flare or with most of it hidden, is left alone:
+the stack's shape alone is never applied. Its gain adds to the corrections of
+the dust lying within it. The surface under the shadow remains an estimate:
+beside clouds or haze the repaired disc may end up about half a percent darker
+or lighter than the sky around it.
 
 The same dirt is small, dark and sharp stopped down and broad and soft wide
 open, so a target may show a confirmed spot in a shape that its references never
@@ -467,18 +493,22 @@ a shadow of theirs is used where no other correction, whether stacked, fitted or
 measured on the target, already covers part of it. The target must measure such
 a shadow itself; where cloud bands, grain or texture prevent that, these stacks
 are trusted as described above only for a speck of at most 64 analysis cells, as
-dust casts it stopped down, whose place at least five views show. Scene
-gradients imitate anything broader, and a few neighboring frames of one scene
-share its small details; such shadows are left alone.
+dust casts it stopped down, whose place at least five views show, and which the
+target shows no more than 1.6 times as deep as the stack does; a target stopped
+down further than its neighbors is allowed that excess on top. Scene gradients
+imitate anything broader, a few neighboring frames of one scene share its small
+details, and such stacks hold enough chance specks that a bird or a twig of the
+target lands on one; such shadows are left alone.
 
 Every shadow confirmed in extra mode is finally refined on the developed
 samples themselves, once for all Bayer planes: the error shared along each
 contour of the shadow and significant local detail inside it are removed. This
 is what clears the dark core and the bright ring that an analysis-resolution
 gain leaves on sharp dust and fibers, and it may darken diffraction fringes by
-up to 22%; ordinary `-fd` only ever brightens. Until planning ends, the prepass
-keeps a residual map of about 4 MB for each target and for each reference within
-128 files of a target in path order; references further away only vote.
+up to 22%; ordinary `-fd` only ever brightens. Broad discs have no such edges
+and stay as measured. Until planning ends, the prepass keeps a residual map of
+about 4 MB for each target and for each reference within 128 files of a target
+in path order; references further away only vote.
 
 `--fix-dust-strength` (`-fix-dust-strength`, `-fds`) accepts a finite value from
 0 to 2 and implies `--fix-dirty`. The default is 1, preserving the normal
@@ -570,7 +600,7 @@ The documented `--long` options also accept `-long`, including `-help`,
 | `--max-color`, `-mc` | Make final RGB more vivid at gamut-safe level 1; default off; requires `--color`; before channel selection, companions unchanged |
 | `--max-color-level N`, `-mcl N` | Vivid-color level 0..2; implies `--max-color`; 0 is unchanged, >1 exaggerates channel separation; conflicts with `--analyze` |
 | `--fix-dirty`, `-fd` | Analyze the entire RAW batch first, then correct confidently recurring sensor-dirt shadows; default off; mono and color |
-| `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers, stack nearby references and refine confirmed shadows at full resolution; opt-in; implies `--fix-dirty`; mono and color |
+| `--fix-dirty-extra`, `-fdx` | Also detect enclosed irregular shadows/curved fibers, stack nearby references, also for the broad discs of dirt far from the sensor, and refine confirmed shadows at full resolution; opt-in; implies `--fix-dirty`; mono and color |
 | `--fix-dirty-list PATH ...`, `-fdl PATH ...` | Separate reference files/directories; repeatable; implies `--fix-dirty`; default: processing inputs |
 | `--fix-dirty-save FILE`, `-fdl-save FILE` | Save the analyzed reference data for later runs; implies `--fix-dirty`; inputs optional; needs `--overwrite` to replace FILE |
 | `--fix-dirty-compression N`, `-fdl-compression N` | Compress the saved residual maps with xz preset 1..9; default uncompressed; requires `--fix-dirty-save` |

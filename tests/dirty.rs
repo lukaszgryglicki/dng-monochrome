@@ -81,6 +81,44 @@ fn shaded(index: usize, shadow: impl Fn(f64, f64) -> f64) -> Dng {
     image
 }
 
+// The flat-floored, soft-edged shadow that dirt far from the sensor casts: log depth
+// `depth` within `radius`, fading over 48 samples around it.
+fn disc(center: (f64, f64), radius: f64, depth: f64) -> impl Fn(f64, f64) -> f64 {
+    move |x, y| {
+        let inside = ((radius - (x - center.0).hypot(y - center.1)) / 48.0 + 0.5).clamp(0.0, 1.0);
+        -depth * inside * inside * (3.0 - 2.0 * inside)
+    }
+}
+
+// View `k` of a tilting sky under `shadow`: no two of these views look alike.
+fn tilted(k: usize, shadow: impl Fn(f64, f64) -> f64) -> Dng {
+    let (sin, cos) = (k as f64 * 0.41).sin_cos();
+    shaded(5, move |x, y| {
+        cos * (x / 640.0 - 0.5) + sin * (y / 480.0 - 0.5) + shadow(x, y)
+    })
+}
+
+// Where the shadow of dirt far from the sensor falls in view `k`: it wanders with the lens
+// and the stabilizer.
+fn wandering(k: usize) -> (f64, f64) {
+    let (sin, cos) = (k as f64 * 1.7).sin_cos();
+    (300.5 + 12.0 * cos, 190.5 + 10.0 * sin)
+}
+
+// Six views of that sky under such a shadow, 3 % deep, as references.
+fn wide_references(root: &Path, extra: bool) -> Vec<Evidence> {
+    (0..6)
+        .map(|k| {
+            let image = decode(
+                root,
+                &format!("wide{k}.DNG"),
+                &tilted(k, disc(wandering(k), 72.0, 0.03)),
+            );
+            dirty::analyze_with_extra(&image, extra).unwrap()
+        })
+        .collect()
+}
+
 // Largest relative error against `clean` within `radius` of a point.
 fn worst_error(image: &[u16], clean: &Dng, center: (f64, f64), radius: f64) -> f64 {
     let black = f64::from(clean.black);
@@ -965,6 +1003,221 @@ fn stacked_dust_among_cloud_bands_is_scaled_from_the_stack_or_left_alone() {
             );
         }
     }
+}
+
+#[test]
+fn broad_discs_are_stacked_on_their_own_level_and_measured_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = wandering(6);
+    let clean = tilted(6, |_, _| 0.0);
+    let original = tilted(6, disc(center, 72.0, 0.03));
+    // No fit of a single frame holds such a disc, so ordinary correction leaves it alone.
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let plain = Calibration::new(&wide_references(dir.path(), false)).unwrap();
+    let report = plain
+        .plan(&dirty::analyze(&image).unwrap())
+        .apply(&mut image)
+        .unwrap();
+    assert_eq!(image.pixels, original.pixels, "{report:?}");
+    // The broad level of the stack finds it and the target measures it.
+    let extra = Calibration::new(&wide_references(dir.path(), true)).unwrap();
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = extra.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(
+        (report.stacked_regions, report.spots.len()),
+        (1, 1),
+        "{report:?}"
+    );
+    let before = worst_error(&original.pixels, &clean, center, 110.0);
+    let after = worst_error(&image.pixels, &clean, center, 110.0);
+    assert!(
+        before > 0.028 && after < 0.004,
+        "{after} of {before}; {report:?}"
+    );
+    let width = clean.width as usize;
+    for (i, (&value, &original)) in image.pixels.iter().zip(&original.pixels).enumerate() {
+        let radius =
+            ((i % width) as f64 + 0.5 - center.0).hypot((i / width) as f64 + 0.5 - center.1);
+        assert!(
+            radius <= 110.0 || value == original,
+            "sample {i} changed away from the disc"
+        );
+    }
+    // Saved reference data holds the broad level as well, stored or compressed.
+    let paths: Vec<PathBuf> = (0..6)
+        .map(|k| dir.path().join(format!("wide{k}.DNG")))
+        .collect();
+    let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    for level in [None, Some(6)] {
+        let mut bytes = Vec::new();
+        extra.save(&mut bytes, true, &paths, level).unwrap();
+        let loaded = dirty::Saved::open(std::io::Cursor::new(bytes))
+            .unwrap()
+            .calibration(|_| true)
+            .unwrap();
+        let mut again = decode(dir.path(), "again.DNG", &original);
+        let target = dirty::analyze_with_extra(&again, true).unwrap();
+        loaded.plan(&target).apply(&mut again).unwrap();
+        assert!(
+            again.pixels == image.pixels,
+            "{level:?}: saved data changed the repair"
+        );
+    }
+    // A clean target has nothing to confirm and stays untouched.
+    let mut other = decode(dir.path(), "clean.DNG", &tilted(7, |_, _| 0.0));
+    let untouched = other.pixels.clone();
+    let target = dirty::analyze_with_extra(&other, true).unwrap();
+    let report = extra.plan(&target).apply(&mut other).unwrap();
+    assert_eq!(
+        (report.stacked_regions, &other.pixels),
+        (0, &untouched),
+        "{report:?}"
+    );
+    // And a disc that only the target shows is a cloud, not dirt.
+    let evidence: Vec<_> = (0..6)
+        .map(|k| {
+            let image = decode(dir.path(), &format!("sky{k}.DNG"), &tilted(k, |_, _| 0.0));
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let mut image = decode(dir.path(), "cloud.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = Calibration::new(&evidence)
+        .unwrap()
+        .plan(&target)
+        .apply(&mut image)
+        .unwrap();
+    assert_eq!(image.pixels, original.pixels, "{report:?}");
+}
+
+#[test]
+fn broad_discs_and_the_dust_within_them_are_repaired_together() {
+    let dir = tempfile::tempdir().unwrap();
+    // Dust on the sensor stays put under the wandering shadow of dirt far from it.
+    let spot = (310.5, 200.5);
+    let dust = |x: f64, y: f64| {
+        -0.2 * (-0.5 * ((x - spot.0).powi(2) + (y - spot.1).powi(2)) / 6.4f64.powi(2)).exp()
+    };
+    let view = |k: usize| tilted(k, |x, y| disc(wandering(k), 72.0, 0.03)(x, y) + dust(x, y));
+    let evidence: Vec<_> = (0..6)
+        .map(|k| {
+            let image = decode(dir.path(), &format!("both{k}.DNG"), &view(k));
+            dirty::analyze_with_extra(&image, true).unwrap()
+        })
+        .collect();
+    let calibration = Calibration::new(&evidence).unwrap();
+    let clean = tilted(6, |_, _| 0.0);
+    let original = view(6);
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(
+        (report.confirmed_sensor_spots, report.stacked_regions),
+        (1, 1),
+        "{report:?}"
+    );
+    // The dust is repaired on the floor of the disc and the disc as the dust leaves it:
+    // the two gains add up.
+    let before = worst_error(&original.pixels, &clean, spot, 4.0);
+    let after = worst_error(&image.pixels, &clean, spot, 4.0);
+    assert!(
+        before > 0.2 && after < 0.012,
+        "{after} of {before} at the dust; {report:?}"
+    );
+    let width = clean.width as usize;
+    let black = f64::from(clean.black);
+    for (i, (&value, &truth)) in image.pixels.iter().zip(&clean.pixels).enumerate() {
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        let error = (f64::from(value) - black) / (f64::from(truth) - black) - 1.0;
+        assert!(
+            (x - spot.0).hypot(y - spot.1) < 30.0 || error.abs() < 0.005,
+            "{error} at {x},{y}; {report:?}"
+        );
+    }
+}
+
+#[test]
+fn broad_discs_are_followed_where_they_run_beyond_the_shape_of_their_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let calibration = Calibration::new(&wide_references(dir.path(), true)).unwrap();
+    // The lens was shifted for this frame: its disc lies seven broad cells to the side of
+    // the place where every reference shows it, well into the ground around the stack's.
+    let center = (356.5, 190.5);
+    let clean = tilted(6, |_, _| 0.0);
+    let original = tilted(6, disc(center, 72.0, 0.03));
+    let mut image = decode(dir.path(), "target.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    let before = worst_error(&original.pixels, &clean, center, 110.0);
+    let after = worst_error(&image.pixels, &clean, center, 110.0);
+    assert!(
+        before > 0.028 && after < 0.006,
+        "{after} of {before}; {report:?}"
+    );
+}
+
+#[test]
+fn broad_discs_continue_under_scenery_and_never_follow_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let calibration = Calibration::new(&wide_references(dir.path(), true)).unwrap();
+    let center = wandering(6);
+    // A hill rises into the disc from below: dark and plain as a shaded slope, or rough as
+    // a wooded one. Its top is `peak` samples below the middle of the disc.
+    let hill = |mut image: Dng, peak: f64, rough: bool| {
+        let (black, width) = (f64::from(image.black), image.width as usize);
+        for (i, pixel) in image.pixels.iter_mut().enumerate() {
+            let (x, y) = (i % width, i / width);
+            if y as f64 + 0.5 >= center.1 + peak + 1.5 * (x as f64 + 0.5 - center.0).abs() {
+                let texture = if rough {
+                    0.25 * (((x / 2 * 7 + y / 2 * 13) % 5) as f64 / 2.0 - 1.0)
+                } else {
+                    0.0
+                };
+                *pixel =
+                    (black + (f64::from(*pixel) - black) * 0.55 * (1.0 + texture)).round() as u16;
+            }
+        }
+        image
+    };
+    for rough in [false, true] {
+        let clean = hill(tilted(6, |_, _| 0.0), 20.0, rough);
+        let original = hill(tilted(6, disc(center, 72.0, 0.03)), 20.0, rough);
+        let mut image = decode(dir.path(), "target.DNG", &original);
+        let target = dirty::analyze_with_extra(&image, true).unwrap();
+        let report = calibration.plan(&target).apply(&mut image).unwrap();
+        assert_eq!(report.stacked_regions, 1, "{rough}: {report:?}");
+        let (black, width) = (f64::from(clean.black), clean.width as usize);
+        let mut sky = 0.0f64;
+        for (i, ((&value, &before), &truth)) in image
+            .pixels
+            .iter()
+            .zip(&original.pixels)
+            .zip(&clean.pixels)
+            .enumerate()
+        {
+            let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+            let error = (f64::from(value) - black) / (f64::from(truth) - black) - 1.0;
+            // Nothing is darkened, and nothing is lifted by more than the disc took, give or
+            // take how far its shadow wanders: the hill is no shadow, however dark and
+            // smooth it is.
+            assert!(
+                value >= before && error < 0.01,
+                "{rough}: {error} at {x},{y}; {report:?}"
+            );
+            if y < center.1 + 20.0 + 1.5 * (x - center.0).abs() - 2.0 {
+                sky = sky.max(-error);
+            }
+        }
+        // The sky is repaired right down to the hill: no step marks where the measurement
+        // ended.
+        assert!(sky < 0.01, "{rough}: {sky} left in the sky; {report:?}");
+    }
+    // A hill that hides most of the disc leaves too little to measure it by.
+    let original = hill(tilted(6, disc(center, 72.0, 0.03)), -60.0, true);
+    let mut image = decode(dir.path(), "hidden.DNG", &original);
+    let target = dirty::analyze_with_extra(&image, true).unwrap();
+    let report = calibration.plan(&target).apply(&mut image).unwrap();
+    assert_eq!(image.pixels, original.pixels, "{report:?}");
 }
 
 #[test]
@@ -1862,18 +2115,22 @@ fn extra_stacking_keeps_the_dust_of_a_session_that_borders_on_a_clean_one() {
     }
     // On a banded sky the target cannot measure the shadow itself. A stack of one side
     // alone is then trusted for the shape of a speck, as dust casts it stopped down,
-    let speck = convert(0.0, 7, "c", 0.03, 0.008);
+    let speck = convert(0.0, 7, "c", 0.016, 0.004);
     assert_eq!(speck["stacked_regions"], 1, "{speck}");
     assert!(speck["changed_samples"].as_u64().unwrap() > 0, "{speck}");
     // but not for a broader shadow, which scene gradients imitate, nor on the word of four
     // views, which may share the small details of one scene.
     for (half, dusty) in [(16.0, 7), (0.0, 4)] {
-        let untouched = convert(half, dusty, "c", 0.03, 0.008);
+        let untouched = convert(half, dusty, "c", 0.016, 0.004);
         assert_eq!(
             untouched["changed_samples"], 0,
             "{half} {dusty}: {untouched}"
         );
     }
+    // Nor where the target is far darker than that stack shows the speck: such stacks hold
+    // enough chance specks that a bird of the target lands on one.
+    let bird = convert(0.0, 7, "e", 0.03, 0.008);
+    assert_eq!(bird["changed_samples"], 0, "{bird}");
     // The first frame of the clean session has nothing to repair, whatever came before.
     let clean = convert(0.0, 7, "d", 0.0, 0.0);
     assert_eq!(clean["changed_samples"], 0, "{clean}");
@@ -2064,6 +2321,11 @@ fn saved_reference_data_reproduces_the_run_that_analyzed_the_references() {
     renamed[40] ^= 1;
     fs::write(&damaged, &renamed).unwrap();
     fails("renamed", &load, "is damaged");
+    // Data of an earlier format lacks the broad level and has to be saved again.
+    let mut older = bytes.clone();
+    older[8] = 1;
+    fs::write(&damaged, &older).unwrap();
+    fails("older", &load, "was saved in format 1");
     fs::write(&damaged, b"not dirt data at all").unwrap();
     fails("foreign", &load, "not sensor-dirt data");
 }
